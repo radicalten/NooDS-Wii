@@ -17,7 +17,7 @@ LDFLAGS += $(CXXFLAGS) \
 -lasnd -lwiikeyboard -lfat -lwiiuse -lbte -logc -lm
 TARGET  := NooDS-Wii
 EXCLUDE := 
-SRCDIR 	:= noods-wii-9-5-clean
+SRCDIR 	:= NooDS-Wii
 C_SOURCES = $(foreach dir, $(SRCDIR), $(filter-out $(EXCLUDE), $(wildcard $(dir)/*.cpp)))
 SOURCES = $(C_SOURCES) 
 OBJECTS = $(SOURCES:.cpp=.o)
