@@ -152,6 +152,10 @@ static bool showFileBrowser  = true;
 static std::string romToLoadPath = "";
 static volatile bool triggerRomLoad = false;
 
+static int scrollHoldTimer = 0;
+static const int SCROLL_DELAY_INITIAL = 18; // Frames before scrolling starts
+static const int SCROLL_DELAY_REPEATED = 3;  // Frames between scrolling steps
+
 #define NDS_KEY_A      0
 #define NDS_KEY_B      1
 #define NDS_KEY_SELECT 2
@@ -488,7 +492,7 @@ static void ScanWiiInputs() {
     bool      hasNunchuk = wdata && (wdata->exp.type == WPAD_EXP_NUNCHUK);
     u32       heldExt   = hasNunchuk ? held : 0;
 
-    if ((pressed & WPAD_BUTTON_HOME) || (gcPressed & PAD_BUTTON_START)) {
+    if (pressed & WPAD_BUTTON_HOME) {
         runEmulatorThread = false;
         PPCCompilerBarrier();
         KThreadJoin(&emulatorThread);
@@ -503,7 +507,31 @@ static void ScanWiiInputs() {
 
     if (showFileBrowser) {
         if (!dirContents.empty()) {
-            if ((pressed & WPAD_BUTTON_DOWN) || (gcPressed & PAD_BUTTON_DOWN)) {
+            bool upHeld   = (held & WPAD_BUTTON_UP)     || (gcHeld & PAD_BUTTON_UP);
+            bool downHeld = (held & WPAD_BUTTON_DOWN)   || (gcHeld & PAD_BUTTON_DOWN);
+            bool upDown   = (pressed & WPAD_BUTTON_UP)  || (gcPressed & PAD_BUTTON_UP);
+            bool downDown = (pressed & WPAD_BUTTON_DOWN)|| (gcPressed & PAD_BUTTON_DOWN);
+
+            bool performUp    = false;
+            bool performDown  = false;
+
+            if (upDown || downDown) {
+                scrollHoldTimer = 0; // Reset timer on raw press
+                if (upDown)   performUp   = true;
+                if (downDown) performDown = true;
+            } else if (upHeld || downHeld) {
+                scrollHoldTimer++;
+                if (scrollHoldTimer >= SCROLL_DELAY_INITIAL) {
+                    if ((scrollHoldTimer - SCROLL_DELAY_INITIAL) % SCROLL_DELAY_REPEATED == 0) {
+                        if (upHeld)   performUp   = true;
+                        if (downHeld) performDown = true;
+                    }
+                }
+            } else {
+                scrollHoldTimer = 0;
+            }
+
+            if (performDown) {
                 selectedItemIndex++;
                 if (selectedItemIndex >= (int)dirContents.size()) {
                     selectedItemIndex = 0;
@@ -512,7 +540,7 @@ static void ScanWiiInputs() {
                 if (selectedItemIndex >= displayOffset + 5)
                     displayOffset = selectedItemIndex - 4;
             }
-            if ((pressed & WPAD_BUTTON_UP) || (gcPressed & PAD_BUTTON_UP)) {
+            if (performUp) {
                 selectedItemIndex--;
                 if (selectedItemIndex < 0) {
                     selectedItemIndex = (int)dirContents.size() - 1;
@@ -521,6 +549,22 @@ static void ScanWiiInputs() {
                 if (selectedItemIndex < displayOffset)
                     displayOffset = selectedItemIndex;
             }
+
+            if ((pressed & WPAD_BUTTON_LEFT) || (gcPressed & PAD_BUTTON_LEFT)) {
+                selectedItemIndex -= 5;
+                if (selectedItemIndex < 0) {
+                    selectedItemIndex = 0;
+                }
+                displayOffset = std::max(0, selectedItemIndex - 2);
+            }
+            if ((pressed & WPAD_BUTTON_RIGHT) || (gcPressed & PAD_BUTTON_RIGHT)) {
+                selectedItemIndex += 5;
+                if (selectedItemIndex >= (int)dirContents.size()) {
+                    selectedItemIndex = (int)dirContents.size() - 1;
+                }
+                displayOffset = std::max(0, std::min((int)dirContents.size() - 5, selectedItemIndex - 2));
+            }
+
             if ((pressed & WPAD_BUTTON_A) || (gcPressed & PAD_BUTTON_A)) {
                 BrowserItem selected = dirContents[selectedItemIndex];
                 if (selected.isDirectory) {
@@ -541,6 +585,9 @@ static void ScanWiiInputs() {
                     PPCIrqUnlockByMsr(st);
 
                     showFileBrowser = false;
+                    
+                    dirContents.clear();
+                    dirContents.shrink_to_fit();
                 }
             }
         }
@@ -548,12 +595,6 @@ static void ScanWiiInputs() {
             showFileBrowser = false;
     }
     else {
-        if ((pressed & WPAD_BUTTON_MINUS) || (gcPressed & PAD_TRIGGER_L)) {
-            showFileBrowser = true;
-            UpdateFileBrowser(currentDir);
-            return;
-        }
-
         uint16_t ndsButtons = WiiButtonsToNDS(held, heldExt, hasNunchuk);
 
         if (gcHeld & PAD_BUTTON_A)     ndsButtons |= (1 << NDS_KEY_A);
@@ -695,13 +736,13 @@ int main(int /*argc*/, char** /*argv*/) {
             }
             while (lineIndex < 6)
                 Wii_DebugOverlayPrint(lineIndex++, " ");
-            Wii_DebugOverlayPrint(6, "D-Pad=Select  A=Load  B=Resume");
+            Wii_DebugOverlayPrint(6, "D-Pad=Select  L/R=Page Skip  A=Load");
             Wii_DebugOverlayPrint(7, " ");
         }
         else {
             Wii_DebugOverlayPrint(0, " ");
             Wii_DebugOverlayPrint(1, "FPS: %5.1f", perf.fps);
-            Wii_DebugOverlayPrint(2, "MINUS/L=Browser  HOME=Quit");
+            Wii_DebugOverlayPrint(2, "HOME=Quit");
             Wii_DebugOverlayPrint(3, " ");
             Wii_DebugOverlayPrint(4, " ");
             Wii_DebugOverlayPrint(5, " ");
