@@ -20,6 +20,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 #include <gccore.h>
 #include <wiiuse/wpad.h>
 #include <fat.h>
@@ -144,7 +145,7 @@ struct BrowserItem {
     bool isDirectory;
 };
 
-static std::string currentDir = "sd:/";
+static std::string currentDir = "sd:/noods/";
 static std::vector<BrowserItem> dirContents;
 static int selectedItemIndex = 0;
 static int displayOffset     = 0;
@@ -181,58 +182,86 @@ struct PerformanceState {
 };
 static PerformanceState perf = {};
 
+//Begin Audio code:
+alignas(32) static uint32_t s_spuOutBuf[2048];
+static uint32_t* GetSamplesNoCopy(int nFrames) {
+    if (!ndsCore) return nullptr;
+    uint32_t* p = ndsCore->spu.getSamples(nFrames);
+    if (!p) return nullptr;
+    memcpy(s_spuOutBuf, p, (size_t)nFrames * sizeof(uint32_t));
+    delete[] p;
+    return s_spuOutBuf;
+}
+alignas(32) static int16_t  s_audioDbl[2][WIIAUD_FRAMES_PER_BUF * 2];
+alignas(32) static int16_t  s_audioSilence[WIIAUD_FRAMES_PER_BUF * 2] = {};
+static volatile int         s_audioWriteIdx  = 0;
+static volatile int         s_audioReadIdx   = 1;
+static volatile bool        s_audioDataReady = false;
+
 static void AudioCallback(s32 voice) {
-    int16_t* buf = WiiAudio_ConsumeBuffer();
-    ASND_AddVoice(voice, buf, WIIAUD_BUF_BYTES);
+    if (s_audioDataReady) {
+        ASND_AddVoice(voice, s_audioDbl[s_audioReadIdx], WIIAUD_BUF_BYTES);
+        s_audioReadIdx   = s_audioWriteIdx;
+        s_audioWriteIdx  = s_audioWriteIdx ^ 1;
+        s_audioDataReady = false;
+    } else {
+        ASND_AddVoice(voice, s_audioSilence, WIIAUD_BUF_BYTES);
+    }
 }
 
+static KThrQueue s_audioQueue;
 static sptr AudioThreadMain(void* /*arg*/) {
-    alignas(32) static int16_t tmp[WIIAUD_FRAMES_PER_BUF * 2];
-
     while (runAudioThread) {
         if (!romLoaded || !ndsCore) {
-            memset(tmp, 0, sizeof(tmp));
-            WiiAudio_Submit(tmp, WIIAUD_FRAMES_PER_BUF);
+            memset(s_audioDbl[s_audioWriteIdx], 0, WIIAUD_BUF_BYTES);
+            s_audioDataReady = true;
             KThreadSleepMs(16);
             continue;
         }
-
-        uint32_t* src = ndsCore->spu.getSamples(WIIAUD_NDS_FRAMES);
-
-        if (!src) {
-            memset(tmp, 0, sizeof(tmp));
-            WiiAudio_Submit(tmp, WIIAUD_FRAMES_PER_BUF);
-            continue;
+        while (s_audioDataReady && runAudioThread) {
+            KThreadSleepUs(1000);
         }
+        if (!runAudioThread) break;
 
-        for (int i = 0; i < WIIAUD_FRAMES_PER_BUF; i++) {
-            int      si    = i * WIIAUD_NDS_FRAMES / WIIAUD_FRAMES_PER_BUF;
-            uint32_t s     = src[si];
-            tmp[i * 2 + 0] = (int16_t)( s         & 0xFFFF);
-            tmp[i * 2 + 1] = (int16_t)((s >> 16)  & 0xFFFF);
+        int16_t* dst = s_audioDbl[s_audioWriteIdx];
+        uint32_t* src = GetSamplesNoCopy(WIIAUD_NDS_FRAMES);
+        if (src) {
+            const int nDst = WIIAUD_FRAMES_PER_BUF;
+            const int nSrc = WIIAUD_NDS_FRAMES;
+            for (int i = 0; i < nDst; i++) {
+                const int si = i * nSrc / nDst;
+                const uint32_t s = src[si];
+                dst[i * 2 + 0] = (int16_t)(s & 0xFFFF);
+                dst[i * 2 + 1] = (int16_t)((s >> 16) & 0xFFFF);
+            }
+        } else {
+            memset(dst, 0, WIIAUD_BUF_BYTES);
         }
-
-        delete[] src;
-
-        WiiAudio_Submit(tmp, WIIAUD_FRAMES_PER_BUF);
+        // Ensure DSP sees coherent data (write-back cache)
+        DCFlushRange(dst, WIIAUD_BUF_BYTES);
+        s_audioDataReady = true;
     }
-
     KThreadExit(0);
     return 0;
 }
 
 static void InitializeAudio() {
     WiiAudio_Init();
+
+    memset(s_audioDbl[0], 0, WIIAUD_BUF_BYTES);
+    memset(s_audioDbl[1], 0, WIIAUD_BUF_BYTES);
+    s_audioWriteIdx  = 0;
+    s_audioReadIdx   = 1;
+    s_audioDataReady = false;
+
     ASND_Init();
     ASND_Pause(0);
-
-    int16_t* buf = WiiAudio_ConsumeBuffer();
 
     ASND_SetVoice(0,
                   VOICE_STEREO_16BIT_BE,
                   WIIAUD_OUT_RATE,
                   0,
-                  buf,
+                  s_audioDbl[0],
                   WIIAUD_BUF_BYTES,
                   MAX_VOLUME,
                   MAX_VOLUME,
@@ -241,9 +270,8 @@ static void InitializeAudio() {
 
 static void ShutdownAudio() {
     if (!Settings::emulateAudio) return;
-
     runAudioThread = false;
-    PPCCompilerBarrier();
+    s_audioDataReady = false;
     ASND_StopVoice(0);
     ASND_End();
     KThreadJoin(&audioThread);
@@ -251,23 +279,23 @@ static void ShutdownAudio() {
 
 static void InitializeSettings() {
     Settings::directBoot   = 1;
-    Settings::bios9Path    = "sd:/bios9.bin";
-    Settings::bios7Path    = "sd:/bios7.bin";
-    Settings::firmwarePath = "sd:/firmware.bin";
-    Settings::gbaBiosPath  = "sd:/gba_bios.bin";
+    Settings::bios9Path    = "sd:/noods/bios/bios9.bin";
+    Settings::bios7Path    = "sd:/noods/bios/bios7.bin";
+    Settings::firmwarePath = "sd:/noods/bios/firmware.bin";
+    Settings::gbaBiosPath  = "sd:/noods/bios/gba_bios.bin";
     Settings::sdImagePath  = "";
     Settings::basePath     = "sd:/";
     Settings::fpsLimiter   = 0;
-    Settings::frameskip    = 0;
+    Settings::frameskip    = 5;
     Settings::threaded2D   = 0;
     Settings::threaded3D   = 0;
     Settings::highRes3D    = 0;
     Settings::screenGhost  = 0;
     Settings::emulateAudio = 0;
     Settings::audio16Bit   = 0;
-    Settings::savesFolder  = 0;
-    Settings::statesFolder = 0;
-    Settings::cheatsFolder = 0;
+    Settings::savesFolder  = 1;
+    Settings::statesFolder = 1;
+    Settings::cheatsFolder = 1;
     Settings::screenFilter = 0;
     Settings::arm7Hle      = 0;
     Settings::dsiMode      = 0;
@@ -460,8 +488,10 @@ static void InitializeNDS() {
     perf.startTime = time(nullptr);
 }
 
-static uint16_t WiiButtonsToNDS(u32 held, u32 heldExt, bool hasNunchuk) {
+static uint16_t WiiButtonsToNDS(u32 held, u32 heldExt, bool hasNunchuk, bool hasClassic) {
     uint16_t nds = 0;
+
+    // Standard Wii Remote mappings (Horizontal or plus Nunchuk)
     if (held & WPAD_BUTTON_RIGHT)  nds |= (1 << NDS_KEY_RIGHT);
     if (held & WPAD_BUTTON_LEFT)   nds |= (1 << NDS_KEY_LEFT);
     if (held & WPAD_BUTTON_UP)     nds |= (1 << NDS_KEY_UP);
@@ -472,10 +502,28 @@ static uint16_t WiiButtonsToNDS(u32 held, u32 heldExt, bool hasNunchuk) {
     if (held & WPAD_BUTTON_B)      nds |= (1 << NDS_KEY_Y);
     if (held & WPAD_BUTTON_PLUS)   nds |= (1 << NDS_KEY_START);
     if (held & WPAD_BUTTON_MINUS)  nds |= (1 << NDS_KEY_SELECT);
+
     if (hasNunchuk) {
         if (heldExt & WPAD_NUNCHUK_BUTTON_Z) nds |= (1 << NDS_KEY_L);
         if (heldExt & WPAD_NUNCHUK_BUTTON_C) nds |= (1 << NDS_KEY_R);
     }
+
+    // Classic Controller physical mapping
+    if (hasClassic) {
+        if (held & WPAD_CLASSIC_BUTTON_RIGHT) nds |= (1 << NDS_KEY_RIGHT);
+        if (held & WPAD_CLASSIC_BUTTON_LEFT)  nds |= (1 << NDS_KEY_LEFT);
+        if (held & WPAD_CLASSIC_BUTTON_UP)    nds |= (1 << NDS_KEY_UP);
+        if (held & WPAD_CLASSIC_BUTTON_DOWN)  nds |= (1 << NDS_KEY_DOWN);
+        if (held & WPAD_CLASSIC_BUTTON_A)     nds |= (1 << NDS_KEY_A);
+        if (held & WPAD_CLASSIC_BUTTON_B)     nds |= (1 << NDS_KEY_B);
+        if (held & WPAD_CLASSIC_BUTTON_X)     nds |= (1 << NDS_KEY_X);
+        if (held & WPAD_CLASSIC_BUTTON_Y)     nds |= (1 << NDS_KEY_Y);
+        if (held & WPAD_CLASSIC_BUTTON_PLUS)  nds |= (1 << NDS_KEY_START);
+        if (held & WPAD_CLASSIC_BUTTON_MINUS) nds |= (1 << NDS_KEY_SELECT);
+        if (held & (WPAD_CLASSIC_BUTTON_FULL_L | WPAD_CLASSIC_BUTTON_ZL)) nds |= (1 << NDS_KEY_L);
+        if (held & (WPAD_CLASSIC_BUTTON_FULL_R | WPAD_CLASSIC_BUTTON_ZR)) nds |= (1 << NDS_KEY_R);
+    }
+
     return nds;
 }
 
@@ -488,11 +536,12 @@ static void ScanWiiInputs() {
     u32 gcHeld    = PAD_ButtonsHeld(0);
     u32 gcPressed = PAD_ButtonsDown(0);
 
-    WPADData* wdata     = WPAD_Data(0);
+    WPADData* wdata      = WPAD_Data(0);
     bool      hasNunchuk = wdata && (wdata->exp.type == WPAD_EXP_NUNCHUK);
-    u32       heldExt   = hasNunchuk ? held : 0;
+    bool      hasClassic = wdata && (wdata->exp.type == WPAD_EXP_CLASSIC);
+    u32       heldExt    = hasNunchuk ? held : 0;
 
-    if (pressed & WPAD_BUTTON_HOME) {
+    if ((pressed & WPAD_BUTTON_HOME) || (pressed & WPAD_CLASSIC_BUTTON_HOME)) {
         runEmulatorThread = false;
         PPCCompilerBarrier();
         KThreadJoin(&emulatorThread);
@@ -507,10 +556,27 @@ static void ScanWiiInputs() {
 
     if (showFileBrowser) {
         if (!dirContents.empty()) {
-            bool upHeld   = (held & WPAD_BUTTON_UP)     || (gcHeld & PAD_BUTTON_UP);
-            bool downHeld = (held & WPAD_BUTTON_DOWN)   || (gcHeld & PAD_BUTTON_DOWN);
-            bool upDown   = (pressed & WPAD_BUTTON_UP)  || (gcPressed & PAD_BUTTON_UP);
-            bool downDown = (pressed & WPAD_BUTTON_DOWN)|| (gcPressed & PAD_BUTTON_DOWN);
+            static bool classicLStickUpLast = false;
+            static bool classicLStickDownLast = false;
+            bool classicLStickUp = false;
+            bool classicLStickDown = false;
+
+            // Classic Controller stick parsing for menus
+            if (hasClassic && wdata) {
+                float ly = wdata->exp.classic.ljs.mag * cosf(wdata->exp.classic.ljs.ang * 3.14159265f / 180.0f);
+                if (wdata->exp.classic.ljs.mag > 0.5f) {
+                    if (ly > 0.5f)  classicLStickUp = true;
+                    if (ly < -0.5f) classicLStickDown = true;
+                }
+            }
+
+            bool upHeld   = (held & WPAD_BUTTON_UP)     || (held & WPAD_CLASSIC_BUTTON_UP)     || (gcHeld & PAD_BUTTON_UP)   || classicLStickUp;
+            bool downHeld = (held & WPAD_BUTTON_DOWN)   || (held & WPAD_CLASSIC_BUTTON_DOWN)   || (gcHeld & PAD_BUTTON_DOWN) || classicLStickDown;
+            bool upDown   = (pressed & WPAD_BUTTON_UP)  || (pressed & WPAD_CLASSIC_BUTTON_UP)  || (gcPressed & PAD_BUTTON_UP)  || (classicLStickUp && !classicLStickUpLast);
+            bool downDown = (pressed & WPAD_BUTTON_DOWN)|| (pressed & WPAD_CLASSIC_BUTTON_DOWN)|| (gcPressed & PAD_BUTTON_DOWN)|| (classicLStickDown && !classicLStickDownLast);
+
+            classicLStickUpLast = classicLStickUp;
+            classicLStickDownLast = classicLStickDown;
 
             bool performUp    = false;
             bool performDown  = false;
@@ -550,14 +616,14 @@ static void ScanWiiInputs() {
                     displayOffset = selectedItemIndex;
             }
 
-            if ((pressed & WPAD_BUTTON_LEFT) || (gcPressed & PAD_BUTTON_LEFT)) {
+            if ((pressed & WPAD_BUTTON_LEFT) || (pressed & WPAD_CLASSIC_BUTTON_LEFT) || (gcPressed & PAD_BUTTON_LEFT)) {
                 selectedItemIndex -= 5;
                 if (selectedItemIndex < 0) {
                     selectedItemIndex = 0;
                 }
                 displayOffset = std::max(0, selectedItemIndex - 2);
             }
-            if ((pressed & WPAD_BUTTON_RIGHT) || (gcPressed & PAD_BUTTON_RIGHT)) {
+            if ((pressed & WPAD_BUTTON_RIGHT) || (pressed & WPAD_CLASSIC_BUTTON_RIGHT) || (gcPressed & PAD_BUTTON_RIGHT)) {
                 selectedItemIndex += 5;
                 if (selectedItemIndex >= (int)dirContents.size()) {
                     selectedItemIndex = (int)dirContents.size() - 1;
@@ -565,7 +631,7 @@ static void ScanWiiInputs() {
                 displayOffset = std::max(0, std::min((int)dirContents.size() - 5, selectedItemIndex - 2));
             }
 
-            if ((pressed & WPAD_BUTTON_A) || (gcPressed & PAD_BUTTON_A)) {
+            if ((pressed & WPAD_BUTTON_A) || (pressed & WPAD_CLASSIC_BUTTON_A) || (gcPressed & PAD_BUTTON_A)) {
                 BrowserItem selected = dirContents[selectedItemIndex];
                 if (selected.isDirectory) {
                     if (selected.name == "..") {
@@ -591,11 +657,22 @@ static void ScanWiiInputs() {
                 }
             }
         }
-        if (((pressed & WPAD_BUTTON_B) || (gcPressed & PAD_BUTTON_B)) && romLoaded)
-            showFileBrowser = false;
+
+        // Handle B button press in file browser: go up directory, or close browser if at root
+        if ((pressed & WPAD_BUTTON_B) || (pressed & WPAD_CLASSIC_BUTTON_B) || (gcPressed & PAD_BUTTON_B)) {
+            if (currentDir != "sd:/" && currentDir != "sd://" && currentDir != "sd:") {
+                size_t slash = currentDir.find_last_of('/', currentDir.length() - 2);
+                if (slash != std::string::npos) {
+                    currentDir = currentDir.substr(0, slash + 1);
+                    UpdateFileBrowser(currentDir);
+                }
+            } else if (romLoaded) {
+                showFileBrowser = false;
+            }
+        }
     }
     else {
-        uint16_t ndsButtons = WiiButtonsToNDS(held, heldExt, hasNunchuk);
+        uint16_t ndsButtons = WiiButtonsToNDS(held, heldExt, hasNunchuk, hasClassic);
 
         if (gcHeld & PAD_BUTTON_A)     ndsButtons |= (1 << NDS_KEY_A);
         if (gcHeld & PAD_BUTTON_B)     ndsButtons |= (1 << NDS_KEY_B);
@@ -609,9 +686,22 @@ static void ScanWiiInputs() {
         if (gcHeld & PAD_TRIGGER_L)    ndsButtons |= (1 << NDS_KEY_L);
         if (gcHeld & PAD_BUTTON_START) ndsButtons |= (1 << NDS_KEY_START);
 
+        // Map Classic Left Stick to NDS D-Pad
+        if (hasClassic && wdata) {
+            float lx = wdata->exp.classic.ljs.mag * sinf(wdata->exp.classic.ljs.ang * 3.14159265f / 180.0f);
+            float ly = wdata->exp.classic.ljs.mag * cosf(wdata->exp.classic.ljs.ang * 3.14159265f / 180.0f);
+            if (wdata->exp.classic.ljs.mag > 0.5f) {
+                if (lx > 0.5f)  ndsButtons |= (1 << NDS_KEY_RIGHT);
+                if (lx < -0.5f) ndsButtons |= (1 << NDS_KEY_LEFT);
+                if (ly > 0.5f)  ndsButtons |= (1 << NDS_KEY_UP);
+                if (ly < -0.5f) ndsButtons |= (1 << NDS_KEY_DOWN);
+            }
+        }
+
         bool isTouching = false;
         g_cursorShow = false;
 
+        // IR pointer styling
         if (wdata && wdata->ir.valid) {
             g_cursorX    = wdata->ir.x;
             g_cursorY    = wdata->ir.y;
@@ -620,6 +710,7 @@ static void ScanWiiInputs() {
                 isTouching = true;
         }
 
+        // GC C-Stick Stylus Emulator
         s8 cstickX = PAD_SubStickX(0);
         s8 cstickY = PAD_SubStickY(0);
         if (abs(cstickX) > 15 || abs(cstickY) > 15) {
@@ -633,7 +724,29 @@ static void ScanWiiInputs() {
             if (g_cursorY > 480.0f) g_cursorY = 480.0f;
         }
 
+        // Classic Controller Right Stick Stylus Emulator
+        if (hasClassic && wdata) {
+            float rx = wdata->exp.classic.rjs.mag * sinf(wdata->exp.classic.rjs.ang * 3.14159265f / 180.0f);
+            float ry = wdata->exp.classic.rjs.mag * cosf(wdata->exp.classic.rjs.ang * 3.14159265f / 180.0f);
+            if (wdata->exp.classic.rjs.mag > 0.15f) {
+                g_cursorX   += rx * 4.0f;
+                g_cursorY   -= ry * 4.0f;
+                g_cursorShow = true;
+
+                if (g_cursorX < 0.0f)   g_cursorX = 0.0f;
+                if (g_cursorX > 640.0f) g_cursorX = 640.0f;
+                if (g_cursorY < 0.0f)   g_cursorY = 0.0f;
+                if (g_cursorY > 480.0f) g_cursorY = 480.0f;
+            }
+        }
+
+        // Stylus activation
         if (gcHeld & PAD_TRIGGER_Z) {
+            isTouching   = true;
+            g_cursorShow = true;
+        }
+
+        if (hasClassic && (held & (WPAD_CLASSIC_BUTTON_ZL | WPAD_CLASSIC_BUTTON_ZR))) {
             isTouching   = true;
             g_cursorShow = true;
         }
@@ -715,12 +828,14 @@ int main(int /*argc*/, char** /*argv*/) {
             renderTop    = topScreenBuffer;
             renderBottom = bottomScreenBuffer;
         }
-
-        {
-            time_t now    = time(nullptr);
-            float  uptime = (float)difftime(now, perf.startTime);
-            if (uptime > 0.0f)
-                perf.fps = (float)perf.renderFrameCount / uptime;
+        
+        static uint32_t lastSecFrames = 0;
+        static time_t   lastSec = 0;
+        time_t now = time(nullptr);
+        if (now != lastSec) {
+                perf.fps = (float)(perf.renderFrameCount - lastSecFrames);
+                lastSecFrames = perf.renderFrameCount;
+                lastSec = now;
         }
 
         if (showFileBrowser) {
@@ -736,7 +851,7 @@ int main(int /*argc*/, char** /*argv*/) {
             }
             while (lineIndex < 6)
                 Wii_DebugOverlayPrint(lineIndex++, " ");
-            Wii_DebugOverlayPrint(6, "D-Pad=Select  L/R=Page Skip  A=Load");
+            Wii_DebugOverlayPrint(6, "D-Pad=Select  L/R=Page Skip  A=Load  B=Back");
             Wii_DebugOverlayPrint(7, " ");
         }
         else {
@@ -752,7 +867,8 @@ int main(int /*argc*/, char** /*argv*/) {
 
         bool isGba = (ndsCore && romLoaded && !showFileBrowser) ? ndsCore->gbaMode : false;
         Wii_VideoRender(renderTop, renderBottom, isGba);
-        Wii_VideoPresent();
+        Wii_VideoFlushAsync();
+        VIDEO_WaitVSync();
     }
 
     return 0;
