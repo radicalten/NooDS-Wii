@@ -53,7 +53,7 @@ struct WiiDebugOverlay {
 void Wii_VideoInit();
 void Wii_VideoRender(const uint32_t* srcTop, const uint32_t* srcBottom,
                      bool gbaMode = false);
-void Wii_VideoPresent();
+void Wii_VideoFlushAsync();
 void Wii_DrawCursor(float x, float y);
 void Wii_DebugOverlayInit();
 void Wii_DebugOverlayPrint(int line, const char* fmt, ...);
