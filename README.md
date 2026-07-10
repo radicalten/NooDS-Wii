@@ -1,3 +1,6 @@
+## About
+NooDS-Wii is a port of Hydr8gon's NooDS emulator to the wii. 
+
 ## Instructions:
 NooDS-Wii requires original DS (Not DSi or 3ds) bios files: <br />
 Settings::bios9Path    = "sd:/noods/bios/bios9.bin"; <br />
