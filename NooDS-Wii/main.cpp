@@ -286,7 +286,7 @@ static void InitializeSettings() {
     Settings::sdImagePath  = "";
     Settings::basePath     = "sd:/";
     Settings::fpsLimiter   = 0;
-    Settings::frameskip    = 5;
+    Settings::frameskip    = 3;
     Settings::threaded2D   = 0;
     Settings::threaded3D   = 0;
     Settings::highRes3D    = 0;
