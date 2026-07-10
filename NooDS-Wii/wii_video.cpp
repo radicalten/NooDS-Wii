@@ -517,14 +517,11 @@ void Wii_DrawCursor(float x, float y) {
     GX_End();
 }
 
-void Wii_VideoPresent() {
+void Wii_VideoFlushAsync() {
     GX_DrawDone();
-
     wiiVid.currentXfb ^= 1;
     GX_CopyDisp(wiiVid.xfbList[wiiVid.currentXfb], GX_TRUE);
     GX_Flush();
-
     VIDEO_SetNextFramebuffer(wiiVid.xfbList[wiiVid.currentXfb]);
     VIDEO_Flush();
-    VIDEO_WaitVSync();
 }
