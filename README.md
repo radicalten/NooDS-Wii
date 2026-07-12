@@ -1,5 +1,5 @@
 ## About
-NooDS-Wii is a port of Hydr8gon's NooDS emulator to the wii. 
+NooDS-Wii is a port of Hydr8gon's NooDS emulator to the wii by radicalten.
 
 ## Instructions:
 NooDS-Wii requires original DS (Not DSi or 3ds) bios files: <br />
