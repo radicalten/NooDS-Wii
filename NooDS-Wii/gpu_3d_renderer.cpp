@@ -134,7 +134,7 @@ uint32_t *Gpu3DRenderer::getLine1(int line) {
     PPCIrqUnlockByMsr(st);
 
     while (currentReady < 3) {
-        KThreadYield();
+        KThreadYield(); 
         st = PPCIrqLockByMsr();
         currentReady = ready[line];
         PPCIrqUnlockByMsr(st);
@@ -249,7 +249,7 @@ void Gpu3DRenderer::drawThreaded(int thread) {
         PPCIrqUnlockByMsr(st);
 
         while (isPrevLeftReady || isPrevReady || isPrevRightReady) {
-            KThreadYield();
+            KThreadYield(); 
             st = PPCIrqLockByMsr();
             isPrevLeftReady = (prev > 0) ? (ready[prev - 1] < 2) : false;
             isPrevReady     = (ready[prev] < 2);
@@ -272,7 +272,7 @@ void Gpu3DRenderer::drawThreaded(int thread) {
     PPCIrqUnlockByMsr(st);
 
     while (isPrevLeftReady || isPrevReady || isPrevRightReady) {
-        KThreadYield();
+        KThreadYield(); 
         st = PPCIrqLockByMsr();
         isPrevLeftReady  = (ready[prev - 1] < 2);
         isPrevReady      = (ready[prev] < 2);

@@ -10,7 +10,7 @@
 
     NooDS-Wii is distributed in the hope that it will be useful, but
     WITHOUT ANY WARRANTY; without even the implied warranty of
-    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNUF
     General Public License for more details.
 
     You should have received a copy of the GNU General Public License
@@ -182,77 +182,133 @@ struct PerformanceState {
 };
 static PerformanceState perf = {};
 
-//Begin Audio code:
-alignas(32) static uint32_t s_spuOutBuf[2048];
-static uint32_t* GetSamplesNoCopy(int nFrames) {
-    if (!ndsCore) return nullptr;
-    uint32_t* p = ndsCore->spu.getSamples(nFrames);
-    if (!p) return nullptr;
-    memcpy(s_spuOutBuf, p, (size_t)nFrames * sizeof(uint32_t));
-    delete[] p;
-    return s_spuOutBuf;
-}
-alignas(32) static int16_t  s_audioDbl[2][WIIAUD_FRAMES_PER_BUF * 2];
-alignas(32) static int16_t  s_audioSilence[WIIAUD_FRAMES_PER_BUF * 2] = {};
-static volatile int         s_audioWriteIdx  = 0;
-static volatile int         s_audioReadIdx   = 1;
-static volatile bool        s_audioDataReady = false;
+// Always stereo layout (L,R pairs) even in mono mode.
+alignas(32) static int16_t s_audioDbl[2][WIIAUD_FRAMES_PER_BUF * 2];
+alignas(32) static int16_t s_audioSilence[WIIAUD_FRAMES_PER_BUF * 2];
 
-static void AudioCallback(s32 voice) {
-    if (s_audioDataReady) {
-        ASND_AddVoice(voice, s_audioDbl[s_audioReadIdx], WIIAUD_BUF_BYTES);
-        s_audioReadIdx   = s_audioWriteIdx;
-        s_audioWriteIdx  = s_audioWriteIdx ^ 1;
-        s_audioDataReady = false;
-    } else {
-        ASND_AddVoice(voice, s_audioSilence, WIIAUD_BUF_BYTES);
+static volatile int  s_writeBuf = 0;    
+static volatile int  s_readBuf  = 1;    
+static volatile bool s_bufReady = false;
+
+static void ResampleLinear(const uint32_t* src, int nSrc,
+                            int16_t*        dst, int nDst,
+                            bool            mono)
+{
+    const int32_t step = (int32_t)(((int64_t)nSrc << 16) / nDst);
+    int32_t       pos  = 0;
+
+    for (int i = 0; i < nDst; i++) {
+        const int idx0 = pos >> 16;
+        const int idx1 = (idx0 + 1 < nSrc) ? idx0 + 1 : nSrc - 1;
+
+        // Fractional part in [0, 65535].
+        const int32_t frac = pos & 0xFFFF;
+
+        // Unpack source samples.
+        const int16_t l0 = (int16_t)( src[idx0]        & 0xFFFF);
+        const int16_t r0 = (int16_t)((src[idx0] >> 16) & 0xFFFF);
+        const int16_t l1 = (int16_t)( src[idx1]        & 0xFFFF);
+        const int16_t r1 = (int16_t)((src[idx1] >> 16) & 0xFFFF);
+
+        // Linear interpolation.
+        const int16_t outL = (int16_t)(l0 + (int32_t)(l1 - l0) * frac / 65536);
+        const int16_t outR = (int16_t)(r0 + (int32_t)(r1 - r0) * frac / 65536);
+
+        if (mono) {
+            // Average both channels; write to both lanes.
+            const int16_t m = (int16_t)(((int32_t)outL + (int32_t)outR) >> 1);
+            dst[i * 2 + 0] = m;
+            dst[i * 2 + 1] = m;
+        } else {
+            dst[i * 2 + 0] = outL;
+            dst[i * 2 + 1] = outR;
+        }
+
+        pos += step;
     }
 }
 
-static KThrQueue s_audioQueue;
-static sptr AudioThreadMain(void* /*arg*/) {
+static uint32_t* PullSpuSamples(int nFrames)
+{
+#if WIIAUD_GBA_FRAMES > WIIAUD_NDS_FRAMES
+    static uint32_t staging[WIIAUD_GBA_FRAMES];
+#else
+    static uint32_t staging[WIIAUD_NDS_FRAMES];
+#endif
+
+    uint32_t* p = ndsCore->spu.getSamples(nFrames);
+    if (!p) return nullptr;
+
+    memcpy(staging, p, (size_t)nFrames * sizeof(uint32_t));
+    delete[] p;        // getSamples() always heap-allocates; free it here.
+    return staging;
+}
+
+static void AudioCallback(s32 voice)
+{
+    if (s_bufReady) {
+        const int justFilled = s_writeBuf;
+        s_readBuf            = justFilled;
+        s_writeBuf           = justFilled ^ 1;
+        s_bufReady           = false;
+
+        ASND_AddVoice(voice,
+                      s_audioDbl[justFilled],
+                      WIIAUD_BUF_BYTES_STEREO);
+    } else {
+        ASND_AddVoice(voice, s_audioSilence, WIIAUD_BUF_BYTES_STEREO);
+    }
+}
+
+static sptr AudioThreadMain(void* /*arg*/)
+{
     while (runAudioThread) {
-        if (!romLoaded || !ndsCore) {
-            memset(s_audioDbl[s_audioWriteIdx], 0, WIIAUD_BUF_BYTES);
-            s_audioDataReady = true;
-            KThreadSleepMs(16);
-            continue;
-        }
-        while (s_audioDataReady && runAudioThread) {
-            KThreadSleepUs(1000);
+        while (s_bufReady && runAudioThread) {
+            KThreadYield();
         }
         if (!runAudioThread) break;
 
-        int16_t* dst = s_audioDbl[s_audioWriteIdx];
-        uint32_t* src = GetSamplesNoCopy(WIIAUD_NDS_FRAMES);
-        if (src) {
-            const int nDst = WIIAUD_FRAMES_PER_BUF;
-            const int nSrc = WIIAUD_NDS_FRAMES;
-            for (int i = 0; i < nDst; i++) {
-                const int si = i * nSrc / nDst;
-                const uint32_t s = src[si];
-                dst[i * 2 + 0] = (int16_t)(s & 0xFFFF);
-                dst[i * 2 + 1] = (int16_t)((s >> 16) & 0xFFFF);
+        int16_t* dst  = s_audioDbl[s_writeBuf];
+        bool     ok   = false;
+        const bool mono = (Settings::monoAudio != 0);
+
+        if (romLoaded && ndsCore) {
+            if (ndsCore->gbaMode) {
+                uint32_t* src = PullSpuSamples(WIIAUD_GBA_FRAMES);
+                if (src) {
+                    ResampleLinear(src, WIIAUD_GBA_FRAMES,
+                                   dst, WIIAUD_FRAMES_PER_BUF, mono);
+                    ok = true;
+                }
+            } else {
+                uint32_t* src = PullSpuSamples(WIIAUD_NDS_FRAMES);
+                if (src) {
+                    ResampleLinear(src, WIIAUD_NDS_FRAMES,
+                                   dst, WIIAUD_FRAMES_PER_BUF, mono);
+                    ok = true;
+                }
             }
-        } else {
-            memset(dst, 0, WIIAUD_BUF_BYTES);
         }
-        // Ensure DSP sees coherent data (write-back cache)
-        DCFlushRange(dst, WIIAUD_BUF_BYTES);
-        s_audioDataReady = true;
+        if (!ok) {
+            memset(dst, 0, WIIAUD_BUF_BYTES_STEREO);
+        }
+        DCFlushRange(dst, WIIAUD_BUF_BYTES_STEREO);
+        s_bufReady = true;
     }
     KThreadExit(0);
     return 0;
 }
 
-static void InitializeAudio() {
-    WiiAudio_Init();
+static void InitializeAudio()
+{
+    memset(s_audioDbl,     0, sizeof(s_audioDbl));
+    memset(s_audioSilence, 0, sizeof(s_audioSilence));
+    DCFlushRange(s_audioDbl,     sizeof(s_audioDbl));
+    DCFlushRange(s_audioSilence, sizeof(s_audioSilence));
 
-    memset(s_audioDbl[0], 0, WIIAUD_BUF_BYTES);
-    memset(s_audioDbl[1], 0, WIIAUD_BUF_BYTES);
-    s_audioWriteIdx  = 0;
-    s_audioReadIdx   = 1;
-    s_audioDataReady = false;
+    s_writeBuf = 0;
+    s_readBuf  = 1;
+    s_bufReady = false;
 
     ASND_Init();
     ASND_Pause(0);
@@ -261,17 +317,17 @@ static void InitializeAudio() {
                   VOICE_STEREO_16BIT_BE,
                   WIIAUD_OUT_RATE,
                   0,
-                  s_audioDbl[0],
-                  WIIAUD_BUF_BYTES,
+                  s_audioSilence,
+                  WIIAUD_BUF_BYTES_STEREO,
                   MAX_VOLUME,
                   MAX_VOLUME,
                   AudioCallback);
 }
 
-static void ShutdownAudio() {
-    if (!Settings::emulateAudio) return;
+static void ShutdownAudio()
+{
     runAudioThread = false;
-    s_audioDataReady = false;
+    s_bufReady = false;       
     ASND_StopVoice(0);
     ASND_End();
     KThreadJoin(&audioThread);
@@ -285,14 +341,15 @@ static void InitializeSettings() {
     Settings::gbaBiosPath  = "sd:/noods/bios/gba_bios.bin";
     Settings::sdImagePath  = "";
     Settings::basePath     = "sd:/";
-    Settings::fpsLimiter   = 0;
-    Settings::frameskip    = 3;
+    Settings::fpsLimiter   = 1;
+    Settings::frameskip    = 2;
     Settings::threaded2D   = 0;
     Settings::threaded3D   = 0;
     Settings::highRes3D    = 0;
     Settings::screenGhost  = 0;
-    Settings::emulateAudio = 0;
-    Settings::audio16Bit   = 0;
+    Settings::emulateAudio = 1;
+    Settings::audio16Bit   = 1;
+    Settings::monoAudio    = 0; 
     Settings::savesFolder  = 1;
     Settings::statesFolder = 1;
     Settings::cheatsFolder = 1;
@@ -455,12 +512,14 @@ static void InitializeNDS() {
     if (!bottomScreenBuffer) bottomScreenBuffer = (uint32_t*)malloc(sz);
 
     if (topScreenBuffer && bottomScreenBuffer) {
-        for (int i = 0; i < NDS_SCREEN_WIDTH * NDS_SCREEN_HEIGHT; i++) {
-            topScreenBuffer[i]    = 0xFF0000FF;
-            bottomScreenBuffer[i] = 0x0000FFFF;
-        }
-    }
+    const uint32_t red    = 0xFC00u; 
+    const uint32_t yellow = 0xFFE0u; 
 
+    for (int i = 0; i < NDS_SCREEN_WIDTH * NDS_SCREEN_HEIGHT; i++) {
+        topScreenBuffer[i]    = red;
+        bottomScreenBuffer[i] = yellow;
+    }
+}
     emulatorThreadStack = (u8*)Noods_MEM2_Alloc(EMULATION_STACK_SIZE);
     if (!emulatorThreadStack) emulatorThreadStack = (u8*)malloc(EMULATION_STACK_SIZE);
 
@@ -543,11 +602,8 @@ static void ScanWiiInputs() {
 
     if ((pressed & WPAD_BUTTON_HOME) || (pressed & WPAD_CLASSIC_BUTTON_HOME)) {
         runEmulatorThread = false;
-        PPCCompilerBarrier();
         KThreadJoin(&emulatorThread);
-
         ShutdownAudio();
-
         delete ndsCore;
         ndsCore = nullptr;
 

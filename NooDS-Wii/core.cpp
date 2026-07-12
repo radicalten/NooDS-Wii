@@ -249,13 +249,10 @@ void Core::schedule(SchedTask task, uint32_t cycles) {
 
 void Core::enterGbaMode() {
     gbaMode = true;
-    
-    // Halt ARM9 permanently and ensure ARM7 is unhalted to run the GBA payload
     interpreter[0].halt(2);
-    interpreter[1].unhalt(2);
     updateRun();
 
-    // Reset event queues and repopulate baseline timing gates to prevent hangs
+    // Reset the scheduler and schedule initial tasks for GBA mode
     events.clear();
     schedule(RESET_CYCLES,    0x7FFFFFFF);
     schedule(GBA_SCANLINE240, 240 * 4);
@@ -284,7 +281,6 @@ void Core::endFrame() {
     PPCIrqState st = PPCIrqLockByMsr();
     running = 0;
     PPCIrqUnlockByMsr(st);
-
     fpsCount++;
 
     if (arm7Hle)

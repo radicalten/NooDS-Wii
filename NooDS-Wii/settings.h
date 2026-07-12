@@ -1,23 +1,3 @@
-/*
-    Copyright (C) 2019-2025 Hydr8gon
-    Copyright (C) 2026 radicalten
-
-    This file is part of NooDS-Wii.
-
-    NooDS-Wii is free software: you can redistribute it and/or modify it
-    under the terms of the GNU General Public License as published by
-    the Free Software Foundation, either version 3 of the License, or
-    (at your option) any later version.
-
-    NooDS-Wii is distributed in the hope that it will be useful, but
-    WITHOUT ANY WARRANTY; without even the implied warranty of
-    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-    General Public License for more details.
-
-    You should have received a copy of the GNU General Public License
-    along with NooDS-Wii. If not, see <https://www.gnu.org/licenses/>.
-*/
-
 #pragma once
 
 #include <string>
@@ -44,6 +24,7 @@ public:
     static int screenGhost;
     static int emulateAudio;
     static int audio16Bit;
+    static int monoAudio;       // 0 = stereo, 1 = mono
     static int savesFolder;
     static int statesFolder;
     static int cheatsFolder;
@@ -64,5 +45,5 @@ public:
 
 private:
     static std::vector<Setting> settings;
-    Settings() {} // Private to prevent instantiation
+    Settings() {}
 };

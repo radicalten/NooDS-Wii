@@ -1,4 +1,5 @@
 /*
+    Copyright (C) 2019-2025 Hydr8gon
     Copyright (C) 2026 radicalten
 
     This file is part of NooDS-Wii.
@@ -156,13 +157,12 @@ static const u8 debugFont[95][8] = {
 #define OVERLAY_ROWS (DEBUG_OVERLAY_HEIGHT / FONT_CHAR_H)
 
 static uint32_t overlayStaging[DEBUG_OVERLAY_WIDTH * DEBUG_OVERLAY_HEIGHT];
-static bool overlayRowDirty[OVERLAY_ROWS];
+static bool     overlayRowDirty[OVERLAY_ROWS];
 
 static void DrawCharToStaging(int col, int row, char c,
                                uint32_t fgColor, uint32_t bgColor) {
     if (c < 0x20 || c > 0x7E) c = '?';
     const u8* glyph = debugFont[c - 0x20];
-
     for (int py = 0; py < FONT_CHAR_H; py++) {
         u8 bits = glyph[py];
         for (int px = 0; px < FONT_CHAR_W; px++) {
@@ -174,8 +174,40 @@ static void DrawCharToStaging(int col, int row, char c,
     }
 }
 
-static void TileImageRGBA8_fromABGR(const uint32_t* src, u8* dest,
-                                     int width, int height) {
+
+//  tile a buffer of packed RGB5A3 words into GX_TF_RGB5A3 format.
+//  GX_TF_RGB5A3 tiles are 4×4 pixels, each pixel = 2 bytes (big-endian).
+//  One tile = 32 bytes.
+//  src[] : one uint32_t per pixel; the RGB5A3 word is in bits[15:0].
+//          (The gpu_2d.cpp framebuffer is uint32_t[] for alignment, but
+//           only the lower 16 bits carry valid colour data.)
+//  dest  : output tile buffer (32-byte-aligned GX texture memory)
+static void TileImageRGB5A3(const uint32_t* src, u8* dest,
+                              int width, int height) {
+    const int tilesX = width  >> 2;   // width  must be a multiple of 4
+    const int tilesY = height >> 2;   // height must be a multiple of 4
+
+    for (int ty = 0; ty < tilesY; ty++) {
+        for (int tx = 0; tx < tilesX; tx++) {
+            // Each tile is 32 bytes (4×4 pixels × 2 bytes each)
+            u8* tile = dest + (ty * tilesX + tx) * 32;
+
+            for (int py = 0; py < 4; py++) {
+                const uint32_t* row = src + (ty * 4 + py) * width + tx * 4;
+                for (int px = 0; px < 4; px++) {
+                    uint16_t rgb5a3 = (uint16_t)(row[px] & 0xFFFF);
+                    // GX expects big-endian 16-bit words
+                    int idx        = (py * 4 + px) * 2;
+                    tile[idx + 0]  = (u8)(rgb5a3 >> 8);   // high byte first
+                    tile[idx + 1]  = (u8)(rgb5a3 & 0xFF); // low byte second
+                }
+            }
+        }
+    }
+}
+
+static void TileImageRGBA8_ARGB(const uint32_t* src, u8* dest,
+                                  int width, int height) {
     const int tilesX = width  >> 2;
     const int tilesY = height >> 2;
 
@@ -189,12 +221,13 @@ static void TileImageRGBA8_fromABGR(const uint32_t* src, u8* dest,
                 const uint32_t* row = src + (ty * 4 + py) * width + tx * 4;
                 for (int px = 0; px < 4; px++) {
                     uint32_t p = row[px];
-                    u8 r = (u8)( p        & 0xFF);
-                    u8 g = (u8)((p >>  8) & 0xFF);
-                    u8 b = (u8)((p >> 16) & 0xFF);
+                    // overlayStaging is 0xAARRGGBB
                     u8 a = (u8)((p >> 24) & 0xFF);
+                    u8 r = (u8)((p >> 16) & 0xFF);
+                    u8 g = (u8)((p >>  8) & 0xFF);
+                    u8 b = (u8)( p        & 0xFF);
 
-                    int idx      = (py << 2) + px;
+                    int idx         = (py << 2) + px;
                     ar[idx * 2 + 0] = a;
                     ar[idx * 2 + 1] = r;
                     gb[idx * 2 + 0] = g;
@@ -259,8 +292,9 @@ void Wii_VideoInit() {
     GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_CLR0, GX_CLR_RGBA, GX_RGBA8, 0);
     GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_TEX0, GX_TEX_ST,   GX_F32,   0);
 
-    const size_t ndsBufSize = NDS_SCREEN_WIDTH * NDS_SCREEN_HEIGHT * 4;
-    wiiVid.texDataTop = (u8*)hw_mem2_align(ndsBufSize, 32);
+    const size_t ndsBufSize = NDS_SCREEN_WIDTH * NDS_SCREEN_HEIGHT * 2;
+
+    wiiVid.texDataTop    = (u8*)hw_mem2_align(ndsBufSize, 32);
     wiiVid.texDataBottom = (u8*)hw_mem2_align(ndsBufSize, 32);
     if (!wiiVid.texDataTop)    wiiVid.texDataTop    = (u8*)memalign(32, ndsBufSize);
     if (!wiiVid.texDataBottom) wiiVid.texDataBottom = (u8*)memalign(32, ndsBufSize);
@@ -273,11 +307,11 @@ void Wii_VideoInit() {
     GX_InitTexObj(&wiiVid.texObjTop,
                   wiiVid.texDataTop,
                   NDS_SCREEN_WIDTH, NDS_SCREEN_HEIGHT,
-                  GX_TF_RGBA8, GX_CLAMP, GX_CLAMP, GX_FALSE);
+                  GX_TF_RGB5A3, GX_CLAMP, GX_CLAMP, GX_FALSE);
     GX_InitTexObj(&wiiVid.texObjBottom,
                   wiiVid.texDataBottom,
                   NDS_SCREEN_WIDTH, NDS_SCREEN_HEIGHT,
-                  GX_TF_RGBA8, GX_CLAMP, GX_CLAMP, GX_FALSE);
+                  GX_TF_RGB5A3, GX_CLAMP, GX_CLAMP, GX_FALSE);
 
     GX_InitTexObjFilterMode(&wiiVid.texObjTop,    GX_NEAR, GX_NEAR);
     GX_InitTexObjFilterMode(&wiiVid.texObjBottom, GX_NEAR, GX_NEAR);
@@ -288,13 +322,14 @@ void Wii_VideoInit() {
 }
 
 void Wii_DebugOverlayInit() {
+    // Overlay keeps RGBA8 
     const size_t bufSize = DEBUG_OVERLAY_WIDTH * DEBUG_OVERLAY_HEIGHT * 4;
     wiiDbg.texData = (u8*)hw_mem2_align(bufSize, 32);
     if (!wiiDbg.texData) wiiDbg.texData = (u8*)memalign(32, bufSize);
 
-    memset(wiiDbg.texData,   0, bufSize);
-    memset(overlayStaging,   0, sizeof(overlayStaging));
-    memset(overlayRowDirty,  0, sizeof(overlayRowDirty));
+    memset(wiiDbg.texData,  0, bufSize);
+    memset(overlayStaging,  0, sizeof(overlayStaging));
+    memset(overlayRowDirty, 0, sizeof(overlayRowDirty));
     DCFlushRange(wiiDbg.texData, bufSize);
 
     GX_InitTexObj(&wiiDbg.texObj,
@@ -323,7 +358,7 @@ void Wii_DebugOverlayPrint(int line, const char* fmt, ...) {
     while (len < OVERLAY_COLS) buf[len++] = ' ';
     buf[OVERLAY_COLS] = '\0';
 
-    const uint32_t fg = 0xFFFFFFFF;
+    const uint32_t fg = 0xFFFFFFFF; // 0xAARRGGBB
     const uint32_t bg = 0xC0000000;
 
     for (int col = 0; col < OVERLAY_COLS; col++)
@@ -342,7 +377,6 @@ static void Wii_DebugOverlayFlush() {
 
         int py0 = row * FONT_CHAR_H;
         int py1 = py0 + FONT_CHAR_H;
-
         int tileRow0 = py0 >> 2;
         int tileRow1 = (py1 + 3) >> 2;
 
@@ -359,7 +393,7 @@ static void Wii_DebugOverlayFlush() {
                         + srcY * DEBUG_OVERLAY_WIDTH + tx * 4;
 
                     for (int tpx = 0; tpx < 4; tpx++) {
-                        uint32_t p = srcRow[tpx];
+                        uint32_t p = srcRow[tpx]; // 0xAARRGGBB
                         u8 a = (u8)((p >> 24) & 0xFF);
                         u8 r = (u8)((p >> 16) & 0xFF);
                         u8 g = (u8)((p >>  8) & 0xFF);
@@ -381,6 +415,7 @@ static void Wii_DebugOverlayFlush() {
 
         overlayRowDirty[row] = false;
     }
+    (void)anyDirty;
 }
 
 static void DrawScreenQuad(GXTexObj* texObj,
@@ -415,32 +450,35 @@ static void DrawScreenQuad(GXTexObj* texObj,
 void Wii_VideoRender(const uint32_t* srcTop, const uint32_t* srcBottom, bool gbaMode) {
     const int scrW = gbaMode ? GBA_SCREEN_WIDTH  : NDS_SCREEN_WIDTH;
     const int scrH = gbaMode ? GBA_SCREEN_HEIGHT : NDS_SCREEN_HEIGHT;
-    const size_t bufSize = (size_t)scrW * scrH * 4;
+
+    // RGB5A3: 2 bytes per pixel
+    const size_t bufSize = (size_t)scrW * scrH * 2;
 
     if (gbaMode != wiiVid.lastGbaMode) {
         GX_InitTexObj(&wiiVid.texObjTop,
                       wiiVid.texDataTop,
                       scrW, scrH,
-                      GX_TF_RGBA8, GX_CLAMP, GX_CLAMP, GX_FALSE);
+                      GX_TF_RGB5A3, GX_CLAMP, GX_CLAMP, GX_FALSE);
         GX_InitTexObjFilterMode(&wiiVid.texObjTop, GX_NEAR, GX_NEAR);
 
         if (!gbaMode) {
             GX_InitTexObj(&wiiVid.texObjBottom,
                           wiiVid.texDataBottom,
                           scrW, scrH,
-                          GX_TF_RGBA8, GX_CLAMP, GX_CLAMP, GX_FALSE);
+                          GX_TF_RGB5A3, GX_CLAMP, GX_CLAMP, GX_FALSE);
             GX_InitTexObjFilterMode(&wiiVid.texObjBottom, GX_NEAR, GX_NEAR);
         }
 
         wiiVid.lastGbaMode = gbaMode;
     }
 
+    // Upload screen textures using the new RGB5A3 tiling function
     if (srcTop) {
-        TileImageRGBA8_fromABGR(srcTop, wiiVid.texDataTop, scrW, scrH);
+        TileImageRGB5A3(srcTop, wiiVid.texDataTop, scrW, scrH);
         DCFlushRange(wiiVid.texDataTop, bufSize);
     }
     if (srcBottom && !gbaMode) {
-        TileImageRGBA8_fromABGR(srcBottom, wiiVid.texDataBottom, scrW, scrH);
+        TileImageRGB5A3(srcBottom, wiiVid.texDataBottom, scrW, scrH);
         DCFlushRange(wiiVid.texDataBottom, bufSize);
     }
 
@@ -459,7 +497,7 @@ void Wii_VideoRender(const uint32_t* srcTop, const uint32_t* srcBottom, bool gba
         const int originY = ((int)rmode->efbHeight - gbaH) / 2;
 
         DrawScreenQuad(&wiiVid.texObjTop,
-                       (f32)originX,        (f32)originY,
+                       (f32)originX,          (f32)originY,
                        (f32)(originX + gbaW), (f32)(originY + gbaH),
                        false);
     }
@@ -481,9 +519,8 @@ void Wii_VideoRender(const uint32_t* srcTop, const uint32_t* srcBottom, bool gba
         DrawScreenQuad(&wiiVid.texObjBottom, x1, botY1, x2, botY2, false);
     }
 
-    if (!gbaMode && g_cursorShow) {
+    if (!gbaMode && g_cursorShow)
         Wii_DrawCursor(g_cursorX, g_cursorY);
-    }
 
     if (wiiDbg.enabled && wiiDbg.texData) {
         DrawScreenQuad(&wiiDbg.texObj,
@@ -507,13 +544,13 @@ void Wii_DrawCursor(float x, float y) {
     GX_SetTevOrder(GX_TEVSTAGE0, GX_TEXCOORDNULL, GX_TEXMAP_NULL, GX_COLOR0A0);
     GX_SetTevOp(GX_TEVSTAGE0, GX_PASSCLR);
     GX_SetBlendMode(GX_BM_BLEND, GX_BL_SRCALPHA, GX_BL_INVSRCALPHA, GX_LO_CLEAR);
-    
+
     const float size = 3.0f;
     GX_Begin(GX_QUADS, GX_VTXFMT0, 4);
-        GX_Position3f32(x - size, y - size, 0.0f); GX_Color4u8(0x00, 0xFF, 0xFF, 0xE0); GX_TexCoord2f32(0.0f, 0.0f);
-        GX_Position3f32(x + size, y - size, 0.0f); GX_Color4u8(0x00, 0xFF, 0xFF, 0xE0); GX_TexCoord2f32(0.0f, 0.0f);
-        GX_Position3f32(x + size, y + size, 0.0f); GX_Color4u8(0x00, 0xFF, 0xFF, 0xE0); GX_TexCoord2f32(0.0f, 0.0f);
-        GX_Position3f32(x - size, y + size, 0.0f); GX_Color4u8(0x00, 0xFF, 0xFF, 0xE0); GX_TexCoord2f32(0.0f, 0.0f);
+        GX_Position3f32(x - size, y - size, 0.0f); GX_Color4u8(0x00,0xFF,0xFF,0xE0); GX_TexCoord2f32(0,0);
+        GX_Position3f32(x + size, y - size, 0.0f); GX_Color4u8(0x00,0xFF,0xFF,0xE0); GX_TexCoord2f32(0,0);
+        GX_Position3f32(x + size, y + size, 0.0f); GX_Color4u8(0x00,0xFF,0xFF,0xE0); GX_TexCoord2f32(0,0);
+        GX_Position3f32(x - size, y + size, 0.0f); GX_Color4u8(0x00,0xFF,0xFF,0xE0); GX_TexCoord2f32(0,0);
     GX_End();
 }
 
