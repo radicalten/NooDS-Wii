@@ -1,5 +1,4 @@
 /*
-    Copyright (C) 2019-2025 Hydr8gon
     Copyright (C) 2026 radicalten
 
     This file is part of NooDS-Wii.
