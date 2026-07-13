@@ -25,18 +25,6 @@
 
 class Core;
 
-// Output pixel format: GX RGB5A3 (native Wii texture word, big-endian)
-// Opaque pixel  (bit 15 = 1): 1_RRRRR_GGGGG_BBBBB
-// Transparent   (bit 15 = 0): 0_AAA_RRRR_GGGG_BBBB
-
-// We always emit opaque pixels from the 2D engine, so bit 15 is always 1.
-// The 18-bit RGB6 internal colour  (b[17:12] g[11:6] r[5:0]) is converted by 
-// taking the top 5 bits of each channel: R5 = r6 >> 1,  G5 = g6 >> 1,  B5 = b6 >> 1
-
-// The resulting 16-bit value is stored big-endian inside a uint16_t because
-// GX textures are big-endian; on the PowerPC this is naturally correct when
-// we write a uint16_t straight to the tiled texture buffer.
-
 class Gpu2D {
 public:
     Gpu2D(Core *core, bool engine);
@@ -48,22 +36,20 @@ public:
     void drawGbaScanline(int line);
     void drawScanline(int line);
 
-    // Framebuffer now holds RGB5A3 words (uint16_t packed into uint32_t
-    // slots for alignment – upper 16 bits unused / zero).
-    // We keep uint32_t so that the rest of the emulator core (gpu.cpp,
-    // gpu3D, etc.) that calls getFramebuffer() keeps compiling without
-    // changes; the actual useful data is in bits [15:0] of every word.
+    // Framebuffer now stores native RGB5A3 uint16_t pixels directly
+    uint16_t *getFramebuffer() { return framebuffer; }
 
-    uint32_t *getFramebuffer() { return framebuffer; }
-    uint32_t *getRawLine()     { return layers[0]; }
+    // getRawLine() still returns uint32_t* (layers[0] in RGB5/RGB6 internal format)
+    // Used only by gpu.cpp display-capture path before final conversion
+    uint32_t *getRawLine() { return layers[0]; }
 
-    uint32_t readDispCnt()         { return dispCnt; }
-    uint16_t readBgCnt(int bg)     { return bgCnt[bg]; }
-    uint16_t readWinIn()           { return winIn; }
-    uint16_t readWinOut()          { return winOut; }
-    uint16_t readBldCnt()          { return bldCnt; }
-    uint16_t readBldAlpha()        { return bldAlpha; }
-    uint16_t readMasterBright()    { return masterBright; }
+    uint32_t readDispCnt()      { return dispCnt; }
+    uint16_t readBgCnt(int bg)  { return bgCnt[bg]; }
+    uint16_t readWinIn()        { return winIn; }
+    uint16_t readWinOut()       { return winOut; }
+    uint16_t readBldCnt()       { return bldCnt; }
+    uint16_t readBldAlpha()     { return bldAlpha; }
+    uint16_t readMasterBright() { return masterBright; }
 
     void writeDispCnt(uint32_t mask, uint32_t value);
     void writeBgCnt(int bg, uint16_t mask, uint16_t value);
@@ -93,11 +79,15 @@ private:
     uint8_t *palette, *oam;
     uint8_t **extPalettes;
 
-    // Internal framebuffer: each slot stores one RGB5A3 word in bits[15:0].
-    uint32_t framebuffer[256 * 192] = {};
+    // Native RGB5A3 framebuffer — each pixel is a uint16_t GX word
+    uint16_t framebuffer[256 * 192] = {};
 
-    // Working layers still use the old RGB6 internal format during rendering;
-    // conversion to RGB5A3 happens once at the end of each scanline.
+    // Separate object-window flag buffer replaces the old BIT(24) trick
+    // that relied on spare bits in the uint32_t framebuffer.
+    // Set to non-zero for pixels covered by an OBJ-window sprite.
+    uint8_t objWinBuffer[256] = {};
+
+    // Working layers remain uint32_t (RGB5 / RGB6 internal format)
     uint32_t layers[2][256]    = {};
     int8_t   priorities[2][256] = {};
     int8_t   blendBits[2][256]  = {};
@@ -133,39 +123,64 @@ private:
     // Colour helpers
     // -----------------------------------------------------------------------
 
-    // Keep the original RGB5→RGB6 converter for internal blending arithmetic.
+    // RGB5 → RGB6 for internal blending (DS 2D engine pipeline)
     static uint32_t rgb5ToRgb6(uint32_t color);
 
-    // Convert a finalised RGB6 pixel (bits 17:0 = b6 g6 r6) to an RGB5A3
-    // opaque word suitable for direct DMA into a GX_TF_RGB5A3 texture.
-    //   RGB5A3 opaque: bit15=1, bits14:10=R5, bits9:5=G5, bits4:0=B5
+    // RGB6 (18-bit internal) → RGB5A3 opaque GX word
+    // Input:  bits[17:12]=b6, bits[11:6]=g6, bits[5:0]=r6
+    // Output: 1_RRRRR_GGGGG_BBBBB
     static inline uint16_t rgb6ToRgb5A3(uint32_t rgb6) {
-        uint8_t r5 = (uint8_t)((rgb6 >>  1) & 0x1F); // r6[5:1]
-        uint8_t g5 = (uint8_t)((rgb6 >>  7) & 0x1F); // g6[11:7]  (g starts at bit 6)
-        uint8_t b5 = (uint8_t)((rgb6 >> 13) & 0x1F); // b6[17:13] (b starts at bit 12)
-        return (uint16_t)(0x8000u | ((uint16_t)r5 << 10) | ((uint16_t)g5 << 5) | b5);
+        uint8_t r5 = (uint8_t)((rgb6 >>  1) & 0x1F);
+        uint8_t g5 = (uint8_t)((rgb6 >>  7) & 0x1F);
+        uint8_t b5 = (uint8_t)((rgb6 >> 13) & 0x1F);
+        return (uint16_t)(0x8000u
+            | ((uint16_t)r5 << 10)
+            | ((uint16_t)g5 <<  5)
+            | b5);
     }
 
-    // Convert a raw RGB5 palette word (DS/GBA 16-bit colour, bit15 = opaque
-    // flag inside the emulator – NOT the GX opaque bit) to RGB5A3.
-    // The DS stores colours as  0_bbbbb_ggggg_rrrrr  (bit15 used as flag).
+    // Raw DS palette word (0_bbbbb_ggggg_rrrrr) → RGB5A3 opaque GX word
     static inline uint16_t rgb5PalToRgb5A3(uint32_t palColor) {
-        // palColor lower 15 bits: bits14:10=b, bits9:5=g, bits4:0=r  (DS order)
         uint8_t r5 = (uint8_t)( palColor        & 0x1F);
         uint8_t g5 = (uint8_t)((palColor >>  5) & 0x1F);
         uint8_t b5 = (uint8_t)((palColor >> 10) & 0x1F);
-        // GX RGB5A3 opaque: 1_RRRRR_GGGGG_BBBBB
-        return (uint16_t)(0x8000u | ((uint16_t)r5 << 10) | ((uint16_t)g5 << 5) | b5);
+        return (uint16_t)(0x8000u
+            | ((uint16_t)r5 << 10)
+            | ((uint16_t)g5 <<  5)
+            | b5);
     }
 
-    // GBA blending works entirely in RGB5 space; convert the finished RGB5
-    // blended value (same bit layout as a palette word, no flag bits) to RGB5A3.
+    // GBA blended RGB5 value (same bit layout as palette, no flag bits) → RGB5A3
     static inline uint16_t rgb5BlendToRgb5A3(uint32_t blended) {
-        // blended: bits14:10=b, bits9:5=g, bits4:0=r
         uint8_t r5 = (uint8_t)( blended        & 0x1F);
         uint8_t g5 = (uint8_t)((blended >>  5) & 0x1F);
         uint8_t b5 = (uint8_t)((blended >> 10) & 0x1F);
-        return (uint16_t)(0x8000u | ((uint16_t)r5 << 10) | ((uint16_t)g5 << 5) | b5);
+        return (uint16_t)(0x8000u
+            | ((uint16_t)r5 << 10)
+            | ((uint16_t)g5 <<  5)
+            | b5);
+    }
+
+    // Unpack an RGB5A3 GX word back to a 5-bit-per-channel value for
+    // master-brightness arithmetic (only called after output stage)
+    static inline uint16_t rgb5a3BrightnessUp(uint16_t px, uint8_t factor) {
+        uint8_t r = (px >> 10) & 0x1F;
+        uint8_t g = (px >>  5) & 0x1F;
+        uint8_t b =  px        & 0x1F;
+        r = (uint8_t)(r + (uint8_t)((31 - r) * factor / 16));
+        g = (uint8_t)(g + (uint8_t)((31 - g) * factor / 16));
+        b = (uint8_t)(b + (uint8_t)((31 - b) * factor / 16));
+        return (uint16_t)(0x8000u | ((uint16_t)r << 10) | ((uint16_t)g << 5) | b);
+    }
+
+    static inline uint16_t rgb5a3BrightnessDown(uint16_t px, uint8_t factor) {
+        uint8_t r = (px >> 10) & 0x1F;
+        uint8_t g = (px >>  5) & 0x1F;
+        uint8_t b =  px        & 0x1F;
+        r = (uint8_t)(r - (uint8_t)(r * factor / 16));
+        g = (uint8_t)(g - (uint8_t)(g * factor / 16));
+        b = (uint8_t)(b - (uint8_t)(b * factor / 16));
+        return (uint16_t)(0x8000u | ((uint16_t)r << 10) | ((uint16_t)g << 5) | b);
     }
 
     void drawBgPixel(int bg, int line, int x, uint32_t pixel);

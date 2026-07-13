@@ -39,7 +39,11 @@ public:
     void saveState(FILE *file);
     void loadState(FILE *file);
 
-    bool getFrame(uint32_t *out, bool gbaCrop);
+    // out[] receives uint16_t RGB5A3 words packed into uint32_t slots
+    // (bits[15:0] valid; bits[31:16] zero) in normal mode,
+    // or full ABGR8 uint32_t in high-res / screen-filter mode.
+    bool getFrame(uint16_t *out, bool gbaCrop);
+
     void invalidate3D() { dirty3D |= BIT(0); }
 
     void gbaScanline240();
@@ -60,9 +64,14 @@ private:
     Core *core;
 
     struct Buffers {
-        uint32_t *framebuffer = nullptr; // RGB5A3 words from Gpu2D
-        uint32_t *hiRes3D     = nullptr; // RGB6 words from Gpu3DRenderer
-        bool      top3D       = false;
+        // 2D engine output: native RGB5A3 uint16_t pixels
+        uint16_t *framebuffer = nullptr;
+
+        // 3D renderer hi-res output: RGB5A3 uint16_t pixels
+        // (Gpu3DRenderer::framebuffer is already uint16_t)
+        uint16_t *hiRes3D     = nullptr;
+
+        bool top3D = false;
     };
 
     std::queue<Buffers> framebuffers;
@@ -83,32 +92,62 @@ private:
     uint32_t dispCapCnt  = 0;
     uint16_t powCnt1     = 0;
 
-    static inline uint32_t rgb5a3ToAbgr8(uint32_t rgb5a3) {
-        uint16_t px = (uint16_t)(rgb5a3 & 0xFFFF);
-        uint8_t r5  = (px >> 10) & 0x1F;
-        uint8_t g5  = (px >>  5) & 0x1F;
-        uint8_t b5  =  px        & 0x1F;
-        // Scale 5-bit → 8-bit: replicate top bits into low bits
-        uint8_t r8  = (r5 << 3) | (r5 >> 2);
-        uint8_t g8  = (g5 << 3) | (g5 >> 2);
-        uint8_t b8  = (b5 << 3) | (b5 >> 2);
-        return (0xFFu << 24) | ((uint32_t)b8 << 16) | ((uint32_t)g8 << 8) | r8;
+    // Unpack RGB5A3 → ABGR8 for high-res / screen-ghost paths
+    static inline uint32_t rgb5a3ToAbgr8(uint16_t px) {
+        if (px & 0x8000u) {
+            // Opaque: 1_RRRRR_GGGGG_BBBBB
+            uint8_t r5 = (px >> 10) & 0x1F;
+            uint8_t g5 = (px >>  5) & 0x1F;
+            uint8_t b5 =  px        & 0x1F;
+            uint8_t r8 = (r5 << 3) | (r5 >> 2);
+            uint8_t g8 = (g5 << 3) | (g5 >> 2);
+            uint8_t b8 = (b5 << 3) | (b5 >> 2);
+            return (0xFFu << 24) | ((uint32_t)b8 << 16)
+                 | ((uint32_t)g8 << 8) | r8;
+        } else {
+            // Translucent: 0_AAA_RRRR_GGGG_BBBB
+            uint8_t a3 = (px >> 12) & 0x07;
+            uint8_t r4 = (px >>  8) & 0x0F;
+            uint8_t g4 = (px >>  4) & 0x0F;
+            uint8_t b4 =  px        & 0x0F;
+            uint8_t a8 = (a3 << 5) | (a3 << 2) | (a3 >> 1);
+            uint8_t r8 = (r4 << 4) | r4;
+            uint8_t g8 = (g4 << 4) | g4;
+            uint8_t b8 = (b4 << 4) | b4;
+            return ((uint32_t)a8 << 24) | ((uint32_t)b8 << 16)
+                 | ((uint32_t)g8 << 8) | r8;
+        }
     }
 
-    // Convert RGB6 (3D renderer internal) → ABGR8, used only by hiRes3D path.
+    // RGB6 (3D internal) → ABGR8, used only by hi-res 3D compositing
     static inline uint32_t rgb6ToAbgr8(uint32_t color) {
         uint8_t r = (uint8_t)(((color >>  0) & 0x3F) * 255 / 63);
         uint8_t g = (uint8_t)(((color >>  6) & 0x3F) * 255 / 63);
         uint8_t b = (uint8_t)(((color >> 12) & 0x3F) * 255 / 63);
-        return (0xFFu << 24) | ((uint32_t)b << 16) | ((uint32_t)g << 8) | r;
+        return (0xFFu << 24) | ((uint32_t)b << 16)
+             | ((uint32_t)g << 8) | r;
     }
 
-    // Convert RGB6 → RGB5 for display capture (reads from 3D renderer line,
-    // which is still RGB6; Gpu2D::getRawLine() also still returns RGB5/RGB6).
+    // RGB6 → RGB5 for display capture
     static inline uint16_t rgb6ToRgb5(uint32_t color) {
         uint8_t r = (uint8_t)((color >>  1) & 0x1F);
         uint8_t g = (uint8_t)((color >>  7) & 0x1F);
         uint8_t b = (uint8_t)((color >> 13) & 0x1F);
+        return (uint16_t)(BIT(15) | (b << 10) | (g << 5) | r);
+    }
+
+    // Unpack stored RGB5A3 pixel (from uint16_t fb slot) back to RGB6
+    // for display-capture blending.  Only called when the source is
+    // a 2D layer line (getRawLine) which is still uint32_t RGB5/RGB6.
+    // This helper is used when source IS the 3D renderer line (uint16_t).
+    static inline uint16_t rgb5a3ToRgb5(uint16_t px) {
+        // Opaque pixel (bit15=1): already has R5 G5 B5 in the right positions
+        // for a DS RGB5 word — just return it as-is with bit15 set.
+        if (px & 0x8000u) return px; // 1_RRRRR_GGGGG_BBBBB
+        // Translucent: recover 4-bit channels, shift to 5-bit
+        uint8_t r = ((px >>  8) & 0x0F) << 1;
+        uint8_t g = ((px >>  4) & 0x0F) << 1;
+        uint8_t b = ( px        & 0x0F) << 1;
         return (uint16_t)(BIT(15) | (b << 10) | (g << 5) | r);
     }
 

@@ -57,7 +57,9 @@ volatile uint8_t ConsoleUI::running;
 std::string ConsoleUI::ndsPath, ConsoleUI::gbaPath;
 std::string ConsoleUI::basePath, ConsoleUI::curPath;
 
-uint32_t ConsoleUI::framebuffer[256 * 192 * 8];
+// Native RGB5A3 framebuffer — 256×192×8 uint16_t halfwords
+uint16_t ConsoleUI::framebuffer[256 * 192 * 8];
+
 ScreenLayout ConsoleUI::layout;
 bool ConsoleUI::gbaMode;
 bool ConsoleUI::changed;
@@ -75,8 +77,10 @@ int ConsoleUI::menuTheme = 0;
 int ConsoleUI::keyBinds[] = {};
 
 const uint32_t ConsoleUI::themeColors[] = {
-    0xFF2D2D2D, 0xFFFFFFFF, 0xFF4B4B4B, 0xFF232323, 0xFFE1B955, 0xFFC8FF00, 0xFFA2A2A2, // Dark
-    0xFFEBEBEB, 0xFF2D2D2D, 0xFFCDCDCD, 0xFFFFFFFF, 0xFFD2D732, 0xFFF05032, 0xFF727272  // Light
+    0xFF2D2D2D, 0xFFFFFFFF, 0xFF4B4B4B, 0xFF232323,
+    0xFFE1B955, 0xFFC8FF00, 0xFFA2A2A2, // Dark
+    0xFFEBEBEB, 0xFF2D2D2D, 0xFFCDCDCD, 0xFFFFFFFF,
+    0xFFD2D732, 0xFFF05032, 0xFF727272  // Light
 };
 
 const uint8_t ConsoleUI::charWidths[] = {
@@ -92,9 +96,11 @@ const uint8_t ConsoleUI::charWidths[] = {
     16, 9, 8, 9, 12, 0, 40, 40, 40, 40
 };
 
-void ConsoleUI::drawRectangle(float x, float y, float w, float h, uint32_t color) {
-    static uint32_t data = 0xFFFFFFFF;
-    static void *texture = createTexture(&data, 1, 1);
+void ConsoleUI::drawRectangle(float x, float y, float w, float h,
+    uint32_t color) {
+    // Single white pixel as a 1×1 RGBA8 texture for UI rectangles
+    static uint32_t data    = 0xFFFFFFFF;
+    static void    *texture = createTextureRGBA8(&data, 1, 1);
     drawTexture(texture, 0, 0, 1, 1, x, y, w, h, false, 0, color);
 }
 
@@ -103,33 +109,40 @@ void ConsoleUI::drawString(std::string string, float x, float y,
     float offset = alignRight ? -stringWidth(string) : 0;
     for (uint32_t i = 0; i < string.size(); i++) {
         float x1 = x + offset * size / 48;
-        float tx = 48.0f * (((uint8_t)string[i] - 32) % 10);
-        float ty = 48.0f * (((uint8_t)string[i] - 32) / 10);
-        drawTexture(fontTexture, tx, ty, 47, 47, x1, y, size, size, true, 0, color);
+        float tx  = 48.0f * (((uint8_t)string[i] - 32) % 10);
+        float ty  = 48.0f * (((uint8_t)string[i] - 32) / 10);
+        drawTexture(fontTexture, tx, ty, 47, 47,
+            x1, y, size, size, true, 0, color);
         offset += charWidths[(uint8_t)string[i] - 32];
     }
 }
 
 uint32_t ConsoleUI::getInputPress() {
     static uint32_t buttons = 0;
-    uint32_t held = getInputHeld();
+    uint32_t held    = getInputHeld();
     uint32_t pressed = held & ~buttons;
     buttons = held;
     return pressed;
 }
 
+// bmpToTexture builds an RGBA8 uint32_t buffer from BMP data and uploads
+// it as a UI texture (icons, font sheet, etc.) — NOT an emulator screen.
 void *ConsoleUI::bmpToTexture(uint8_t *bmp) {
     int width  = U8TO32(bmp, 0x12);
     int height = U8TO32(bmp, 0x16);
     uint32_t *data = new uint32_t[width * height];
     for (int y = 0; y < height; y++) {
         for (int x = 0; x < width; x++) {
-            uint8_t *color = &bmp[0x46 + (((height - y - 1) * width + x) << 2)];
+            uint8_t *color =
+                &bmp[0x46 + (((height - y - 1) * width + x) << 2)];
             data[y * width + x] =
-                (color[3] << 24) | (color[0] << 16) | (color[1] << 8) | color[2];
+                ((uint32_t)color[3] << 24) |
+                ((uint32_t)color[0] << 16) |
+                ((uint32_t)color[1] <<  8) |
+                 (uint32_t)color[2];
         }
     }
-    void *texture = createTexture(data, width, height);
+    void *texture = createTextureRGBA8(data, width, height);
     delete[] data;
     return texture;
 }
@@ -144,34 +157,39 @@ int ConsoleUI::stringWidth(std::string &string) {
 void ConsoleUI::initialize(int width, int height,
     std::string root, std::string prefix) {
 
-    fileTextures[0]   = bmpToTexture(&_binary_src_console_images_file_dark_bmp_start);
-    fileTextures[1]   = bmpToTexture(&_binary_src_console_images_file_light_bmp_start);
-    folderTextures[0] = bmpToTexture(&_binary_src_console_images_folder_dark_bmp_start);
-    folderTextures[1] = bmpToTexture(&_binary_src_console_images_folder_light_bmp_start);
-    fontTexture       = bmpToTexture(&_binary_src_console_images_font_bmp_start);
+    fileTextures[0]   =
+        bmpToTexture(&_binary_src_console_images_file_dark_bmp_start);
+    fileTextures[1]   =
+        bmpToTexture(&_binary_src_console_images_file_light_bmp_start);
+    folderTextures[0] =
+        bmpToTexture(&_binary_src_console_images_folder_dark_bmp_start);
+    folderTextures[1] =
+        bmpToTexture(&_binary_src_console_images_folder_light_bmp_start);
+    fontTexture       =
+        bmpToTexture(&_binary_src_console_images_font_bmp_start);
 
     for (int i = 0; i < INPUT_MAX; i++)
         keyBinds[i] = defaultKeys[i];
 
     std::vector<Setting> platformSettings = {
-        Setting("showFpsCounter",  &showFpsCounter,           false),
-        Setting("menuTheme",       &menuTheme,                false),
-        Setting("keyA",            &keyBinds[INPUT_A],        false),
-        Setting("keyB",            &keyBinds[INPUT_B],        false),
-        Setting("keySelect",       &keyBinds[INPUT_SELECT],   false),
-        Setting("keyStart",        &keyBinds[INPUT_START],    false),
-        Setting("keyRight",        &keyBinds[INPUT_RIGHT],    false),
-        Setting("keyLeft",         &keyBinds[INPUT_LEFT],     false),
-        Setting("keyUp",           &keyBinds[INPUT_UP],       false),
-        Setting("keyDown",         &keyBinds[INPUT_DOWN],     false),
-        Setting("keyR",            &keyBinds[INPUT_R],        false),
-        Setting("keyL",            &keyBinds[INPUT_L],        false),
-        Setting("keyX",            &keyBinds[INPUT_X],        false),
-        Setting("keyY",            &keyBinds[INPUT_Y],        false),
-        Setting("keyMenu",         &keyBinds[INPUT_MENU],     false),
-        Setting("keyFastHold",     &keyBinds[INPUT_FAST_HOLD],false),
-        Setting("keyFastToggle",   &keyBinds[INPUT_FAST_TOGG],false),
-        Setting("keyScreenSwap",   &keyBinds[INPUT_SCRN_SWAP],false)
+        Setting("showFpsCounter",  &showFpsCounter,            false),
+        Setting("menuTheme",       &menuTheme,                 false),
+        Setting("keyA",            &keyBinds[INPUT_A],         false),
+        Setting("keyB",            &keyBinds[INPUT_B],         false),
+        Setting("keySelect",       &keyBinds[INPUT_SELECT],    false),
+        Setting("keyStart",        &keyBinds[INPUT_START],     false),
+        Setting("keyRight",        &keyBinds[INPUT_RIGHT],     false),
+        Setting("keyLeft",         &keyBinds[INPUT_LEFT],      false),
+        Setting("keyUp",           &keyBinds[INPUT_UP],        false),
+        Setting("keyDown",         &keyBinds[INPUT_DOWN],      false),
+        Setting("keyR",            &keyBinds[INPUT_R],         false),
+        Setting("keyL",            &keyBinds[INPUT_L],         false),
+        Setting("keyX",            &keyBinds[INPUT_X],         false),
+        Setting("keyY",            &keyBinds[INPUT_Y],         false),
+        Setting("keyMenu",         &keyBinds[INPUT_MENU],      false),
+        Setting("keyFastHold",     &keyBinds[INPUT_FAST_HOLD], false),
+        Setting("keyFastToggle",   &keyBinds[INPUT_FAST_TOGG], false),
+        Setting("keyScreenSwap",   &keyBinds[INPUT_SCRN_SWAP], false)
     };
 
     ScreenLayout::addSettings();
@@ -213,35 +231,52 @@ void ConsoleUI::mainLoop(MenuTouch (*specialTouch)(),
             changed = false;
         }
 
-        void *gbaTexture = nullptr, *topTexture = nullptr, *botTexture = nullptr;
-        bool shift = (Settings::highRes3D || Settings::screenFilter == 1);
+        // getFrame() now writes native RGB5A3 uint16_t pixels into
+        // framebuffer[].  No hi-res ABGR8 path exists any more — the
+        // 3D renderer already stores everything as RGB5A3.
         core->gpu.getFrame(framebuffer, gbaMode);
         startFrame(0);
 
+        void *gbaTexture = nullptr;
+        void *topTexture = nullptr;
+        void *botTexture = nullptr;
+
         if (gbaMode) {
-            gbaTexture = createTexture(&framebuffer[0],
-                240 << shift, 160 << shift);
-            drawTexture(gbaTexture, 0, 0, 240 << shift, 160 << shift,
-                layout.topX, layout.topY, layout.topWidth, layout.topHeight,
-                Settings::screenFilter, ScreenLayout::screenRotation);
+            // GBA: 240×160 RGB5A3 pixels at offset 0
+            gbaTexture = createTexture(
+                &framebuffer[0], 240, 160);
+            drawTexture(gbaTexture, 0, 0, 240, 160,
+                layout.topX, layout.topY,
+                layout.topWidth, layout.topHeight,
+                Settings::screenFilter,
+                ScreenLayout::screenRotation);
         }
         else {
+            // NDS: top screen starts at offset 0 (256×192 pixels)
+            // Bottom screen follows immediately after
+            // (256×192 uint16_t = 256*192 halfwords)
+            const int screenPixels = 256 * 192;
+
             if (ScreenLayout::screenArrangement != 3 ||
                 ScreenLayout::screenSizing < 2) {
-                topTexture = createTexture(&framebuffer[0],
-                    256 << shift, 192 << shift);
-                drawTexture(topTexture, 0, 0, 256 << shift, 192 << shift,
-                    layout.topX, layout.topY, layout.topWidth, layout.topHeight,
-                    Settings::screenFilter, ScreenLayout::screenRotation);
+                topTexture = createTexture(
+                    &framebuffer[0], 256, 192);
+                drawTexture(topTexture, 0, 0, 256, 192,
+                    layout.topX, layout.topY,
+                    layout.topWidth, layout.topHeight,
+                    Settings::screenFilter,
+                    ScreenLayout::screenRotation);
             }
+
             if (ScreenLayout::screenArrangement != 3 ||
                 ScreenLayout::screenSizing == 2) {
                 botTexture = createTexture(
-                    &framebuffer[(256 * 192) << (shift * 2)],
-                    256 << shift, 192 << shift);
-                drawTexture(botTexture, 0, 0, 256 << shift, 192 << shift,
-                    layout.botX, layout.botY, layout.botWidth, layout.botHeight,
-                    Settings::screenFilter, ScreenLayout::screenRotation);
+                    &framebuffer[screenPixels], 256, 192);
+                drawTexture(botTexture, 0, 0, 256, 192,
+                    layout.botX, layout.botY,
+                    layout.botWidth, layout.botHeight,
+                    Settings::screenFilter,
+                    ScreenLayout::screenRotation);
             }
         }
 
@@ -284,12 +319,13 @@ void ConsoleUI::mainLoop(MenuTouch (*specialTouch)(),
         if (topTexture) destroyTexture(topTexture);
         if (botTexture) destroyTexture(botTexture);
 
-        // Restore the FPS limiter when pausing or releasing fast-forward hold
-        if ((fpsLimiterBackup && (pressed & keyBinds[INPUT_MENU])) ||
+        // Restore the FPS limiter when pausing or releasing fast-forward
+        if ((fpsLimiterBackup &&
+             (pressed & keyBinds[INPUT_MENU])) ||
             (uint32_t(fpsLimiterBackup - 1) < 0x100 &&
              !(held & keyBinds[INPUT_FAST_HOLD]))) {
             Settings::fpsLimiter = fpsLimiterBackup & 0xFF;
-            fpsLimiterBackup = 0;
+            fpsLimiterBackup     = 0;
         }
 
         if (pressed & keyBinds[INPUT_MENU]) {
@@ -297,18 +333,18 @@ void ConsoleUI::mainLoop(MenuTouch (*specialTouch)(),
         }
         else if (pressed & keyBinds[INPUT_FAST_HOLD]) {
             if (Settings::fpsLimiter != 0) {
-                fpsLimiterBackup = Settings::fpsLimiter;
+                fpsLimiterBackup   = Settings::fpsLimiter;
                 Settings::fpsLimiter = 0;
             }
         }
         else if (pressed & keyBinds[INPUT_FAST_TOGG]) {
             if (Settings::fpsLimiter != 0) {
-                fpsLimiterBackup = Settings::fpsLimiter | 0x100;
+                fpsLimiterBackup   = Settings::fpsLimiter | 0x100;
                 Settings::fpsLimiter = 0;
             }
             else if (fpsLimiterBackup != 0) {
                 Settings::fpsLimiter = fpsLimiterBackup & 0xFF;
-                fpsLimiterBackup = 0;
+                fpsLimiterBackup     = 0;
             }
         }
         else if (pressed & keyBinds[INPUT_SCRN_SWAP]) {
@@ -357,11 +393,11 @@ uint32_t ConsoleUI::menu(std::string title, std::vector<MenuItem> &items,
     std::string actionB = "\x81 Back     ";
     std::string actionA = "\x80 OK";
 
-    int boundsAB   = 1218 - (stringWidth(actionA) +
-                      2.5f * charWidths[0]) * 34 / 48;
-    int boundsBX   = boundsAB   - stringWidth(actionB)    * 34 / 48;
-    int boundsXPlus= boundsBX   - stringWidth(actionX)    * 34 / 48;
-    int boundsPlus = boundsXPlus- stringWidth(actionPlus) * 34 / 48;
+    int boundsAB    = 1218 - (stringWidth(actionA) +
+                       2.5f * charWidths[0]) * 34 / 48;
+    int boundsBX    = boundsAB    - stringWidth(actionB)    * 34 / 48;
+    int boundsXPlus = boundsBX    - stringWidth(actionX)    * 34 / 48;
+    int boundsPlus  = boundsXPlus - stringWidth(actionPlus) * 34 / 48;
 
     bool upHeld = false, downHeld = false, scroll = false;
     std::chrono::steady_clock::time_point timeHeld;
@@ -415,15 +451,17 @@ uint32_t ConsoleUI::menu(std::string title, std::vector<MenuItem> &items,
             index += items.empty() ? 0 : items[index].header;
         }
 
-        if (upHeld   && !(held & defaultKeys[INPUT_UP]))   { upHeld   = false; scroll = false; }
-        if (downHeld && !(held & defaultKeys[INPUT_DOWN]))  { downHeld = false; scroll = false; }
+        if (upHeld   && !(held & defaultKeys[INPUT_UP]))
+            { upHeld   = false; scroll = false; }
+        if (downHeld && !(held & defaultKeys[INPUT_DOWN]))
+            { downHeld = false; scroll = false; }
 
-        if ((upHeld && index > min) ||
+        if ((upHeld   && index > min) ||
             (downHeld && index < (int)items.size() - 1)) {
             std::chrono::duration<double> elapsed =
                 std::chrono::steady_clock::now() - timeHeld;
             if (!scroll && elapsed.count() > 0.5f) scroll = true;
-            if (scroll  && elapsed.count() > 0.1f) {
+            if ( scroll && elapsed.count() > 0.1f) {
                 index += (1 + (items.empty() ? 0 : items[index].header)) *
                          (upHeld ? -1 : 1);
                 timeHeld = std::chrono::steady_clock::now();
@@ -456,18 +494,22 @@ uint32_t ConsoleUI::menu(std::string title, std::vector<MenuItem> &items,
         }
         else {
             if (!touchScroll && touchStart.y >= 650) {
-                if (touchStart.x >= boundsBX && touchStart.x < boundsAB)
+                if (touchStart.x >= boundsBX &&
+                    touchStart.x <  boundsAB)
                     return defaultKeys[INPUT_B];
-                else if (touchStart.x >= boundsXPlus && touchStart.x < boundsBX)
+                else if (touchStart.x >= boundsXPlus &&
+                         touchStart.x <  boundsBX)
                     return defaultKeys[INPUT_X];
-                else if (touchStart.x >= boundsPlus && touchStart.x < boundsXPlus)
+                else if (touchStart.x >= boundsPlus &&
+                         touchStart.x <  boundsXPlus)
                     return defaultKeys[INPUT_START];
             }
             touchStarted = false;
         }
 
         if (!items.empty())
-            drawRectangle(SCALE(90), SCALE(124), SCALE(1100), lineHeight, palette[2]);
+            drawRectangle(SCALE(90), SCALE(124),
+                SCALE(1100), lineHeight, palette[2]);
 
         int size = std::min<int>(7, items.size());
         for (int i = 0, offset; i < size; i++) {
@@ -488,34 +530,41 @@ uint32_t ConsoleUI::menu(std::string title, std::vector<MenuItem> &items,
             }
 
             if (!touchMode && offset == index) {
-                drawRectangle(SCALE(90),   SCALE(125 + i*70), SCALE(1100), SCALE(69),  palette[3]);
-                drawRectangle(SCALE(89),   SCALE(121 + i*70), SCALE(1103), SCALE(5),   palette[4]);
-                drawRectangle(SCALE(89),   SCALE(191 + i*70), SCALE(1103), SCALE(5),   palette[4]);
-                drawRectangle(SCALE(88),   SCALE(122 + i*70), SCALE(5),    SCALE(73),  palette[4]);
-                drawRectangle(SCALE(1188), SCALE(122 + i*70), SCALE(5),    SCALE(73),  palette[4]);
+                drawRectangle(SCALE(90),   SCALE(125+i*70),
+                    SCALE(1100), SCALE(69),  palette[3]);
+                drawRectangle(SCALE(89),   SCALE(121+i*70),
+                    SCALE(1103), SCALE(5),   palette[4]);
+                drawRectangle(SCALE(89),   SCALE(191+i*70),
+                    SCALE(1103), SCALE(5),   palette[4]);
+                drawRectangle(SCALE(88),   SCALE(122+i*70),
+                    SCALE(5),    SCALE(73),  palette[4]);
+                drawRectangle(SCALE(1188), SCALE(122+i*70),
+                    SCALE(5),    SCALE(73),  palette[4]);
             }
             else {
-                drawRectangle(SCALE(90), SCALE(194 + i*70), SCALE(1100), lineHeight, palette[2]);
+                drawRectangle(SCALE(90), SCALE(194+i*70),
+                    SCALE(1100), lineHeight, palette[2]);
             }
 
             if (items[offset].header) {
                 drawString(items[offset].name,
-                    SCALE(105), SCALE(160 + i*70), SCALE(28), palette[6]);
+                    SCALE(105), SCALE(160+i*70), SCALE(28), palette[6]);
                 continue;
             }
 
             int x = (items[offset].iconSize > 0) ? 184 : 105;
             drawString(items[offset].name,
-                SCALE(x), SCALE(140 + i*70), SCALE(38), palette[1]);
+                SCALE(x), SCALE(140+i*70), SCALE(38), palette[1]);
 
             if (items[offset].iconSize > 0)
                 drawTexture(items[offset].iconTex,
                     0, 0, items[offset].iconSize, items[offset].iconSize,
-                    SCALE(105), SCALE(127 + i*70), SCALE(64), SCALE(64));
+                    SCALE(105), SCALE(127+i*70), SCALE(64), SCALE(64));
 
             if (items[offset].setting != "")
                 drawString(items[offset].setting,
-                    SCALE(1175), SCALE(143 + i*70), SCALE(32), palette[5], true);
+                    SCALE(1175), SCALE(143+i*70),
+                    SCALE(32), palette[5], true);
         }
 
         endFrame();
@@ -551,8 +600,8 @@ uint32_t ConsoleUI::message(std::string title, std::string text, int type) {
         }
 
         uint32_t pressed = getInputPress();
-        if (pressed && type == 2)                            return pressed;
-        else if (pressed & defaultKeys[INPUT_A])             return 1;
+        if (pressed && type == 2)                               return pressed;
+        else if (pressed & defaultKeys[INPUT_A])                return 1;
         else if ((pressed & defaultKeys[INPUT_B]) && type == 1) return 0;
 
         MenuTouch touch = getInputTouch();
@@ -563,16 +612,19 @@ uint32_t ConsoleUI::message(std::string title, std::string text, int type) {
                 touchScroll  = false;
                 touchMode    = true;
             }
-            if (touch.x > touchStart.x + 25 || touch.x < touchStart.x - 25 ||
-                touch.y > touchStart.y + 25 || touch.y < touchStart.y - 25)
+            if (touch.x > touchStart.x + 25 ||
+                touch.x < touchStart.x - 25 ||
+                touch.y > touchStart.y + 25 ||
+                touch.y < touchStart.y - 25)
                 touchScroll = true;
         }
         else {
             if (!touchScroll && touchStart.y >= 650) {
                 if (touchStart.x >= boundsAB &&
-                    touchStart.x <  boundsA  && type < 2)   return 1;
+                    touchStart.x <  boundsA  && type < 2)  return 1;
                 else if (touchStart.x >= boundsB &&
-                         touchStart.x <  boundsAB && type == 1) return 0;
+                         touchStart.x <  boundsAB &&
+                         type == 1)                         return 0;
             }
             touchStarted = false;
         }
@@ -598,12 +650,15 @@ void ConsoleUI::fileBrowser() {
                 files.push_back(MenuItem(name, "",
                     folderTextures[menuTheme], 64));
             }
-            else if (name.find(".nds", name.length() - 4) != std::string::npos) {
-                void *texture =
-                    createTexture(NdsIcon(subpath).getIcon(), 32, 32);
+            else if (name.find(".nds", name.length() - 4)
+                     != std::string::npos) {
+                // NDS icon: 32×32 RGBA8 pixels — use createTextureRGBA8
+                void *texture = createTextureRGBA8(
+                    NdsIcon(subpath).getIcon(), 32, 32);
                 files.push_back(MenuItem(name, "", texture, 32));
             }
-            else if (name.find(".gba", name.length() - 4) != std::string::npos) {
+            else if (name.find(".gba", name.length() - 4)
+                     != std::string::npos) {
                 files.push_back(MenuItem(name, "",
                     fileTextures[menuTheme], 64));
             }
@@ -612,7 +667,8 @@ void ConsoleUI::fileBrowser() {
         sort(files.begin(), files.end());
         closedir(dir);
 
-        uint32_t pressed = menu("NooDS", files, index, "Settings", "Exit");
+        uint32_t pressed =
+            menu("NooDS", files, index, "Settings", "Exit");
 
         if (pressed & defaultKeys[INPUT_A]) {
             if (files.empty()) continue;
@@ -651,14 +707,18 @@ void ConsoleUI::settingsMenu() {
     const std::vector<std::string> frames      = { "None", "1 Frame", "2 Frames",
                                                    "3 Frames", "4 Frames", "5 Frames" };
     const std::vector<std::string> threads     = { "Disabled", "1 Thread", "2 Threads" };
-    const std::vector<std::string> position    = { "Center", "Top", "Bottom", "Left", "Right" };
-    const std::vector<std::string> rotation    = { "None", "Clockwise", "Counter-Clockwise" };
+    const std::vector<std::string> position    = { "Center", "Top", "Bottom",
+                                                   "Left", "Right" };
+    const std::vector<std::string> rotation    = { "None", "Clockwise",
+                                                   "Counter-Clockwise" };
     const std::vector<std::string> arrangement = { "Automatic", "Vertical",
                                                    "Horizontal", "Single Screen" };
-    const std::vector<std::string> sizing      = { "Even", "Enlarge Top", "Enlarge Bottom" };
+    const std::vector<std::string> sizing      = { "Even", "Enlarge Top",
+                                                   "Enlarge Bottom" };
     const std::vector<std::string> gap         = { "None", "Quarter", "Half", "Full" };
     const std::vector<std::string> filter      = { "Nearest", "Upscaled", "Linear" };
-    const std::vector<std::string> aspect      = { "Default", "16:10", "16:9", "18:9" };
+    const std::vector<std::string> aspect      = { "Default", "16:10",
+                                                   "16:9", "18:9" };
 
     int index = 0;
     while (true) {
@@ -701,35 +761,35 @@ void ConsoleUI::settingsMenu() {
 
         if (pressed & defaultKeys[INPUT_A]) {
             switch (index) {
-                case 1:  Settings::directBoot             = (Settings::directBoot + 1) % 2;  break;
-                case 2:  Settings::romInRam               = (Settings::romInRam + 1) % 2;    break;
-                case 3:  Settings::fpsLimiter             = (Settings::fpsLimiter + 1) % 2;  break;
-                case 4:  showFpsCounter                   = (showFpsCounter + 1) % 2;        break;
-                case 7:  Settings::frameskip              = (Settings::frameskip + 1) % 6;   break;
-                case 8:  Settings::threaded2D             = (Settings::threaded2D + 1) % 2;  break;
-                case 9:  Settings::threaded3D             = (Settings::threaded3D + 1) % 3;  break;
-                case 10: Settings::highRes3D              = (Settings::highRes3D + 1) % 2;   break;
-                case 11: Settings::screenGhost            = (Settings::screenGhost + 1) % 2; break;
-                case 13: Settings::emulateAudio           = (Settings::emulateAudio + 1) % 2;break;
-                case 14: Settings::audio16Bit             = (Settings::audio16Bit + 1) % 2;  break;
-                case 16: Settings::arm7Hle                = (Settings::arm7Hle + 1) % 2;     break;
-                case 17: Settings::dsiMode                = (Settings::dsiMode + 1) % 2;     break;
-                case 19: Settings::savesFolder            = (Settings::savesFolder + 1) % 2; break;
-                case 20: Settings::statesFolder           = (Settings::statesFolder + 1) % 2;break;
-                case 21: Settings::cheatsFolder           = (Settings::cheatsFolder + 1) % 2;break;
-                case 23: ScreenLayout::screenPosition     = (ScreenLayout::screenPosition + 1) % 5;    break;
-                case 24: ScreenLayout::screenRotation     = (ScreenLayout::screenRotation + 1) % 3;    break;
-                case 25: ScreenLayout::screenArrangement  = (ScreenLayout::screenArrangement + 1) % 4; break;
-                case 26: ScreenLayout::screenSizing       = (ScreenLayout::screenSizing + 1) % 3;      break;
-                case 27: ScreenLayout::screenGap          = (ScreenLayout::screenGap + 1) % 4;         break;
-                case 28: Settings::screenFilter           = (Settings::screenFilter + 1) % 3;          break;
-                case 29: ScreenLayout::aspectRatio        = (ScreenLayout::aspectRatio + 1) % 4;       break;
-                case 30: ScreenLayout::integerScale       = (ScreenLayout::integerScale + 1) % 2;      break;
-                case 31: ScreenLayout::gbaCrop            = (ScreenLayout::gbaCrop + 1) % 2;           break;
-                case 5:
-                    menuTheme = (menuTheme + 1) % 2;
-                    palette   = &themeColors[menuTheme * 7];
-                    break;
+            case  1: Settings::directBoot            = (Settings::directBoot + 1) % 2;   break;
+            case  2: Settings::romInRam              = (Settings::romInRam + 1) % 2;     break;
+            case  3: Settings::fpsLimiter            = (Settings::fpsLimiter + 1) % 2;   break;
+            case  4: showFpsCounter                  = (showFpsCounter + 1) % 2;         break;
+            case  7: Settings::frameskip             = (Settings::frameskip + 1) % 6;    break;
+            case  8: Settings::threaded2D            = (Settings::threaded2D + 1) % 2;   break;
+            case  9: Settings::threaded3D            = (Settings::threaded3D + 1) % 3;   break;
+            case 10: Settings::highRes3D             = (Settings::highRes3D + 1) % 2;    break;
+            case 11: Settings::screenGhost           = (Settings::screenGhost + 1) % 2;  break;
+            case 13: Settings::emulateAudio          = (Settings::emulateAudio + 1) % 2; break;
+            case 14: Settings::audio16Bit            = (Settings::audio16Bit + 1) % 2;   break;
+            case 16: Settings::arm7Hle               = (Settings::arm7Hle + 1) % 2;      break;
+            case 17: Settings::dsiMode               = (Settings::dsiMode + 1) % 2;      break;
+            case 19: Settings::savesFolder           = (Settings::savesFolder + 1) % 2;  break;
+            case 20: Settings::statesFolder          = (Settings::statesFolder + 1) % 2; break;
+            case 21: Settings::cheatsFolder          = (Settings::cheatsFolder + 1) % 2; break;
+            case 23: ScreenLayout::screenPosition    = (ScreenLayout::screenPosition + 1) % 5;    break;
+            case 24: ScreenLayout::screenRotation    = (ScreenLayout::screenRotation + 1) % 3;    break;
+            case 25: ScreenLayout::screenArrangement = (ScreenLayout::screenArrangement + 1) % 4; break;
+            case 26: ScreenLayout::screenSizing      = (ScreenLayout::screenSizing + 1) % 3;      break;
+            case 27: ScreenLayout::screenGap         = (ScreenLayout::screenGap + 1) % 4;         break;
+            case 28: Settings::screenFilter          = (Settings::screenFilter + 1) % 3;          break;
+            case 29: ScreenLayout::aspectRatio       = (ScreenLayout::aspectRatio + 1) % 4;       break;
+            case 30: ScreenLayout::integerScale      = (ScreenLayout::integerScale + 1) % 2;      break;
+            case 31: ScreenLayout::gbaCrop           = (ScreenLayout::gbaCrop + 1) % 2;           break;
+            case  5:
+                menuTheme = (menuTheme + 1) % 2;
+                palette   = &themeColors[menuTheme * 7];
+                break;
             }
         }
         else if (pressed & defaultKeys[INPUT_B]) {
@@ -765,7 +825,7 @@ void ConsoleUI::controlsMenu() {
         }
 
         std::vector<MenuItem> controls = {
-            MenuItem("Buttons",                        true),
+            MenuItem("Buttons",                          true),
             MenuItem(names[INPUT_A],        bindings[INPUT_A]),
             MenuItem(names[INPUT_B],        bindings[INPUT_B]),
             MenuItem(names[INPUT_SELECT],   bindings[INPUT_SELECT]),
@@ -778,18 +838,19 @@ void ConsoleUI::controlsMenu() {
             MenuItem(names[INPUT_L],        bindings[INPUT_L]),
             MenuItem(names[INPUT_X],        bindings[INPUT_X]),
             MenuItem(names[INPUT_Y],        bindings[INPUT_Y]),
-            MenuItem("Hotkeys",                        true),
-            MenuItem(names[INPUT_MENU],     bindings[INPUT_MENU]),
-            MenuItem(names[INPUT_FAST_HOLD],bindings[INPUT_FAST_HOLD]),
-            MenuItem(names[INPUT_FAST_TOGG],bindings[INPUT_FAST_TOGG]),
-            MenuItem(names[INPUT_SCRN_SWAP],bindings[INPUT_SCRN_SWAP])
+            MenuItem("Hotkeys",                          true),
+            MenuItem(names[INPUT_MENU],      bindings[INPUT_MENU]),
+            MenuItem(names[INPUT_FAST_HOLD], bindings[INPUT_FAST_HOLD]),
+            MenuItem(names[INPUT_FAST_TOGG], bindings[INPUT_FAST_TOGG]),
+            MenuItem(names[INPUT_SCRN_SWAP], bindings[INPUT_SCRN_SWAP])
         };
 
         uint32_t pressed = menu("Controls", controls, index, "Clear");
         int i = index - ((index > 13) ? 2 : 1);
 
         if (pressed & defaultKeys[INPUT_A]) {
-            keyBinds[i] |= message(std::string("Remap ") + names[i],
+            keyBinds[i] |= message(
+                std::string("Remap ") + names[i],
                 "Press an input to add it as a binding.", 2);
         }
         else if (pressed & defaultKeys[INPUT_B]) {
@@ -862,7 +923,8 @@ void ConsoleUI::pauseMenu() {
                     break;
                 case STATE_VERSION_FAIL:
                     ltitle = "Error";
-                    ltext  = "The state file isn't compatible with this version of NooDS.";
+                    ltext  = "The state file isn't compatible with"
+                             " this version of NooDS.";
                     break;
                 }
                 if (!message(ltitle, ltext, !error) || error) break;
@@ -926,26 +988,26 @@ bool ConsoleUI::saveTypeMenu() {
 
             if (core->gbaMode) {
                 switch (index) {
-                    case 0: core->cartridgeGba.resizeSave(0x00000); break;
-                    case 1: core->cartridgeGba.resizeSave(0x00200); break;
-                    case 2: core->cartridgeGba.resizeSave(0x02000); break;
-                    case 3: core->cartridgeGba.resizeSave(0x08000); break;
-                    case 4: core->cartridgeGba.resizeSave(0x10000); break;
-                    case 5: core->cartridgeGba.resizeSave(0x20000); break;
+                case 0: core->cartridgeGba.resizeSave(0x00000); break;
+                case 1: core->cartridgeGba.resizeSave(0x00200); break;
+                case 2: core->cartridgeGba.resizeSave(0x02000); break;
+                case 3: core->cartridgeGba.resizeSave(0x08000); break;
+                case 4: core->cartridgeGba.resizeSave(0x10000); break;
+                case 5: core->cartridgeGba.resizeSave(0x20000); break;
                 }
             }
             else {
                 switch (index) {
-                    case 0: core->cartridgeNds.resizeSave(0x000000); break;
-                    case 1: core->cartridgeNds.resizeSave(0x000200); break;
-                    case 2: core->cartridgeNds.resizeSave(0x002000); break;
-                    case 3: core->cartridgeNds.resizeSave(0x010000); break;
-                    case 4: core->cartridgeNds.resizeSave(0x020000); break;
-                    case 5: core->cartridgeNds.resizeSave(0x008000); break;
-                    case 6: core->cartridgeNds.resizeSave(0x040000); break;
-                    case 7: core->cartridgeNds.resizeSave(0x080000); break;
-                    case 8: core->cartridgeNds.resizeSave(0x100000); break;
-                    case 9: core->cartridgeNds.resizeSave(0x800000); break;
+                case 0: core->cartridgeNds.resizeSave(0x000000); break;
+                case 1: core->cartridgeNds.resizeSave(0x000200); break;
+                case 2: core->cartridgeNds.resizeSave(0x002000); break;
+                case 3: core->cartridgeNds.resizeSave(0x010000); break;
+                case 4: core->cartridgeNds.resizeSave(0x020000); break;
+                case 5: core->cartridgeNds.resizeSave(0x008000); break;
+                case 6: core->cartridgeNds.resizeSave(0x040000); break;
+                case 7: core->cartridgeNds.resizeSave(0x080000); break;
+                case 8: core->cartridgeNds.resizeSave(0x100000); break;
+                case 9: core->cartridgeNds.resizeSave(0x800000); break;
                 }
             }
             return true;
@@ -966,13 +1028,14 @@ bool ConsoleUI::createCore() {
         std::string text;
         switch (e) {
         case ERROR_BIOS:
-            text = "Make sure the path settings point to valid BIOS files and try again.\n"
+            text = "Make sure the path settings point to valid BIOS files"
+                   " and try again.\n"
                    "You can modify the path settings in the noods.ini file.";
             message("Error Loading BIOS", text);
             break;
         case ERROR_FIRM:
-            text = "Make sure the path settings point to a bootable firmware file"
-                   " or try another boot method.\n"
+            text = "Make sure the path settings point to a bootable firmware"
+                   " file or try another boot method.\n"
                    "You can modify the path settings in the noods.ini file.";
             message("Error Loading Firmware", text);
             break;
@@ -1028,11 +1091,6 @@ sptr ConsoleUI::runCore(void *arg) {
     PPCIrqUnlockByMsr(st);
 
     while (isRunning) {
-        // Re-arm the frame gate before each runCore() call.
-        // Core::endFrame() sets core->running = 0 to signal frame
-        // completion and break out of the internal run loop.
-        // Without this, runCore() returns immediately after the first
-        // frame and the emulator stalls forever.
         {
             PPCIrqState st2 = PPCIrqLockByMsr();
             core->running = 1;
