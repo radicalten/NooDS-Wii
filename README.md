@@ -18,6 +18,4 @@ Wii remote, Gamecube controller, and Wii Classic controller are supported as of 
 ## Channel Icon
 <img width="128" height="48" alt="icon" src="https://github.com/user-attachments/assets/abfebd7a-7400-481c-ad71-ae433ccf3670" />
 <br />
-Icon Credit: <br />
-Niius for channel icon. <br />
-Hydr8gon for initial snake + DS design. 
+Channel icon designed by Niius based on Hydr8gon's NooDS logo.
