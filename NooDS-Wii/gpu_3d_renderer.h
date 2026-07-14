@@ -41,9 +41,7 @@ public:
     void loadState(FILE *file);
 
     void drawScanline(int line);
-    
-    // Returns native 16-bit RGB5A3 pointers directly to avoid intermediate conversions
-    uint16_t *getLine(int line);
+    uint32_t *getLine(int line);
 
     uint16_t readDisp3DCnt() { return disp3DCnt; }
 
@@ -60,7 +58,7 @@ private:
     Core *core;
 
     bool resShift = false;
-    uint16_t framebuffer[2][256 * 192 * 4] = {}; // Native RGB5A3
+    uint32_t framebuffer[2][256 * 192 * 4] = {};
     int32_t depthBuffer[2][256 * 192 * 4] = {};
     uint32_t attribBuffer[2][256 * 192 * 4] = {};
     uint8_t stencilBuffer[256 * 192 * 4] = {};
@@ -71,9 +69,9 @@ private:
 
     // Tuxedo Thread Structures
     uint8_t activeThreads = 0;
-    KThread threads[4]; 
+    KThread threads[4]; // Supporting up to 4 parallel threads on the platform
     uint8_t* threadStacks[4] = {};
-    volatile int ready[192 * 2]; 
+    volatile int ready[192 * 2]; // Thread safe synchronization indicators
 
     uint16_t disp3DCnt = 0;
     uint16_t edgeColor[8] = {};
@@ -84,67 +82,9 @@ private:
     uint8_t fogTable[32] = {};
     uint16_t toonTable[32] = {};
 
-    // Pack internal RGBA6 word -> RGB5A3 uint16_t
-    static inline uint16_t rgba6ToRgb5a3(uint32_t c) {
-        uint8_t a = (c >> 18) & 0x3F;
-        uint8_t r = (c >>  0) & 0x3F;
-        uint8_t g = (c >>  6) & 0x3F;
-        uint8_t b = (c >> 12) & 0x3F;
-
-        if (a >= 0x3F) {
-            // Opaque: 1_RRRRR_GGGGG_BBBBB  (6-bit -> 5-bit)
-            return static_cast<uint16_t>(
-                0x8000u |
-                ((r >> 1) << 10) |
-                ((g >> 1) <<  5) |
-                ((b >> 1) <<  0));
-        } else {
-            // Translucent: 0_AAA_RRRR_GGGG_BBBB (6->3 alpha, 6->4 color)
-            return static_cast<uint16_t>(
-                ((a >> 3) << 12) |
-                ((r >> 2) <<  8) |
-                ((g >> 2) <<  4) |
-                ((b >> 2) <<  0));
-        }
-    }
-
-    // Read framebuffer pixel back as RGBA6 for blending operations
-    inline uint32_t fbGet(int layer, int idx) const {
-        uint16_t p = framebuffer[layer][idx];
-        if (p & 0x8000u) {
-            uint8_t r5 = (p >> 10) & 0x1F;
-            uint8_t g5 = (p >>  5) & 0x1F;
-            uint8_t b5 = (p >>  0) & 0x1F;
-            uint8_t r6 = (r5 << 1) | (r5 >> 4);
-            uint8_t g6 = (g5 << 1) | (g5 >> 4);
-            uint8_t b6 = (b5 << 1) | (b5 >> 4);
-            return (0x3Fu << 18) | (b6 << 12) | (g6 << 6) | r6;
-        } else {
-            uint8_t a3 = (p >> 12) & 0x07;
-            uint8_t r4 = (p >>  8) & 0x0F;
-            uint8_t g4 = (p >>  4) & 0x0F;
-            uint8_t b4 = (p >>  0) & 0x0F;
-            uint8_t a6 = (a3 << 3) | (a3 >> 0); 
-            uint8_t r6 = (r4 << 2) | (r4 >> 2); 
-            uint8_t g6 = (g4 << 2) | (g4 >> 2);
-            uint8_t b6 = (b4 << 2) | (b4 >> 2);
-            return (a6 << 18) | (b6 << 12) | (g6 << 6) | r6;
-        }
-    }
-
-    inline bool fbHasAlpha(int layer, int idx) const {
-        uint16_t p = framebuffer[layer][idx];
-        if (p & 0x8000u) return true;           
-        return ((p >> 12) & 0x07) != 0;         
-    }
-
-    inline bool fbIsOpaque(int layer, int idx) const {
-        return (framebuffer[layer][idx] & 0x8000u) != 0;
-    }
-
     static uint32_t rgba5ToRgba6(uint32_t color);
 
-    uint16_t *getLine1(int line);
+    uint32_t *getLine1(int line);
 
     static sptr drawThreadedEntryPoint(void* arg);
     void drawThreaded(int thread);
