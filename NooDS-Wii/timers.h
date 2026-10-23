@@ -47,6 +47,9 @@ private:
     uint16_t timers[4] = {};
     uint8_t shifts[4] = {};
     uint32_t endCycles[4] = {};
+    uint32_t enableCycles[4] = {};
+    uint32_t reloadWriteCycle[4] = {};
+    uint16_t prevTmCntL[4] = {};
 
     uint16_t tmCntL[4] = {};
     uint16_t tmCntH[4] = {};

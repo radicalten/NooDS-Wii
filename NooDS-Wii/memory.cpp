@@ -19,7 +19,64 @@
 */
 
 #include <cstring>
+#include <cstdio>
+#include <cstdlib>
+#include <malloc.h>
+#include <new>
+#include <string>
+#ifdef GEKKO
+#include <gccore.h>
+#include <fat.h>
+#endif
 #include "core.h"
+
+#ifndef NOODS_FULL_RAM_DUMP
+#define NOODS_FULL_RAM_DUMP 0
+#endif
+
+Memory::Memory(Core *core, bool gbaOnly): core(core) {
+    if (Settings::dsiMode)
+        ramAllocBytes = 0x1000000u;
+    else if (gbaOnly && !NOODS_FULL_RAM_DUMP)
+        ramAllocBytes = 0x40000u;
+    else
+        ramAllocBytes = 0x400000u;
+
+    ram = (uint8_t*)memalign(32, ramAllocBytes);
+    if (!ram) throw std::bad_alloc();
+    std::memset(ram, 0, ramAllocBytes);
+
+    if (!gbaOnly) {
+        readMap9B  = (uint8_t**)memalign(32, 0x100000 * sizeof(uint8_t*));
+        writeMap9B = (uint8_t**)memalign(32, 0x100000 * sizeof(uint8_t*));
+        if (!readMap9B || !writeMap9B) {
+            free(readMap9B);  readMap9B  = nullptr;
+            free(writeMap9B); writeMap9B = nullptr;
+            free(ram);        ram        = nullptr;
+            throw std::bad_alloc();
+        }
+        std::memset(readMap9B,  0, 0x100000 * sizeof(uint8_t*));
+        std::memset(writeMap9B, 0, 0x100000 * sizeof(uint8_t*));
+    }
+}
+
+Memory::~Memory() {
+    if (readMap9B) {
+        free(readMap9B);
+        readMap9B = nullptr;
+    }
+    if (writeMap9B) {
+        free(writeMap9B);
+        writeMap9B = nullptr;
+    }
+    if (ram) {
+        free(ram);
+        ram = nullptr;
+    }
+    ramAllocBytes = 0;
+}
+
+static std::string s_mgbaLogData;
 
 // Defines an 8-bit register in an I/O switch statement
 #define DEF_IO_8(addr, func) \
@@ -73,7 +130,9 @@ template <typename T> void VramMapping::write(uint32_t address, T value) {
 
 void Memory::saveState(FILE *file) {
     // Write state data to the file
-    fwrite(ram, 1, core->dsiMode ? 0x1000000 : 0x400000, file);
+    size_t saveRamBytes = core->dsiMode ? 0x1000000u : (core->gbaMode ? 0x40000u : 0x400000u);
+    if (saveRamBytes > ramAllocBytes) saveRamBytes = ramAllocBytes;
+    fwrite(ram, 1, saveRamBytes, file);
     fwrite(wram, 1, sizeof(wram), file);
     fwrite(instrTcm, 1, sizeof(instrTcm), file);
     fwrite(dataTcm, 1, sizeof(dataTcm), file);
@@ -91,6 +150,20 @@ void Memory::saveState(FILE *file) {
     fwrite(vramI, 1, sizeof(vramI), file);
     fwrite(oam, 1, sizeof(oam), file);
     fwrite(&gbaBiosAddr, sizeof(gbaBiosAddr), 1, file);
+    fwrite(&gbaBiosOpenBus, sizeof(gbaBiosOpenBus), 1, file);
+    fwrite(&gbaDmaOpenBus, sizeof(gbaDmaOpenBus), 1, file);
+    fwrite(&gbaDmaOpenBusActive, sizeof(gbaDmaOpenBusActive), 1, file);
+    fwrite(&gbaWaitCnt, sizeof(gbaWaitCnt), 1, file);
+    fwrite(&gbaKeyCnt, sizeof(gbaKeyCnt), 1, file);
+    fwrite(gbaSioData, 2, 4, file);
+    fwrite(&gbaSioCnt, sizeof(gbaSioCnt), 1, file);
+    fwrite(&gbaSioSend, sizeof(gbaSioSend), 1, file);
+    fwrite(&gbaRCnt, sizeof(gbaRCnt), 1, file);
+    fwrite(&gbaJoyCnt, sizeof(gbaJoyCnt), 1, file);
+    fwrite(&gbaJoyRecv, sizeof(gbaJoyRecv), 1, file);
+    fwrite(&gbaJoyTrans, sizeof(gbaJoyTrans), 1, file);
+    fwrite(&gbaJoyStat, sizeof(gbaJoyStat), 1, file);
+    fwrite(&gbaSioActive, sizeof(gbaSioActive), 1, file);
     fwrite(dmaFill, 4, sizeof(dmaFill) / 4, file);
     fwrite(vramCnt, 1, sizeof(vramCnt), file);
     fwrite(&wramCnt, sizeof(wramCnt), 1, file);
@@ -99,7 +172,9 @@ void Memory::saveState(FILE *file) {
 
 void Memory::loadState(FILE *file) {
     // Read state data from the file
-    fread(ram, 1, core->dsiMode ? 0x1000000 : 0x400000, file);
+    size_t loadRamBytes = core->dsiMode ? 0x1000000u : (core->gbaMode ? 0x40000u : 0x400000u);
+    if (loadRamBytes > ramAllocBytes) loadRamBytes = ramAllocBytes;
+    fread(ram, 1, loadRamBytes, file);
     fread(wram, 1, sizeof(wram), file);
     fread(instrTcm, 1, sizeof(instrTcm), file);
     fread(dataTcm, 1, sizeof(dataTcm), file);
@@ -117,6 +192,20 @@ void Memory::loadState(FILE *file) {
     fread(vramI, 1, sizeof(vramI), file);
     fread(oam, 1, sizeof(oam), file);
     fread(&gbaBiosAddr, sizeof(gbaBiosAddr), 1, file);
+    fread(&gbaBiosOpenBus, sizeof(gbaBiosOpenBus), 1, file);
+    fread(&gbaDmaOpenBus, sizeof(gbaDmaOpenBus), 1, file);
+    fread(&gbaDmaOpenBusActive, sizeof(gbaDmaOpenBusActive), 1, file);
+    fread(&gbaWaitCnt, sizeof(gbaWaitCnt), 1, file);
+    fread(&gbaKeyCnt, sizeof(gbaKeyCnt), 1, file);
+    fread(gbaSioData, 2, 4, file);
+    fread(&gbaSioCnt, sizeof(gbaSioCnt), 1, file);
+    fread(&gbaSioSend, sizeof(gbaSioSend), 1, file);
+    fread(&gbaRCnt, sizeof(gbaRCnt), 1, file);
+    fread(&gbaJoyCnt, sizeof(gbaJoyCnt), 1, file);
+    fread(&gbaJoyRecv, sizeof(gbaJoyRecv), 1, file);
+    fread(&gbaJoyTrans, sizeof(gbaJoyTrans), 1, file);
+    fread(&gbaJoyStat, sizeof(gbaJoyStat), 1, file);
+    fread(&gbaSioActive, sizeof(gbaSioActive), 1, file);
     fread(dmaFill, 4, sizeof(dmaFill) / 4, file);
     fread(vramCnt, 1, sizeof(vramCnt), file);
     fread(&wramCnt, sizeof(wramCnt), 1, file);
@@ -157,14 +246,20 @@ bool Memory::loadBios7() {
 }
 
 bool Memory::loadGbaBios() {
-    // Load the GBA BIOS if the file is found
+    // Load the GBA BIOS only if a valid 16KB BIOS image is found
     if (FILE *file = fopen(Settings::gbaBiosPath.c_str(), "rb")) {
-        fread(gbaBios, sizeof(uint8_t), 0x4000, file);
+        fseek(file, 0, SEEK_END);
+        long sz = ftell(file);
+        fseek(file, 0, SEEK_SET);
+        if (sz == 0x4000 && fread(gbaBios, sizeof(uint8_t), 0x4000, file) == 0x4000 && gbaBios[3] == 0xEA) {
+            fclose(file);
+            return true;
+        }
         fclose(file);
-        return true;
     }
 
     // Prepare HLE BIOS with a special opcode for interrupt return
+    std::memset(gbaBios, 0, sizeof(gbaBios));
     gbaBios[3] = 0xFF;
     return false;
 }
@@ -176,6 +271,8 @@ void Memory::copyBiosLogo(uint8_t *logo) {
 }
 
 void Memory::updateMap9(uint32_t start, uint32_t end, bool tcm) {
+    if (!readMap9B || !writeMap9B) return;
+
     // Update the ARM9 read and write memory maps in the given range
     for (uint64_t address = start; address < end; address += 0x1000) {
         // Get the current read and write pointers; there are TCM and non-TCM maps
@@ -247,6 +344,9 @@ void Memory::updateMap9(uint32_t start, uint32_t end, bool tcm) {
 
     // Update the ARM9 opcode pointer in case it was remapped
     core->interpreter[0].getOpcode16();
+#if NOODS_JIT
+    ArmPpcJit::invalidateMapRange(false, start, end);
+#endif
 }
 
 void Memory::updateMap7(uint32_t start, uint32_t end) {
@@ -331,6 +431,9 @@ void Memory::updateMap7(uint32_t start, uint32_t end) {
 
     // Update the ARM7 opcode pointer in case it was remapped
     core->interpreter[1].getOpcode16();
+#if NOODS_JIT
+    ArmPpcJit::invalidateMapRange(true, start, end);
+#endif
 }
 
 void Memory::updateVram() {
@@ -606,13 +709,188 @@ void Memory::updateVram() {
     core->gpu.invalidate3D();
 }
 
+void Memory::onGbaCpuDataAccess(uint32_t address, uint32_t sizeBytes, bool isLoad) {
+    GbaBus &bus = core->gbaBus;
+    int cyc = bus.dataAccess(address, sizeBytes, bus.inSeqAccess, gbaWaitCnt, false);
+    bus.inSeqAccess = true;
+    bus.hadDataAccess = true;
+    if (isLoad)
+        bus.hadLoad = true;
+    core->interpreter[1].advanceGbaCycles(cyc);
+}
+
+bool Memory::handleMpuDataAbort(uint32_t address, bool isWrite) {
+    if (!core->cp15.checkAccess(address, isWrite, true, core->interpreter[0].isPrivileged())) {
+        core->interpreter[0].dataAbort = true;
+        return true;
+    }
+    return false;
+}
+
+template <typename T> T Memory::readGbaOpenBus(uint32_t address) {
+    uint32_t word = 0;
+    if (gbaDmaOpenBusActive) {
+        word = gbaDmaOpenBus;
+    }
+    else {
+        uint32_t pc = core->interpreter[1].getPC();
+        if (core->interpreter[1].isThumb()) {
+            uint8_t region = pc >> 24;
+            if (region == 0x00 || region == 0x03) {
+                if (region == 0x00 && pc < 0x4000)
+                    word = U8TO32(gbaBios, pc & 0x3FFC);
+                else if (region == 0x03)
+                    word = U8TO32(wram, pc & 0x7FFC);
+            }
+            else {
+                uint16_t hw = read<uint16_t>(true, pc & ~1u);
+                word = uint32_t(hw) * 0x00010001u;
+            }
+        }
+        else {
+            if (pc != (address & ~3u))
+                word = read<uint32_t>(true, pc & ~3u);
+        }
+    }
+    return (T)(word >> ((address & (4u - sizeof(T))) & 3u) * 8u);
+}
+
+bool Memory::isGbaReadableIoWord(uint32_t wAddr) const {
+    if ((wAddr & 0xFFFF00FFu) == 0x04000800u)
+        return true;
+    switch (wAddr) {
+        case 0x4000000: case 0x4000004: case 0x4000008: case 0x400000C:
+        case 0x4000048: case 0x4000050:
+        case 0x4000060: case 0x4000064: case 0x4000068: case 0x400006C:
+        case 0x4000070: case 0x4000074: case 0x4000078: case 0x400007C:
+        case 0x4000080: case 0x4000084: case 0x4000088:
+        case 0x4000090: case 0x4000094: case 0x4000098: case 0x400009C:
+        case 0x40000B8: case 0x40000C4: case 0x40000D0: case 0x40000DC:
+        case 0x4000100: case 0x4000104: case 0x4000108: case 0x400010C:
+        case 0x4000120: case 0x4000124: case 0x4000128:
+        case 0x4000130: case 0x4000134: case 0x4000140:
+        case 0x4000150: case 0x4000154: case 0x4000158:
+        case 0x4000200: case 0x4000204: case 0x4000208:
+        case 0x4000300:
+            return true;
+        default:
+            return false;
+    }
+}
+
+uint16_t Memory::readGbaSio(uint32_t hAddr) {
+    uint8_t mode = (gbaSioCnt >> 12) & 3u;
+    switch (hAddr) {
+        case 0x4000120: return gbaSioData[0];
+        case 0x4000122: return gbaSioData[1];
+        case 0x4000124: return gbaSioData[2];
+        case 0x4000126: return gbaSioData[3];
+        case 0x4000128: {
+            if (!(gbaRCnt & 0x8000u)) {
+                if (mode == 2) return (gbaSioCnt & 0x6F83u) | 0x000Cu; // SD=1, SI=1 disconnected
+                if (mode == 3) return (gbaSioCnt & 0x7FAFu);
+            }
+            return (gbaSioCnt & 0x5F8Bu) | 0x0004u; // SI=1 pulled high
+        }
+        case 0x400012A:
+            if (!(gbaRCnt & 0x8000u) && mode == 3)
+                return 0;
+            return gbaSioSend;
+        case 0x4000134: {
+            if (gbaRCnt & 0x8000u) {
+                if (gbaRCnt & 0x4000u)
+                    return 0xC000u | (gbaRCnt & 0x01FCu); // JOY Bus mode
+                return 0x8000u | (gbaRCnt & 0x01FFu);     // GPIO mode
+            }
+            if (mode == 0 || mode == 1)
+                return (gbaRCnt & 0x41F0u) | ((gbaSioCnt & 0x0008u)) | 0x0005u; // SO=sioCnt[3], SI=1, SD=0, SC=1
+            return (gbaRCnt & 0x41FFu);
+        }
+        case 0x4000140: return gbaJoyCnt & 0x0047u;
+        case 0x4000150: return uint16_t(gbaJoyRecv);
+        case 0x4000152: return uint16_t(gbaJoyRecv >> 16);
+        case 0x4000154: return uint16_t(gbaJoyTrans);
+        case 0x4000156: return uint16_t(gbaJoyTrans >> 16);
+        case 0x4000158: return gbaJoyStat & 0x003Au;
+        default: return 0;
+    }
+}
+
+void Memory::writeGbaSio(uint32_t hAddr, uint16_t mask, uint16_t value) {
+    uint8_t mode = (gbaSioCnt >> 12) & 3u;
+    switch (hAddr) {
+        case 0x4000120:
+            if (!(gbaRCnt & 0x8000u) && mode == 1)
+                gbaSioData[0] = (gbaSioData[0] & ~mask) | (value & mask);
+            break;
+        case 0x4000122:
+            if (!(gbaRCnt & 0x8000u) && mode == 1)
+                gbaSioData[1] = (gbaSioData[1] & ~mask) | (value & mask);
+            break;
+        case 0x4000124:
+        case 0x4000126:
+            break;
+        case 0x4000128: {
+            uint16_t oldCnt = gbaSioCnt;
+            gbaSioCnt = (gbaSioCnt & ~mask) | (value & mask);
+            uint8_t newMode = (gbaSioCnt >> 12) & 3u;
+            if (!(gbaRCnt & 0x8000u) && (newMode == 0 || newMode == 1)) {
+                if (!(oldCnt & BIT(7)) && (gbaSioCnt & BIT(7)) && (gbaSioCnt & BIT(0))) {
+                    // Internal clock active transfer: 256kHz = 64 cycles/bit, 2MHz = 8 cycles/bit
+                    uint32_t bits = (newMode == 1) ? 32u : 8u;
+                    uint32_t cycPerBit = (gbaSioCnt & BIT(1)) ? 8u : 64u;
+                    gbaSioActive = true;
+                    core->schedule(GBA_SIO_TRANSFER, bits * cycPerBit + 5u);
+                }
+            }
+            break;
+        }
+        case 0x400012A:
+            gbaSioSend = (gbaSioSend & ~mask) | (value & mask);
+            break;
+        case 0x4000134:
+            gbaRCnt = (gbaRCnt & ~mask) | (value & mask & 0xC1FFu);
+            break;
+        case 0x4000140:
+            gbaJoyCnt = ((gbaJoyCnt & ~(value & mask & 0x0007u)) & ~0x0040u) | (value & mask & 0x0040u);
+            break;
+        case 0x4000150:
+        case 0x4000152:
+        case 0x4000154:
+        case 0x4000156:
+            break;
+        case 0x4000158:
+            gbaJoyStat = (gbaJoyStat & ~(mask & 0x0030u)) | (value & mask & 0x0030u);
+            break;
+    }
+}
+
+void Memory::completeGbaSioTransfer() {
+    if (!gbaSioActive)
+        return;
+    gbaSioActive = false;
+    if ((gbaRCnt & 0x8000u) || !(gbaSioCnt & BIT(7)))
+        return;
+    uint8_t mode = (gbaSioCnt >> 12) & 3u;
+    if (mode == 0)
+        gbaSioSend = 0xFF;
+    else if (mode == 1)
+        gbaSioData[0] = gbaSioData[1] = 0xFFFF;
+    gbaSioCnt &= ~BIT(7);
+    if (gbaSioCnt & BIT(14))
+        core->interpreter[1].sendInterrupt(7);
+}
+
 template <typename T> T Memory::readFallback(bool arm7, uint32_t address) {
+    uint32_t rawAddress = address;
     // Align the address
     address &= ~(sizeof(T) - 1);
     uint8_t *data = nullptr;
 
     // Handle special memory reads such as I/O registers, overlapping VRAM, or areas smaller than 4KB
     if (!arm7) { // ARM9
+        // Fast path for halfword polls of DISPSTAT: same value as ioRead9 (single aligned halfword, base 0)
+        if (sizeof(T) == 2 && address == 0x04000004u) return core->gpu.readDispStat(0);
         switch (address & 0xFF000000) {
         case 0x4000000: // I/O registers
             return ioRead9<T>(address);
@@ -647,9 +925,15 @@ template <typename T> T Memory::readFallback(bool arm7, uint32_t address) {
     }
     else if (core->gbaMode) { // GBA
         switch (address & 0xFF000000) {
-        case 0x0000000: // GBA BIOS (only readable when executing; otherwise returns last value)
-            if (address < 0x4000)
-                data = &gbaBios[(core->interpreter[1].getPC() < 0x4000) ? (gbaBiosAddr = address) : gbaBiosAddr];
+        case 0x0000000: // GBA BIOS (only readable when executing; otherwise returns last BIOS latch)
+            if (address < 0x4000) {
+                if (core->interpreter[1].getPC() < 0x4000) {
+                    gbaBiosOpenBus = U8TO32(gbaBios, address & 0x3FFC);
+                    data = &gbaBios[address];
+                    break;
+                }
+                return (T)(gbaBiosOpenBus >> ((address & 3u) * 8u));
+            }
             break;
 
         case 0x4000000: // I/O registers
@@ -673,10 +957,20 @@ template <typename T> T Memory::readFallback(bool arm7, uint32_t address) {
                 return ioReadGba<T>(address);
             if ((data = core->cartridgeGba.getRom(address)))
                 break;
-            return (T)0xFFFFFFFF;
+            // Multiplexed GamePak AD[15:0] open bus returns halfword address (addr >> 1) & 0xFFFF!
+            if constexpr (sizeof(T) == 1)
+                return (uint8_t)(((rawAddress >> 1) & 0xFFFFu) >> ((rawAddress & 1u) * 8u));
+            else if constexpr (sizeof(T) == 2)
+                return (uint16_t)((address >> 1) & 0xFFFFu);
+            else
+                return (((address >> 1) & 0xFFFFu) | (((((address + 2u) >> 1) & 0xFFFFu)) << 16));
 
-        case 0xE000000: // SRAM
-            return core->cartridgeGba.sramRead(address);
+        case 0xE000000: case 0xF000000: { // 8-bit GBA SRAM / Flash bus (mirrors byte across lanes)
+            uint8_t b = core->cartridgeGba.sramRead(rawAddress);
+            if constexpr (sizeof(T) == 1) return b;
+            if constexpr (sizeof(T) == 2) return uint16_t(b) * 0x0101u;
+            return uint32_t(b) * 0x01010101u;
+        }
         }
     }
     else { // ARM7
@@ -712,13 +1006,13 @@ template <typename T> T Memory::readFallback(bool arm7, uint32_t address) {
         return 0;
     }
 
-    // Handle unknown GBA reads by returning the last prefetched opcode (open bus)
+    // Handle unknown GBA reads by returning the last prefetched opcode / DMA bus value (open bus)
     LOG_WARN("Unmapped GBA memory read: 0x%X\n", address);
-    if (address == core->interpreter[1].getPC()) return 0;
-    return read<T>(arm7, core->interpreter[1].getPC());
+    return readGbaOpenBus<T>(address);
 }
 
 template <typename T> void Memory::writeFallback(bool arm7, uint32_t address, T value) {
+    uint32_t rawAddress = address;
     // Align the address
     address &= ~(sizeof(T) - 1);
     uint8_t *data = nullptr;
@@ -745,6 +1039,9 @@ template <typename T> void Memory::writeFallback(bool arm7, uint32_t address, T 
             }
             if (mapping->count == 0) break;
             mapping->write<T>(address & 0x3FFF, value);
+#if NOODS_JIT
+            ArmPpcJit::invalidateSharedAddr(address);
+#endif
             return;
         }
 
@@ -763,11 +1060,30 @@ template <typename T> void Memory::writeFallback(bool arm7, uint32_t address, T 
             ioWriteGba<T>(address, value);
             return;
 
-        case 0x5000000: // Palettes
+        case 0x5000000: // Palettes (8-bit write duplicates across 16-bit halfword)
+            if constexpr (sizeof(T) == 1) {
+                uint32_t off = rawAddress & 0x3FEu;
+                palette[off] = palette[off + 1] = value;
+                return;
+            }
             data = &palette[address & 0x3FF];
             break;
 
-        case 0x7000000: // OAM
+        case 0x6000000: // VRAM 8-bit write: duplicates in BG VRAM, ignored in OBJ VRAM
+            if constexpr (sizeof(T) == 1) {
+                uint32_t off = rawAddress & 0x1FFFEu;
+                uint32_t bgLimit = ((core->gpu2D[0].readDispCnt() & 7u) >= 3u) ? 0x14000u : 0x10000u;
+                if (off < bgLimit) {
+                    if (off >= 0x18000u) off -= 0x8000u;
+                    vramC[off] = vramC[off + 1] = value;
+                }
+                return;
+            }
+            break;
+
+        case 0x7000000: // OAM (ignores 8-bit writes)
+            if constexpr (sizeof(T) == 1)
+                return;
             data = &oam[address & 0x3FF];
             break;
 
@@ -781,9 +1097,11 @@ template <typename T> void Memory::writeFallback(bool arm7, uint32_t address, T 
                 return core->cartridgeGba.eepromWrite(value);
             break;
 
-        case 0xE000000: // SRAM
-            core->cartridgeGba.sramWrite(address, value);
+        case 0xE000000: case 0xF000000: { // 8-bit SRAM bus selects byte lane by rawAddress & (sizeof(T)-1)
+            uint8_t b = uint8_t(value >> ((rawAddress & (sizeof(T) - 1)) * 8u));
+            core->cartridgeGba.sramWrite(rawAddress, b);
             return;
+        }
         }
     }
     else { // ARM7
@@ -796,6 +1114,9 @@ template <typename T> void Memory::writeFallback(bool arm7, uint32_t address, T 
             VramMapping *mapping = &vram7[(address & 0x3FFFF) >> 17];
             if (mapping->count == 0) break;
             mapping->write<T>(address & 0x1FFFF, value);
+#if NOODS_JIT
+            ArmPpcJit::invalidateSharedAddr(address);
+#endif
             return;
         }
 
@@ -809,6 +1130,9 @@ template <typename T> void Memory::writeFallback(bool arm7, uint32_t address, T 
     if (data) {
         for (uint32_t i = 0; i < sizeof(T); i++)
             data[i] = value >> (i * 8);
+#if NOODS_JIT
+        ArmPpcJit::invalidateSharedAddr(address);
+#endif
         return;
     }
 
@@ -1131,6 +1455,24 @@ template <typename T> T Memory::ioRead7(uint32_t address) {
 }
 
 template <typename T> T Memory::ioReadGba(uint32_t address) {
+    // Handle mGBA debug registers (0x4FFF600..0x4FFF780)
+    if (address >= 0x4FFF600 && address < 0x4FFF800) {
+        if (address == 0x4FFF780)
+            return (T)mgbaDebugEnable;
+        if (address == 0x4FFF700)
+            return (T)mgbaDebugFlags;
+        if (address < 0x4FFF700) {
+            T val = 0;
+            for (uint32_t i = 0; i < sizeof(T); i++) {
+                uint32_t off = (address + i) - 0x4FFF600;
+                if (off < 256)
+                    val |= (T)((uint8_t)mgbaDebugBuf[off]) << (i * 8);
+            }
+            return val;
+        }
+        return 0;
+    }
+
     // Read a value from one or more GBA I/O registers
     T value = 0;
     for (uint32_t i = 0; i < sizeof(T);) {
@@ -1190,25 +1532,44 @@ template <typename T> T Memory::ioReadGba(uint32_t address) {
             DEF_IO16(0x400010A, data = core->timers[1].readTmCntH(2)) // TM2CNT_H
             DEF_IO16(0x400010C, data = core->timers[1].readTmCntL(3)) // TM3CNT_L
             DEF_IO16(0x400010E, data = core->timers[1].readTmCntH(3)) // TM3CNT_H
+            DEF_IO16(0x4000120, data = readGbaSio(0x4000120)) // SIODATA32_L / SIOMULTI0
+            DEF_IO16(0x4000122, data = readGbaSio(0x4000122)) // SIODATA32_H / SIOMULTI1
+            DEF_IO16(0x4000124, data = readGbaSio(0x4000124)) // SIOMULTI2
+            DEF_IO16(0x4000126, data = readGbaSio(0x4000126)) // SIOMULTI3
+            DEF_IO16(0x4000128, data = readGbaSio(0x4000128)) // SIOCNT
+            DEF_IO16(0x400012A, data = readGbaSio(0x400012A)) // SIODATA8 / SIOMLT_SEND
             DEF_IO16(0x4000130, data = core->input.readKeyInput()) // KEYINPUT
+            DEF_IO16(0x4000132, data = gbaKeyCnt) // KEYCNT
+            DEF_IO16(0x4000134, data = readGbaSio(0x4000134)) // RCNT
+            DEF_IO16(0x4000140, data = readGbaSio(0x4000140)) // JOYCNT
+            DEF_IO16(0x4000150, data = readGbaSio(0x4000150)) // JOY_RECV_L
+            DEF_IO16(0x4000152, data = readGbaSio(0x4000152)) // JOY_RECV_H
+            DEF_IO16(0x4000154, data = readGbaSio(0x4000154)) // JOY_TRANS_L
+            DEF_IO16(0x4000156, data = readGbaSio(0x4000156)) // JOY_TRANS_H
+            DEF_IO16(0x4000158, data = readGbaSio(0x4000158)) // JOYSTAT
             DEF_IO16(0x4000200, data = core->interpreter[1].readIe()) // IE
             DEF_IO16(0x4000202, data = core->interpreter[1].readIrf()) // IF
+            DEF_IO16(0x4000204, data = gbaWaitCnt) // WAITCNT
             DEF_IO_8(0x4000208, data = core->interpreter[1].readIme()) // IME
             DEF_IO_8(0x4000300, data = core->interpreter[1].readPostFlg()) // POSTFLG
             DEF_IO16(0x80000C4, data = core->rtc.readGpData()) // GP_DATA
             DEF_IO16(0x80000C6, data = core->rtc.readGpDirection()) // GP_DIRECTION
             DEF_IO16(0x80000C8, data = core->rtc.readGpControl()) // GP_CONTROL
 
-        default:
-            // Handle unknown reads by returning nothing
-            if (i == 0) {
-                LOG_WARN("Unknown GBA I/O register read: 0x%X\n", address);
-                return 0;
+        default: {
+            uint32_t wAddr = (address + i) & ~3u;
+            if ((wAddr >> 24) == 0x04 && !isGbaReadableIoWord(wAddr)) {
+                if (i == 0 && sizeof(T) <= 2)
+                    return readGbaOpenBus<T>(address);
+                uint16_t ob = readGbaOpenBus<uint16_t>((address + i) & ~1u);
+                value |= (T)(uint8_t(ob >> (((address + i) & 1u) * 8u))) << (i * 8);
+                i++;
+                continue;
             }
-
-            // Ignore unknown reads after the first byte; this allows larger reads from smaller registers
+            // Partner halfword in same 32-bit word is readable -> I/O decoder drives 0
             i++;
             continue;
+        }
         }
 
         // Add data to the return value and adjust byte offset
@@ -1727,6 +2088,44 @@ template <typename T> void Memory::ioWrite7(uint32_t address, T value) {
 }
 
 template <typename T> void Memory::ioWriteGba(uint32_t address, T value) {
+    // Handle mGBA debug registers (0x4FFF600..0x4FFF780)
+    if (address >= 0x4FFF600 && address < 0x4FFF800) {
+        if (address == 0x4FFF780) {
+            uint16_t v16 = (uint16_t)(value & 0xFFFF);
+            if (v16 == 0xC0DE) {
+                mgbaDebugEnable = 0x1DEA;
+                memset(mgbaDebugBuf, 0, sizeof(mgbaDebugBuf));
+                if (!mgbaLogInitialized) {
+                    s_mgbaLogData.clear();
+                    s_mgbaLogData.reserve(512 * 1024);
+                    mgbaLogInitialized = true;
+                }
+            } else {
+                mgbaDebugEnable = 0;
+            }
+            return;
+        }
+        if (address == 0x4FFF700) {
+            uint16_t v16 = (uint16_t)(value & 0xFFFF);
+            mgbaDebugFlags = v16;
+            if (mgbaDebugEnable == 0x1DEA && (v16 & 0x0100)) {
+                flushMgbaDebugLog(v16);
+                mgbaDebugFlags &= ~0x0100;
+                memset(mgbaDebugBuf, 0, sizeof(mgbaDebugBuf));
+            }
+            return;
+        }
+        if (address < 0x4FFF700) {
+            for (uint32_t i = 0; i < sizeof(T); i++) {
+                uint32_t off = (address + i) - 0x4FFF600;
+                if (off < 256)
+                    mgbaDebugBuf[off] = (char)((value >> (i * 8)) & 0xFF);
+            }
+            return;
+        }
+        return;
+    }
+
     // Write a value to one or more GBA I/O registers
     for (uint32_t i = 0; i < sizeof(T);) {
         // Store data to a register
@@ -1821,8 +2220,23 @@ template <typename T> void Memory::ioWriteGba(uint32_t address, T value) {
             DEF_IO16(0x400010A, core->timers[1].writeTmCntH(2, IOWR_PARAMS)) // TM2CNT_H
             DEF_IO16(0x400010C, core->timers[1].writeTmCntL(3, IOWR_PARAMS)) // TM3CNT_L
             DEF_IO16(0x400010E, core->timers[1].writeTmCntH(3, IOWR_PARAMS)) // TM3CNT_H
+            DEF_IO16(0x4000120, writeGbaSio(0x4000120, IOWR_PARAMS)) // SIODATA32_L / SIOMULTI0
+            DEF_IO16(0x4000122, writeGbaSio(0x4000122, IOWR_PARAMS)) // SIODATA32_H / SIOMULTI1
+            DEF_IO16(0x4000124, writeGbaSio(0x4000124, IOWR_PARAMS)) // SIOMULTI2
+            DEF_IO16(0x4000126, writeGbaSio(0x4000126, IOWR_PARAMS)) // SIOMULTI3
+            DEF_IO16(0x4000128, writeGbaSio(0x4000128, IOWR_PARAMS)) // SIOCNT
+            DEF_IO16(0x400012A, writeGbaSio(0x400012A, IOWR_PARAMS)) // SIODATA8 / SIOMLT_SEND
+            DEF_IO16(0x4000132, gbaKeyCnt = (gbaKeyCnt & ~(mask << (base * 8))) | ((data << (base * 8)) & (mask << (base * 8)) & 0xC3FFu)) // KEYCNT
+            DEF_IO16(0x4000134, writeGbaSio(0x4000134, IOWR_PARAMS)) // RCNT
+            DEF_IO16(0x4000140, writeGbaSio(0x4000140, IOWR_PARAMS)) // JOYCNT
+            DEF_IO16(0x4000150, writeGbaSio(0x4000150, IOWR_PARAMS)) // JOY_RECV_L
+            DEF_IO16(0x4000152, writeGbaSio(0x4000152, IOWR_PARAMS)) // JOY_RECV_H
+            DEF_IO16(0x4000154, writeGbaSio(0x4000154, IOWR_PARAMS)) // JOY_TRANS_L
+            DEF_IO16(0x4000156, writeGbaSio(0x4000156, IOWR_PARAMS)) // JOY_TRANS_H
+            DEF_IO16(0x4000158, writeGbaSio(0x4000158, IOWR_PARAMS)) // JOYSTAT
             DEF_IO16(0x4000200, core->interpreter[1].writeIe(IOWR_PARAMS)) // IE
             DEF_IO16(0x4000202, core->interpreter[1].writeIrf(IOWR_PARAMS)) // IF
+            DEF_IO16(0x4000204, { uint16_t nw = (gbaWaitCnt & ~(mask << (base * 8))) | ((data << (base * 8)) & (mask << (base * 8)) & 0x5FFFu); if (!(nw & BIT(14))) { core->gbaBus.active = false; core->gbaBus.count = 0; core->gbaBus.duty = 0; } gbaWaitCnt = nw; }) // WAITCNT
             DEF_IO_8(0x4000208, core->interpreter[1].writeIme(IOWR_PARAMS8)) // IME
             DEF_IO_8(0x4000300, core->interpreter[1].writePostFlg(IOWR_PARAMS8)) // POSTFLG
             DEF_IO_8(0x4000301, writeGbaHaltCnt(IOWR_PARAMS8)) // HALTCNT
@@ -1850,6 +2264,47 @@ template <typename T> void Memory::ioWriteGba(uint32_t address, T value) {
 void Memory::writeDmaFill(int channel, uint32_t mask, uint32_t value) {
     // Write to one of the DMAFILL registers
     dmaFill[channel] = (dmaFill[channel] & ~mask) | (value & mask);
+}
+
+void Memory::syncMgbaLogToSd(bool unmountSync) {
+    if (s_mgbaLogData.empty())
+        return;
+    if (FILE *f = fopen("sd:/gbaout.log", "wb")) {
+        fwrite(s_mgbaLogData.data(), 1, s_mgbaLogData.size(), f);
+        fflush(f);
+        fclose(f);
+    }
+#ifdef GEKKO
+    if (unmountSync) {
+        fatUnmount("sd");
+        fatInitDefault();
+    }
+#endif
+}
+
+void Memory::flushMgbaDebugLog(uint16_t /*flags*/) {
+    mgbaDebugBuf[256] = '\0';
+    size_t len = strlen(mgbaDebugBuf);
+    while (len > 0 && (mgbaDebugBuf[len - 1] == '\n' || mgbaDebugBuf[len - 1] == '\r'))
+        mgbaDebugBuf[--len] = '\0';
+    if (len == 0)
+        return;
+
+    s_mgbaLogData.append(mgbaDebugBuf, len);
+    s_mgbaLogData.push_back('\n');
+
+    bool isAllDone = (strcmp(mgbaDebugBuf, "ALL DONE") == 0);
+    bool isMilestone = isAllDone ||
+                       (strncmp(mgbaDebugBuf, "END:", 4) == 0) ||
+                       (strncmp(mgbaDebugBuf, "SKIP:", 5) == 0);
+    if (isMilestone) {
+        syncMgbaLogToSd(isAllDone);
+    }
+#ifdef GEKKO
+    if (isMilestone || strncmp(mgbaDebugBuf, "BEGIN:", 6) == 0 || strstr(mgbaDebugBuf, "FAIL") != nullptr) {
+        SYS_Report("[MGBA] %s\n", mgbaDebugBuf);
+    }
+#endif
 }
 
 void Memory::writeVramCnt(int index, uint8_t value) {

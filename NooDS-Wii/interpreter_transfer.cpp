@@ -20,6 +20,46 @@
 
 #include "core.h"
 
+// Dust's empty ARM register-list behavior is CPU-specific: ARM7 treats the
+// empty list as an implicit PC transfer and advances the base by 0x40 when W
+// is set; ARM9 performs no transfer but still applies that 0x40 writeback.
+#define HANDLE_EMPTY_ARM_LDM(UPWARDS, PREINC, WRITEBACK, S_BIT) do { \
+    if (m == 0) { \
+        uint8_t emptyBaseReg = (opcode >> 16) & 0xF; \
+        uint32_t emptyBase = *registers[emptyBaseReg]; \
+        uint32_t emptyStart = (UPWARDS) ? emptyBase : emptyBase - 0x40; \
+        if (!(arm7)) { \
+            if (WRITEBACK) *registers[emptyBaseReg] = (UPWARDS) ? emptyBase + 0x40 : emptyStart; \
+            return 1; \
+        } \
+        if (WRITEBACK) *registers[emptyBaseReg] = (UPWARDS) ? emptyBase + 0x40 : emptyStart; \
+        uint32_t emptyAddr = emptyStart + ((PREINC) ? 4 : 0); \
+        *registers[15] = core->memory.read<uint32_t>(arm7, emptyAddr); \
+        if (S_BIT) { \
+            if (spsr) setCpsr(*spsr); \
+        } else { \
+            cpsr |= (*registers[15] & !arm7) << 5; \
+        } \
+        flushPipeline(); \
+        return 4; \
+    } \
+} while (0)
+
+#define HANDLE_EMPTY_ARM_STM(UPWARDS, PREINC, WRITEBACK) do { \
+    if (m == 0) { \
+        uint8_t emptyBaseReg = (opcode >> 16) & 0xF; \
+        uint32_t emptyBase = *registers[emptyBaseReg]; \
+        uint32_t emptyStart = (UPWARDS) ? emptyBase : emptyBase - 0x40; \
+        if (WRITEBACK) *registers[emptyBaseReg] = (UPWARDS) ? emptyBase + 0x40 : emptyStart; \
+        if (arm7) { \
+            uint32_t emptyAddr = emptyStart + ((PREINC) ? 4 : 0); \
+            core->memory.write<uint32_t>(arm7, emptyAddr, *registers[15] + 4); \
+        } \
+        return 1; \
+    } \
+} while (0)
+
+
 // Define functions for each ARM offset variation (half type)
 #define HALF_FUNCS(func) \
     int Interpreter::func##Ofrm(uint32_t opcode) { return func##Of(opcode, -rp(opcode)); } \
@@ -539,6 +579,7 @@ int Interpreter::swp(uint32_t opcode) { // SWP Rd,Rm,[Rn]
 int Interpreter::ldmda(uint32_t opcode) { // LDMDA Rn, <Rlist>
     // Block load, post-decrement without writeback
     uint8_t m = bitCount[opcode & 0xFF] + bitCount[(opcode >> 8) & 0xFF];
+    HANDLE_EMPTY_ARM_LDM(false, false, false, false);
     uint32_t op0 = *registers[(opcode >> 16) & 0xF] - (m << 2);
     for (int i = 0; i < 16; i++) {
         if (~opcode & BIT(i)) continue;
@@ -555,10 +596,11 @@ int Interpreter::ldmda(uint32_t opcode) { // LDMDA Rn, <Rlist>
 int Interpreter::stmda(uint32_t opcode) { // STMDA Rn, <Rlist>
     // Block store, post-decrement without writeback
     uint8_t m = bitCount[opcode & 0xFF] + bitCount[(opcode >> 8) & 0xFF];
+    HANDLE_EMPTY_ARM_STM(false, false, false);
     uint32_t op0 = *registers[(opcode >> 16) & 0xF] - (m << 2);
     for (int i = 0; i < 16; i++) {
         if (~opcode & BIT(i)) continue;
-        core->memory.write<uint32_t>(arm7, op0 += 4, *registers[i]);
+        core->memory.write<uint32_t>(arm7, op0 += 4, ((i == 15) ? (*registers[15] + 4) : *registers[i]));
     }
     return m + (arm7 || m < 2);
 }
@@ -566,6 +608,7 @@ int Interpreter::stmda(uint32_t opcode) { // STMDA Rn, <Rlist>
 int Interpreter::ldmia(uint32_t opcode) { // LDMIA Rn, <Rlist>
     // Block load, post-increment without writeback
     uint8_t m = bitCount[opcode & 0xFF] + bitCount[(opcode >> 8) & 0xFF];
+    HANDLE_EMPTY_ARM_LDM(true, false, false, false);
     uint32_t op0 = *registers[(opcode >> 16) & 0xF];
     for (int i = 0; i < 16; i++) {
         if (~opcode & BIT(i)) continue;
@@ -583,10 +626,11 @@ int Interpreter::ldmia(uint32_t opcode) { // LDMIA Rn, <Rlist>
 int Interpreter::stmia(uint32_t opcode) { // STMIA Rn, <Rlist>
     // Block store, post-increment without writeback
     uint8_t m = bitCount[opcode & 0xFF] + bitCount[(opcode >> 8) & 0xFF];
+    HANDLE_EMPTY_ARM_STM(true, false, false);
     uint32_t op0 = *registers[(opcode >> 16) & 0xF];
     for (int i = 0; i < 16; i++) {
         if (~opcode & BIT(i)) continue;
-        core->memory.write<uint32_t>(arm7, op0, *registers[i]);
+        core->memory.write<uint32_t>(arm7, op0, ((i == 15) ? (*registers[15] + 4) : *registers[i]));
         op0 += 4;
     }
     return m + (arm7 || m < 2);
@@ -595,6 +639,7 @@ int Interpreter::stmia(uint32_t opcode) { // STMIA Rn, <Rlist>
 int Interpreter::ldmdb(uint32_t opcode) { // LDMDB Rn, <Rlist>
     // Block load, pre-decrement without writeback
     uint8_t m = bitCount[opcode & 0xFF] + bitCount[(opcode >> 8) & 0xFF];
+    HANDLE_EMPTY_ARM_LDM(false, true, false, false);
     uint32_t op0 = *registers[(opcode >> 16) & 0xF] - (m << 2);
     for (int i = 0; i < 16; i++) {
         if (~opcode & BIT(i)) continue;
@@ -612,10 +657,11 @@ int Interpreter::ldmdb(uint32_t opcode) { // LDMDB Rn, <Rlist>
 int Interpreter::stmdb(uint32_t opcode) { // STMDB Rn, <Rlist>
     // Block store, pre-decrement without writeback
     uint8_t m = bitCount[opcode & 0xFF] + bitCount[(opcode >> 8) & 0xFF];
+    HANDLE_EMPTY_ARM_STM(false, true, false);
     uint32_t op0 = *registers[(opcode >> 16) & 0xF] - (m << 2);
     for (int i = 0; i < 16; i++) {
         if (~opcode & BIT(i)) continue;
-        core->memory.write<uint32_t>(arm7, op0, *registers[i]);
+        core->memory.write<uint32_t>(arm7, op0, ((i == 15) ? (*registers[15] + 4) : *registers[i]));
         op0 += 4;
     }
     return m + (arm7 || m < 2);
@@ -624,6 +670,7 @@ int Interpreter::stmdb(uint32_t opcode) { // STMDB Rn, <Rlist>
 int Interpreter::ldmib(uint32_t opcode) { // LDMIB Rn, <Rlist>
     // Block load, pre-increment without writeback
     uint8_t m = bitCount[opcode & 0xFF] + bitCount[(opcode >> 8) & 0xFF];
+    HANDLE_EMPTY_ARM_LDM(true, true, false, false);
     uint32_t op0 = *registers[(opcode >> 16) & 0xF];
     for (int i = 0; i < 16; i++) {
         if (~opcode & BIT(i)) continue;
@@ -640,10 +687,11 @@ int Interpreter::ldmib(uint32_t opcode) { // LDMIB Rn, <Rlist>
 int Interpreter::stmib(uint32_t opcode) { // STMIB Rn, <Rlist>
     // Block store, pre-increment without writeback
     uint8_t m = bitCount[opcode & 0xFF] + bitCount[(opcode >> 8) & 0xFF];
+    HANDLE_EMPTY_ARM_STM(true, true, false);
     uint32_t op0 = *registers[(opcode >> 16) & 0xF];
     for (int i = 0; i < 16; i++) {
         if (~opcode & BIT(i)) continue;
-        core->memory.write<uint32_t>(arm7, op0 += 4, *registers[i]);
+        core->memory.write<uint32_t>(arm7, op0 += 4, ((i == 15) ? (*registers[15] + 4) : *registers[i]));
     }
     return m + (arm7 || m < 2);
 }
@@ -651,6 +699,7 @@ int Interpreter::stmib(uint32_t opcode) { // STMIB Rn, <Rlist>
 int Interpreter::ldmdaW(uint32_t opcode) { // LDMDA Rn!, <Rlist>
     // Block load, post-decrement with writeback
     uint8_t m = bitCount[opcode & 0xFF] + bitCount[(opcode >> 8) & 0xFF];
+    HANDLE_EMPTY_ARM_LDM(false, false, true, false);
     uint8_t op0 = (opcode >> 16) & 0xF;
     uint32_t address = (*registers[op0] -= (m << 2));
     for (int i = 0; i < 16; i++) {
@@ -672,6 +721,7 @@ int Interpreter::ldmdaW(uint32_t opcode) { // LDMDA Rn!, <Rlist>
 int Interpreter::stmdaW(uint32_t opcode) { // STMDA Rn!, <Rlist>
     // Store the writeback value if it's not the first listed register on ARM7
     uint8_t m = bitCount[opcode & 0xFF] + bitCount[(opcode >> 8) & 0xFF];
+    HANDLE_EMPTY_ARM_STM(false, false, true);
     uint8_t op0 = (opcode >> 16) & 0xF;
     uint32_t address = *registers[op0] - (m << 2);
     if (arm7 && (opcode & (BIT(op0 + 1) - 1)) > BIT(op0))
@@ -680,7 +730,7 @@ int Interpreter::stmdaW(uint32_t opcode) { // STMDA Rn!, <Rlist>
     // Block store, post-decrement with writeback
     for (int i = 0; i < 16; i++) {
         if (~opcode & BIT(i)) continue;
-        core->memory.write<uint32_t>(arm7, address += 4, *registers[i]);
+        core->memory.write<uint32_t>(arm7, address += 4, ((i == 15) ? (*registers[15] + 4) : *registers[i]));
     }
     *registers[op0] = address - (m << 2);
     return m + (arm7 || m < 2);
@@ -689,6 +739,7 @@ int Interpreter::stmdaW(uint32_t opcode) { // STMDA Rn!, <Rlist>
 int Interpreter::ldmiaW(uint32_t opcode) { // LDMIA Rn!, <Rlist>
     // Block load, post-increment with writeback
     uint8_t m = bitCount[opcode & 0xFF] + bitCount[(opcode >> 8) & 0xFF];
+    HANDLE_EMPTY_ARM_LDM(true, false, true, false);
     uint8_t op0 = (opcode >> 16) & 0xF;
     uint32_t address = (*registers[op0] += (m << 2)) - (m << 2);
     for (int i = 0; i < 16; i++) {
@@ -711,6 +762,7 @@ int Interpreter::ldmiaW(uint32_t opcode) { // LDMIA Rn!, <Rlist>
 int Interpreter::stmiaW(uint32_t opcode) { // STMIA Rn!, <Rlist>
     // Store the writeback value if it's not the first listed register on ARM7
     uint8_t m = bitCount[opcode & 0xFF] + bitCount[(opcode >> 8) & 0xFF];
+    HANDLE_EMPTY_ARM_STM(true, false, true);
     uint8_t op0 = (opcode >> 16) & 0xF;
     uint32_t address = *registers[op0];
     if (arm7 && (opcode & (BIT(op0 + 1) - 1)) > BIT(op0))
@@ -719,7 +771,7 @@ int Interpreter::stmiaW(uint32_t opcode) { // STMIA Rn!, <Rlist>
     // Block store, post-increment with writeback
     for (int i = 0; i < 16; i++) {
         if (~opcode & BIT(i)) continue;
-        core->memory.write<uint32_t>(arm7, address, *registers[i]);
+        core->memory.write<uint32_t>(arm7, address, ((i == 15) ? (*registers[15] + 4) : *registers[i]));
         address += 4;
     }
     *registers[op0] = address;
@@ -729,6 +781,7 @@ int Interpreter::stmiaW(uint32_t opcode) { // STMIA Rn!, <Rlist>
 int Interpreter::ldmdbW(uint32_t opcode) { // LDMDB Rn!, <Rlist>
     // Block load, pre-decrement with writeback
     uint8_t m = bitCount[opcode & 0xFF] + bitCount[(opcode >> 8) & 0xFF];
+    HANDLE_EMPTY_ARM_LDM(false, true, true, false);
     uint8_t op0 = (opcode >> 16) & 0xF;
     uint32_t address = (*registers[op0] -= (m << 2));
     for (int i = 0; i < 16; i++) {
@@ -751,6 +804,7 @@ int Interpreter::ldmdbW(uint32_t opcode) { // LDMDB Rn!, <Rlist>
 int Interpreter::stmdbW(uint32_t opcode) { // STMDB Rn!, <Rlist>
     // Store the writeback value if it's not the first listed register on ARM7
     uint8_t m = bitCount[opcode & 0xFF] + bitCount[(opcode >> 8) & 0xFF];
+    HANDLE_EMPTY_ARM_STM(false, true, true);
     uint8_t op0 = (opcode >> 16) & 0xF;
     uint32_t address = *registers[op0] - (m << 2);
     if (arm7 && (opcode & (BIT(op0 + 1) - 1)) > BIT(op0))
@@ -759,7 +813,7 @@ int Interpreter::stmdbW(uint32_t opcode) { // STMDB Rn!, <Rlist>
     // Block store, pre-decrement with writeback
     for (int i = 0; i < 16; i++) {
         if (~opcode & BIT(i)) continue;
-        core->memory.write<uint32_t>(arm7, address, *registers[i]);
+        core->memory.write<uint32_t>(arm7, address, ((i == 15) ? (*registers[15] + 4) : *registers[i]));
         address += 4;
     }
     *registers[op0] = address - (m << 2);
@@ -769,6 +823,7 @@ int Interpreter::stmdbW(uint32_t opcode) { // STMDB Rn!, <Rlist>
 int Interpreter::ldmibW(uint32_t opcode) { // LDMIB Rn!, <Rlist>
     // Block load, pre-increment with writeback
     uint8_t m = bitCount[opcode & 0xFF] + bitCount[(opcode >> 8) & 0xFF];
+    HANDLE_EMPTY_ARM_LDM(true, true, true, false);
     uint8_t op0 = (opcode >> 16) & 0xF;
     uint32_t address = (*registers[op0] += (m << 2)) - (m << 2);
     for (int i = 0; i < 16; i++) {
@@ -790,6 +845,7 @@ int Interpreter::ldmibW(uint32_t opcode) { // LDMIB Rn!, <Rlist>
 int Interpreter::stmibW(uint32_t opcode) { // STMIB Rn!, <Rlist>
     // Store the writeback value if it's not the first listed register on ARM7
     uint8_t m = bitCount[opcode & 0xFF] + bitCount[(opcode >> 8) & 0xFF];
+    HANDLE_EMPTY_ARM_STM(true, true, true);
     uint8_t op0 = (opcode >> 16) & 0xF;
     uint32_t address = *registers[op0];
     if (arm7 && (opcode & (BIT(op0 + 1) - 1)) > BIT(op0))
@@ -798,7 +854,7 @@ int Interpreter::stmibW(uint32_t opcode) { // STMIB Rn!, <Rlist>
     // Block store, pre-increment with writeback
     for (int i = 0; i < 16; i++) {
         if (~opcode & BIT(i)) continue;
-        core->memory.write<uint32_t>(arm7, address += 4, *registers[i]);
+        core->memory.write<uint32_t>(arm7, address += 4, ((i == 15) ? (*registers[15] + 4) : *registers[i]));
     }
     *registers[op0] = address;
     return m + (arm7 || m < 2);
@@ -807,6 +863,7 @@ int Interpreter::stmibW(uint32_t opcode) { // STMIB Rn!, <Rlist>
 int Interpreter::ldmdaU(uint32_t opcode) { // LDMDA Rn, <Rlist>^
     // User block load, post-decrement without writeback; normal registers if branching
     uint8_t m = bitCount[opcode & 0xFF] + bitCount[(opcode >> 8) & 0xFF];
+    HANDLE_EMPTY_ARM_LDM(false, false, false, true);
     uint32_t op0 = *registers[(opcode >> 16) & 0xF] - (m << 2);
     uint32_t **regs = &registers[(~opcode & BIT(15)) >> 11];
     for (int i = 0; i < 16; i++) {
@@ -825,10 +882,11 @@ int Interpreter::ldmdaU(uint32_t opcode) { // LDMDA Rn, <Rlist>^
 int Interpreter::stmdaU(uint32_t opcode) { // STMDA Rn, <Rlist>^
     // User block store, post-decrement without writeback
     uint8_t m = bitCount[opcode & 0xFF] + bitCount[(opcode >> 8) & 0xFF];
+    HANDLE_EMPTY_ARM_STM(false, false, false);
     uint32_t op0 = *registers[(opcode >> 16) & 0xF] - (m << 2);
     for (int i = 0; i < 16; i++) {
         if (~opcode & BIT(i)) continue;
-        core->memory.write<uint32_t>(arm7, op0 += 4, registersUsr[i]);
+        core->memory.write<uint32_t>(arm7, op0 += 4, ((i == 15) ? (*registers[15] + 4) : registersUsr[i]));
     }
     return m + (arm7 || m < 2);
 }
@@ -836,6 +894,7 @@ int Interpreter::stmdaU(uint32_t opcode) { // STMDA Rn, <Rlist>^
 int Interpreter::ldmiaU(uint32_t opcode) { // LDMIA Rn, <Rlist>^
     // User block load, post-increment without writeback; normal registers if branching
     uint8_t m = bitCount[opcode & 0xFF] + bitCount[(opcode >> 8) & 0xFF];
+    HANDLE_EMPTY_ARM_LDM(true, false, false, true);
     uint32_t op0 = *registers[(opcode >> 16) & 0xF];
     uint32_t **regs = &registers[(~opcode & BIT(15)) >> 11];
     for (int i = 0; i < 16; i++) {
@@ -855,10 +914,11 @@ int Interpreter::ldmiaU(uint32_t opcode) { // LDMIA Rn, <Rlist>^
 int Interpreter::stmiaU(uint32_t opcode) { // STMIA Rn, <Rlist>^
     // User block store, post-increment without writeback
     uint8_t m = bitCount[opcode & 0xFF] + bitCount[(opcode >> 8) & 0xFF];
+    HANDLE_EMPTY_ARM_STM(true, false, false);
     uint32_t op0 = *registers[(opcode >> 16) & 0xF];
     for (int i = 0; i < 16; i++) {
         if (~opcode & BIT(i)) continue;
-        core->memory.write<uint32_t>(arm7, op0, registersUsr[i]);
+        core->memory.write<uint32_t>(arm7, op0, ((i == 15) ? (*registers[15] + 4) : registersUsr[i]));
         op0 += 4;
     }
     return m + (arm7 || m < 2);
@@ -867,6 +927,7 @@ int Interpreter::stmiaU(uint32_t opcode) { // STMIA Rn, <Rlist>^
 int Interpreter::ldmdbU(uint32_t opcode) { // LDMDB Rn, <Rlist>^
     // User block load, pre-decrement without writeback; normal registers if branching
     uint8_t m = bitCount[opcode & 0xFF] + bitCount[(opcode >> 8) & 0xFF];
+    HANDLE_EMPTY_ARM_LDM(false, true, false, true);
     uint32_t op0 = *registers[(opcode >> 16) & 0xF] - (m << 2);
     uint32_t **regs = &registers[(~opcode & BIT(15)) >> 11];
     for (int i = 0; i < 16; i++) {
@@ -886,10 +947,11 @@ int Interpreter::ldmdbU(uint32_t opcode) { // LDMDB Rn, <Rlist>^
 int Interpreter::stmdbU(uint32_t opcode) { // STMDB Rn, <Rlist>^
     // User block store, pre-decrement without writeback
     uint8_t m = bitCount[opcode & 0xFF] + bitCount[(opcode >> 8) & 0xFF];
+    HANDLE_EMPTY_ARM_STM(false, true, false);
     uint32_t op0 = *registers[(opcode >> 16) & 0xF] - (m << 2);
     for (int i = 0; i < 16; i++) {
         if (~opcode & BIT(i)) continue;
-        core->memory.write<uint32_t>(arm7, op0, registersUsr[i]);
+        core->memory.write<uint32_t>(arm7, op0, ((i == 15) ? (*registers[15] + 4) : registersUsr[i]));
         op0 += 4;
     }
     return m + (arm7 || m < 2);
@@ -898,6 +960,7 @@ int Interpreter::stmdbU(uint32_t opcode) { // STMDB Rn, <Rlist>^
 int Interpreter::ldmibU(uint32_t opcode) { // LDMIB Rn, <Rlist>^
     // User block load, pre-increment without writeback; normal registers if branching
     uint8_t m = bitCount[opcode & 0xFF] + bitCount[(opcode >> 8) & 0xFF];
+    HANDLE_EMPTY_ARM_LDM(true, true, false, true);
     uint32_t op0 = *registers[(opcode >> 16) & 0xF];
     uint32_t **regs = &registers[(~opcode & BIT(15)) >> 11];
     for (int i = 0; i < 16; i++) {
@@ -916,10 +979,11 @@ int Interpreter::ldmibU(uint32_t opcode) { // LDMIB Rn, <Rlist>^
 int Interpreter::stmibU(uint32_t opcode) { // STMIB Rn, <Rlist>^
     // User block store, pre-increment without writeback
     uint8_t m = bitCount[opcode & 0xFF] + bitCount[(opcode >> 8) & 0xFF];
+    HANDLE_EMPTY_ARM_STM(true, true, false);
     uint32_t op0 = *registers[(opcode >> 16) & 0xF];
     for (int i = 0; i < 16; i++) {
         if (~opcode & BIT(i)) continue;
-        core->memory.write<uint32_t>(arm7, op0 += 4, registersUsr[i]);
+        core->memory.write<uint32_t>(arm7, op0 += 4, ((i == 15) ? (*registers[15] + 4) : registersUsr[i]));
     }
     return m + (arm7 || m < 2);
 }
@@ -927,6 +991,7 @@ int Interpreter::stmibU(uint32_t opcode) { // STMIB Rn, <Rlist>^
 int Interpreter::ldmdaUW(uint32_t opcode) { // LDMDA Rn!, <Rlist>^
     // User block load, post-decrement with writeback; normal registers if branching
     uint8_t m = bitCount[opcode & 0xFF] + bitCount[(opcode >> 8) & 0xFF];
+    HANDLE_EMPTY_ARM_LDM(false, false, true, true);
     uint8_t op0 = (opcode >> 16) & 0xF;
     uint32_t address = (*registers[op0] -= (m << 2));
     uint32_t **regs = &registers[(~opcode & BIT(15)) >> 11];
@@ -950,6 +1015,7 @@ int Interpreter::ldmdaUW(uint32_t opcode) { // LDMDA Rn!, <Rlist>^
 int Interpreter::stmdaUW(uint32_t opcode) { // STMDA Rn!, <Rlist>^
     // Store the writeback value if it's not the first listed register on ARM7
     uint8_t m = bitCount[opcode & 0xFF] + bitCount[(opcode >> 8) & 0xFF];
+    HANDLE_EMPTY_ARM_STM(false, false, true);
     uint8_t op0 = (opcode >> 16) & 0xF;
     uint32_t address = *registers[op0] - (m << 2);
     if (arm7 && (opcode & (BIT(op0 + 1) - 1)) > BIT(op0))
@@ -958,7 +1024,7 @@ int Interpreter::stmdaUW(uint32_t opcode) { // STMDA Rn!, <Rlist>^
     // User block store, post-decrement with writeback
     for (int i = 0; i < 16; i++) {
         if (~opcode & BIT(i)) continue;
-        core->memory.write<uint32_t>(arm7, address += 4, registersUsr[i]);
+        core->memory.write<uint32_t>(arm7, address += 4, ((i == 15) ? (*registers[15] + 4) : registersUsr[i]));
     }
     *registers[op0] = address - (m << 2);
     return m + (arm7 || m < 2);
@@ -967,6 +1033,7 @@ int Interpreter::stmdaUW(uint32_t opcode) { // STMDA Rn!, <Rlist>^
 int Interpreter::ldmiaUW(uint32_t opcode) { // LDMIA Rn!, <Rlist>^
     // User block load, post-increment with writeback; normal registers if branching
     uint8_t m = bitCount[opcode & 0xFF] + bitCount[(opcode >> 8) & 0xFF];
+    HANDLE_EMPTY_ARM_LDM(true, false, true, true);
     uint8_t op0 = (opcode >> 16) & 0xF;
     uint32_t address = (*registers[op0] += (m << 2)) - (m << 2);
     uint32_t **regs = &registers[(~opcode & BIT(15)) >> 11];
@@ -981,7 +1048,8 @@ int Interpreter::ldmiaUW(uint32_t opcode) { // LDMIA Rn!, <Rlist>^
         *registers[op0] = address;
 
     // Handle pipelining and mode/THUMB switching
-    if (~opcode & BIT(15)) return m + (arm7 ? 2 : (m < 2));
+    if (~opcode & BIT(15))
+        return m + (arm7 ? 2 : (m < 2));
     if (spsr) setCpsr(*spsr);
     cpsr |= (*registers[15] & !arm7) << 5;
     flushPipeline();
@@ -991,6 +1059,7 @@ int Interpreter::ldmiaUW(uint32_t opcode) { // LDMIA Rn!, <Rlist>^
 int Interpreter::stmiaUW(uint32_t opcode) { // STMIA Rn!, <Rlist>^
     // Store the writeback value if it's not the first listed register on ARM7
     uint8_t m = bitCount[opcode & 0xFF] + bitCount[(opcode >> 8) & 0xFF];
+    HANDLE_EMPTY_ARM_STM(true, false, true);
     uint8_t op0 = (opcode >> 16) & 0xF;
     uint32_t address = *registers[op0];
     if (arm7 && (opcode & (BIT(op0 + 1) - 1)) > BIT(op0))
@@ -999,7 +1068,7 @@ int Interpreter::stmiaUW(uint32_t opcode) { // STMIA Rn!, <Rlist>^
     // User block store, post-increment with writeback
     for (int i = 0; i < 16; i++) {
         if (~opcode & BIT(i)) continue;
-        core->memory.write<uint32_t>(arm7, address, registersUsr[i]);
+        core->memory.write<uint32_t>(arm7, address, ((i == 15) ? (*registers[15] + 4) : registersUsr[i]));
         address += 4;
     }
     *registers[op0] = address;
@@ -1009,6 +1078,7 @@ int Interpreter::stmiaUW(uint32_t opcode) { // STMIA Rn!, <Rlist>^
 int Interpreter::ldmdbUW(uint32_t opcode) { // LDMDB Rn!, <Rlist>^
     // User block load, pre-decrement with writeback; normal registers if branching
     uint8_t m = bitCount[opcode & 0xFF] + bitCount[(opcode >> 8) & 0xFF];
+    HANDLE_EMPTY_ARM_LDM(false, true, true, true);
     uint8_t op0 = (opcode >> 16) & 0xF;
     uint32_t address = (*registers[op0] -= (m << 2));
     uint32_t **regs = &registers[(~opcode & BIT(15)) >> 11];
@@ -1033,6 +1103,7 @@ int Interpreter::ldmdbUW(uint32_t opcode) { // LDMDB Rn!, <Rlist>^
 int Interpreter::stmdbUW(uint32_t opcode) { // STMDB Rn!, <Rlist>^
     // Store the writeback value if it's not the first listed register on ARM7
     uint8_t m = bitCount[opcode & 0xFF] + bitCount[(opcode >> 8) & 0xFF];
+    HANDLE_EMPTY_ARM_STM(false, true, true);
     uint8_t op0 = (opcode >> 16) & 0xF;
     uint32_t address = *registers[op0] - (m << 2);
     if (arm7 && (opcode & (BIT(op0 + 1) - 1)) > BIT(op0))
@@ -1041,7 +1112,7 @@ int Interpreter::stmdbUW(uint32_t opcode) { // STMDB Rn!, <Rlist>^
     // User block store, pre-decrement with writeback
     for (int i = 0; i < 16; i++) {
         if (~opcode & BIT(i)) continue;
-        core->memory.write<uint32_t>(arm7, address, registersUsr[i]);
+        core->memory.write<uint32_t>(arm7, address, ((i == 15) ? (*registers[15] + 4) : registersUsr[i]));
         address += 4;
     }
     *registers[op0] = address - (m << 2);
@@ -1051,6 +1122,7 @@ int Interpreter::stmdbUW(uint32_t opcode) { // STMDB Rn!, <Rlist>^
 int Interpreter::ldmibUW(uint32_t opcode) { // LDMIB Rn!, <Rlist>^
     // User block load, pre-increment with writeback; normal registers if branching
     uint8_t m = bitCount[opcode & 0xFF] + bitCount[(opcode >> 8) & 0xFF];
+    HANDLE_EMPTY_ARM_LDM(true, true, true, true);
     uint8_t op0 = (opcode >> 16) & 0xF;
     uint32_t address = (*registers[op0] += (m << 2)) - (m << 2);
     uint32_t **regs = &registers[(~opcode & BIT(15)) >> 11];
@@ -1074,6 +1146,7 @@ int Interpreter::ldmibUW(uint32_t opcode) { // LDMIB Rn!, <Rlist>^
 int Interpreter::stmibUW(uint32_t opcode) { // STMIB Rn!, <Rlist>^
     // Store the writeback value if it's not the first listed register on ARM7
     uint8_t m = bitCount[opcode & 0xFF] + bitCount[(opcode >> 8) & 0xFF];
+    HANDLE_EMPTY_ARM_STM(true, true, true);
     uint8_t op0 = (opcode >> 16) & 0xF;
     uint32_t address = *registers[op0];
     if (arm7 && (opcode & (BIT(op0 + 1) - 1)) > BIT(op0))
@@ -1082,71 +1155,57 @@ int Interpreter::stmibUW(uint32_t opcode) { // STMIB Rn!, <Rlist>^
     // User block store, pre-increment with writeback
     for (int i = 0; i < 16; i++) {
         if (~opcode & BIT(i)) continue;
-        core->memory.write<uint32_t>(arm7, address += 4, registersUsr[i]);
+        core->memory.write<uint32_t>(arm7, address += 4, ((i == 15) ? (*registers[15] + 4) : registersUsr[i]));
     }
     *registers[op0] = address;
     return m + (arm7 || m < 2);
 }
 
 int Interpreter::msrRc(uint32_t opcode) { // MSR CPSR,Rm
-    // Write the first 8 bits of the status flags, only changing the CPU mode when not in user mode
     uint32_t op1 = *registers[opcode & 0xF];
-    if (opcode & BIT(16)) {
-        uint8_t mask = ((cpsr & 0x1F) == 0x10) ? 0xE0 : 0xFF;
+    // Match ARM9/ARM7 privileged writes: f updates NZCVQ; c updates control bits 7:5 and 3:0.
+    // User mode may write flags but cannot change CPSR control, interrupt masks, or T state.
+    uint32_t mask = (opcode & BIT(19)) ? (arm7 ? 0xF0000000 : 0xF8000000) : 0;
+    if ((cpsr & 0x0F) != 0 && (opcode & BIT(16)))
+        mask |= 0x000000EF;
+    if (mask)
         setCpsr((cpsr & ~mask) | (op1 & mask));
-    }
-
-    // Write the remaining 8-bit blocks of the status flags
-    for (int i = 1; i < 4; i++) {
-        if (opcode & BIT(16 + i))
-            cpsr = (cpsr & ~(0xFF << (i << 3))) | (op1 & (0xFF << (i << 3)));
-    }
     return 1;
 }
 
 int Interpreter::msrRs(uint32_t opcode) { // MSR SPSR,Rm
-    // Write the saved status flags in 8-bit blocks
     if (!spsr) return 1;
     uint32_t op1 = *registers[opcode & 0xF];
-    for (int i = 0; i < 4; i++) {
-        if (opcode & BIT(16 + i))
-            *spsr = (*spsr & ~(0xFF << (i << 3))) | (op1 & (0xFF << (i << 3)));
-    }
+    uint32_t mask = (opcode & BIT(19)) ? (arm7 ? 0xF0000000 : 0xF8000000) : 0;
+    if (opcode & BIT(16)) mask |= 0x000000EF;
+    if (mask)
+        *spsr = (*spsr & ~mask) | (op1 & mask);
     return 1;
 }
 
 int Interpreter::msrIc(uint32_t opcode) { // MSR CPSR,#i
-    // Rotate the immediate value
     uint32_t value = opcode & 0xFF;
     uint8_t shift = (opcode >> 7) & 0x1E;
-    uint32_t op1 = (value << (32 - shift)) | (value >> shift);
+    uint32_t op1 = shift ? ((value >> shift) | (value << (32 - shift))) : value;
 
-    // Write the first 8 bits of the status flags, only changing the CPU mode when not in user mode
-    if (opcode & BIT(16)) {
-        uint8_t mask = ((cpsr & 0x1F) == 0x10) ? 0xE0 : 0xFF;
+    uint32_t mask = (opcode & BIT(19)) ? (arm7 ? 0xF0000000 : 0xF8000000) : 0;
+    if ((cpsr & 0x0F) != 0 && (opcode & BIT(16)))
+        mask |= 0x000000EF;
+    if (mask)
         setCpsr((cpsr & ~mask) | (op1 & mask));
-    }
-
-    // Write the remaining 8-bit blocks of the status flags
-    for (int i = 1; i < 4; i++) {
-        if (opcode & BIT(16 + i))
-            cpsr = (cpsr & ~(0xFF << (i << 3))) | (op1 & (0xFF << (i << 3)));
-    }
     return 1;
 }
 
 int Interpreter::msrIs(uint32_t opcode) { // MSR SPSR,#i
-    // Rotate the immediate value
     if (!spsr) return 1;
     uint32_t value = opcode & 0xFF;
     uint8_t shift = (opcode >> 7) & 0x1E;
-    uint32_t op1 = (value << (32 - shift)) | (value >> shift);
+    uint32_t op1 = shift ? ((value >> shift) | (value << (32 - shift))) : value;
 
-    // Write the saved status flags in 8-bit blocks
-    for (int i = 0; i < 4; i++) {
-        if (opcode & BIT(16 + i))
-            *spsr = (*spsr & ~(0xFF << (i << 3))) | (op1 & (0xFF << (i << 3)));
-    }
+    uint32_t mask = (opcode & BIT(19)) ? (arm7 ? 0xF0000000 : 0xF8000000) : 0;
+    if (opcode & BIT(16)) mask |= 0x000000EF;
+    if (mask)
+        *spsr = (*spsr & ~mask) | (op1 & mask);
     return 1;
 }
 
@@ -1378,6 +1437,17 @@ int Interpreter::strSpT(uint16_t opcode) { // STR Rd,[SP,#i]
 int Interpreter::ldmiaT(uint16_t opcode) { // LDMIA Rb!,<Rlist>
     // Block load, post-increment with writeback (THUMB)
     uint8_t m = bitCount[opcode & 0xFF];
+    if (m == 0) {
+        uint32_t *baseReg = registers[(opcode >> 8) & 0x7];
+        uint32_t base = *baseReg;
+        *baseReg = base + 0x40;
+        if (arm7) {
+            *registers[15] = core->memory.read<uint32_t>(arm7, base);
+            flushPipeline();
+            return 4;
+        }
+        return 1;
+    }
     uint32_t *op0 = registers[(opcode >> 8) & 0x7];
     uint32_t address = (*op0 += (m << 2)) - (m << 2);
     for (int i = 0; i < 8; i++) {
@@ -1393,6 +1463,11 @@ int Interpreter::stmiaT(uint16_t opcode) { // STMIA Rb!,<Rlist>
     uint8_t m = bitCount[opcode & 0xFF];
     uint8_t op0 = (opcode >> 8) & 0x7;
     uint32_t address = *registers[op0];
+    if (m == 0) {
+        if (arm7) core->memory.write<uint32_t>(arm7, address, *registers[15]);
+        *registers[op0] = address + 0x40;
+        return 1;
+    }
     if (arm7 && (opcode & (BIT(op0 + 1) - 1)) > BIT(op0))
         *registers[op0] = address + (m << 2);
 

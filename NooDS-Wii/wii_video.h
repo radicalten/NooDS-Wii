@@ -52,11 +52,14 @@ struct WiiDebugOverlay {
 
 void Wii_VideoInit();
 void Wii_VideoRender(const uint32_t* srcTop, const uint32_t* srcBottom,
-                     bool gbaMode = false);
+                     bool gbaMode = false, bool uploadTextures = true);
+bool Wii_GetTouchScreenRect(float* outLeft, float* outTop,
+                            float* outRight, float* outBottom);
 void Wii_VideoFlushAsync();
 void Wii_DrawCursor(float x, float y);
 void Wii_DebugOverlayInit();
 void Wii_DebugOverlayPrint(int line, const char* fmt, ...);
 void Wii_DebugOverlaySetEnabled(bool enabled);
+bool Wii_DebugOverlayHasDirty();
 
 #endif // WII_VIDEO_H

@@ -18,7 +18,6 @@
     along with NooDS-Wii. If not, see <https://www.gnu.org/licenses/>.
 */
 
-#include <cmath>
 #include "core.h"
 
 void DivSqrt::saveState(FILE *file) {
@@ -31,6 +30,7 @@ void DivSqrt::saveState(FILE *file) {
     fwrite(&sqrtCnt, sizeof(sqrtCnt), 1, file);
     fwrite(&sqrtResult, sizeof(sqrtResult), 1, file);
     fwrite(&sqrtParam, sizeof(sqrtParam), 1, file);
+    fwrite(&sqrtReadyCycle, sizeof(sqrtReadyCycle), 1, file);
 }
 
 void DivSqrt::loadState(FILE *file) {
@@ -43,6 +43,11 @@ void DivSqrt::loadState(FILE *file) {
     fread(&sqrtCnt, sizeof(sqrtCnt), 1, file);
     fread(&sqrtResult, sizeof(sqrtResult), 1, file);
     fread(&sqrtParam, sizeof(sqrtParam), 1, file);
+    // Older states have no pending square-root deadline. A clear BUSY bit
+    // makes the default deadline irrelevant in that case.
+    sqrtReadyCycle = 0;
+    fread(&sqrtReadyCycle, sizeof(sqrtReadyCycle), 1, file);
+    if (!(sqrtCnt & 0x8000)) sqrtReadyCycle = 0;
 }
 
 void DivSqrt::divide() {
@@ -99,16 +104,51 @@ void DivSqrt::divide() {
 }
 
 void DivSqrt::squareRoot() {
-    // Calculate the square root result
-    switch (sqrtCnt & 0x1) { // Square root mode
-    case 0: // 32-bit
-        sqrtResult = sqrt((uint32_t)sqrtParam);
-        break;
-
-    case 1: // 64-bit
-        sqrtResult = sqrtl(sqrtParam);
-        break;
+    // Match the ARM9 integer square-root datapath used by Dust. Floating-point
+    // sqrt can round differently at 64 bits on platforms where long double is
+    // only 53-bit precision.
+    uint64_t input = (sqrtCnt & 0x1) ? sqrtParam : (uint32_t)sqrtParam;
+    uint64_t bit = (sqrtCnt & 0x1) ? (1ULL << 62) : (1ULL << 30);
+    uint64_t result = 0;
+    while (bit > input) bit >>= 2;
+    while (bit != 0) {
+        if (input >= result + bit) {
+            input -= result + bit;
+            result = (result >> 1) + bit;
+        } else {
+            result >>= 1;
+        }
+        bit >>= 2;
     }
+    sqrtResult = (uint32_t)result;
+}
+
+void DivSqrt::updateSquareRoot() {
+    if ((sqrtCnt & 0x8000) &&
+        (int32_t)(core->globalCycles - sqrtReadyCycle) >= 0) {
+        sqrtCnt &= (uint16_t)~0x8000;
+        squareRoot();
+    }
+}
+
+void DivSqrt::scheduleSquareRoot() {
+    sqrtCnt |= 0x8000;
+    sqrtReadyCycle = core->globalCycles + 26;
+}
+
+uint16_t DivSqrt::readSqrtCnt() {
+    updateSquareRoot();
+    return sqrtCnt;
+}
+
+uint32_t DivSqrt::readSqrtResult() {
+    updateSquareRoot();
+    return sqrtResult;
+}
+
+void DivSqrt::resetCycles(uint32_t elapsedCycles) {
+    updateSquareRoot();
+    if (sqrtCnt & 0x8000) sqrtReadyCycle -= elapsedCycles;
 }
 
 void DivSqrt::writeDivCnt(uint16_t mask, uint16_t value) {
@@ -143,20 +183,24 @@ void DivSqrt::writeDivDenomH(uint32_t mask, uint32_t value) {
 }
 
 void DivSqrt::writeSqrtCnt(uint16_t mask, uint16_t value) {
-    // Write to the SQRTCNT register and update the square root result
+    // Control/input writes restart the hardware calculation; BUSY clears 26
+    // ARM9 cycles after the last write, when the integer result is committed.
+    updateSquareRoot();
     mask &= 0x0001;
     sqrtCnt = (sqrtCnt & ~mask) | (value & mask);
-    squareRoot();
+    scheduleSquareRoot();
 }
 
 void DivSqrt::writeSqrtParamL(uint32_t mask, uint32_t value) {
-    // Write to the DIVDENOM register and update the square root result
+    // Write to the square-root parameter and restart the calculation.
+    updateSquareRoot();
     sqrtParam = (sqrtParam & ~((uint64_t)mask)) | (value & mask);
-    squareRoot();
+    scheduleSquareRoot();
 }
 
 void DivSqrt::writeSqrtParamH(uint32_t mask, uint32_t value) {
-    // Write to the SQRTPARAM register and update the square root result
+    // Write to the square-root parameter and restart the calculation.
+    updateSquareRoot();
     sqrtParam = (sqrtParam & ~((uint64_t)mask << 32)) | ((uint64_t)(value & mask) << 32);
-    squareRoot();
+    scheduleSquareRoot();
 }

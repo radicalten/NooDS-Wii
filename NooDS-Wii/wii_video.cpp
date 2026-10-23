@@ -18,6 +18,7 @@
 */
 
 #include "wii_video.h"
+#include "settings.h"
 #include <gccore.h>
 #include <string.h>
 #include <malloc.h>
@@ -157,6 +158,8 @@ static const u8 debugFont[95][8] = {
 
 static uint32_t overlayStaging[DEBUG_OVERLAY_WIDTH * DEBUG_OVERLAY_HEIGHT];
 static bool overlayRowDirty[OVERLAY_ROWS];
+static char overlayLastText[OVERLAY_ROWS][OVERLAY_COLS + 1];
+
 
 static void DrawCharToStaging(int col, int row, char c,
                                uint32_t fgColor, uint32_t bgColor) {
@@ -165,42 +168,53 @@ static void DrawCharToStaging(int col, int row, char c,
 
     for (int py = 0; py < FONT_CHAR_H; py++) {
         u8 bits = glyph[py];
-        for (int px = 0; px < FONT_CHAR_W; px++) {
-            bool lit = (bits >> px) & 1;
-            int idx  = (row * FONT_CHAR_H + py) * DEBUG_OVERLAY_WIDTH
-                     + (col * FONT_CHAR_W + px);
-            overlayStaging[idx] = lit ? fgColor : bgColor;
-        }
+        uint32_t* dst = overlayStaging + (row * FONT_CHAR_H + py) * DEBUG_OVERLAY_WIDTH
+                      + (col * FONT_CHAR_W);
+        dst[0] = (bits & 0x01) ? fgColor : bgColor;
+        dst[1] = (bits & 0x02) ? fgColor : bgColor;
+        dst[2] = (bits & 0x04) ? fgColor : bgColor;
+        dst[3] = (bits & 0x08) ? fgColor : bgColor;
+        dst[4] = (bits & 0x10) ? fgColor : bgColor;
+        dst[5] = (bits & 0x20) ? fgColor : bgColor;
+        dst[6] = (bits & 0x40) ? fgColor : bgColor;
+        dst[7] = (bits & 0x80) ? fgColor : bgColor;
     }
 }
 
-static void TileImageRGBA8_fromABGR(const uint32_t* src, u8* dest,
+static void TileImageRGBA8_fromABGR(const uint32_t* __restrict__ src,
+                                     u8* __restrict__ dest,
                                      int width, int height) {
     const int tilesX = width  >> 2;
     const int tilesY = height >> 2;
 
     for (int ty = 0; ty < tilesY; ty++) {
-        for (int tx = 0; tx < tilesX; tx++) {
-            u8* tile = dest + ((ty * tilesX + tx) << 6);
-            u8* ar   = tile;
-            u8* gb   = tile + 32;
+        const uint32_t* row0 = src + (ty * 4 + 0) * width;
+        const uint32_t* row1 = row0 + width;
+        const uint32_t* row2 = row1 + width;
+        const uint32_t* row3 = row2 + width;
+        u32* tilePtr = (u32*)(dest + ((ty * tilesX) << 6));
 
-            for (int py = 0; py < 4; py++) {
-                const uint32_t* row = src + (ty * 4 + py) * width + tx * 4;
-                for (int px = 0; px < 4; px++) {
-                    uint32_t p = row[px];
-                    u8 r = (u8)( p        & 0xFF);
-                    u8 g = (u8)((p >>  8) & 0xFF);
-                    u8 b = (u8)((p >> 16) & 0xFF);
-                    u8 a = (u8)((p >> 24) & 0xFF);
-
-                    int idx      = (py << 2) + px;
-                    ar[idx * 2 + 0] = a;
-                    ar[idx * 2 + 1] = r;
-                    gb[idx * 2 + 0] = g;
-                    gb[idx * 2 + 1] = b;
-                }
-            }
+        for (int tx = 0; tx < tilesX; tx++, tilePtr += 16) {
+            const int x4 = tx << 2;
+            #define PACK_ROW(ROW, BASE) do { \
+                const uint32_t p0 = (ROW)[x4 + 0]; \
+                const uint32_t p1 = (ROW)[x4 + 1]; \
+                const uint32_t p2 = (ROW)[x4 + 2]; \
+                const uint32_t p3 = (ROW)[x4 + 3]; \
+                tilePtr[(BASE) + 0] = ((p0 & 0xFF000000u) | ((p0 & 0xFFu) << 16)) \
+                                    | (((p1 & 0xFF000000u) >> 16) | (p1 & 0xFFu)); \
+                tilePtr[(BASE) + 1] = ((p2 & 0xFF000000u) | ((p2 & 0xFFu) << 16)) \
+                                    | (((p3 & 0xFF000000u) >> 16) | (p3 & 0xFFu)); \
+                tilePtr[(BASE) + 8] = (((p0 & 0x0000FF00u) << 16) | (p0 & 0x00FF0000u)) \
+                                    | ((p1 & 0x0000FF00u) | ((p1 & 0x00FF0000u) >> 16)); \
+                tilePtr[(BASE) + 9] = (((p2 & 0x0000FF00u) << 16) | (p2 & 0x00FF0000u)) \
+                                    | ((p3 & 0x0000FF00u) | ((p3 & 0x00FF0000u) >> 16)); \
+            } while (0)
+            PACK_ROW(row0, 0);
+            PACK_ROW(row1, 2);
+            PACK_ROW(row2, 4);
+            PACK_ROW(row3, 6);
+            #undef PACK_ROW
         }
     }
 }
@@ -295,6 +309,7 @@ void Wii_DebugOverlayInit() {
     memset(wiiDbg.texData,   0, bufSize);
     memset(overlayStaging,   0, sizeof(overlayStaging));
     memset(overlayRowDirty,  0, sizeof(overlayRowDirty));
+    memset(overlayLastText,  0, sizeof(overlayLastText));
     DCFlushRange(wiiDbg.texData, bufSize);
 
     GX_InitTexObj(&wiiDbg.texObj,
@@ -310,6 +325,14 @@ void Wii_DebugOverlaySetEnabled(bool enabled) {
     wiiDbg.enabled = enabled;
 }
 
+bool Wii_DebugOverlayHasDirty() {
+    if (!wiiDbg.enabled) return false;
+    for (int row = 0; row < OVERLAY_ROWS; row++) {
+        if (overlayRowDirty[row]) return true;
+    }
+    return false;
+}
+
 void Wii_DebugOverlayPrint(int line, const char* fmt, ...) {
     if (!wiiDbg.enabled || line < 0 || line >= OVERLAY_ROWS) return;
 
@@ -322,6 +345,10 @@ void Wii_DebugOverlayPrint(int line, const char* fmt, ...) {
     int len = (int)strlen(buf);
     while (len < OVERLAY_COLS) buf[len++] = ' ';
     buf[OVERLAY_COLS] = '\0';
+
+    if (memcmp(buf, overlayLastText[line], OVERLAY_COLS) == 0)
+        return;
+    memcpy(overlayLastText[line], buf, OVERLAY_COLS + 1);
 
     const uint32_t fg = 0xFFFFFFFF;
     const uint32_t bg = 0xC0000000;
@@ -381,6 +408,12 @@ static void Wii_DebugOverlayFlush() {
 
         overlayRowDirty[row] = false;
     }
+
+    if (anyDirty) {
+        static u8 s_overlayTexGen = 0;
+        wiiDbg.texData[0] = (u8)(0xC0u | (++s_overlayTexGen & 1u));
+        DCFlushRange(wiiDbg.texData, 32);
+    }
 }
 
 static void DrawScreenQuad(GXTexObj* texObj,
@@ -412,78 +445,248 @@ static void DrawScreenQuad(GXTexObj* texObj,
     GX_End();
 }
 
-void Wii_VideoRender(const uint32_t* srcTop, const uint32_t* srcBottom, bool gbaMode) {
+static struct {
+    f32  left, top, right, bottom;
+    bool visible;
+} s_lastTouchRect = { 192.0f, 241.0f, 448.0f, 433.0f, true };
+
+bool Wii_GetTouchScreenRect(float* outLeft, float* outTop,
+                            float* outRight, float* outBottom) {
+    if (outLeft)   *outLeft   = s_lastTouchRect.left;
+    if (outTop)    *outTop    = s_lastTouchRect.top;
+    if (outRight)  *outRight  = s_lastTouchRect.right;
+    if (outBottom) *outBottom = s_lastTouchRect.bottom;
+    return s_lastTouchRect.visible;
+}
+
+struct WiiScreenRects {
+    f32  topX1, topY1, topX2, topY2;
+    bool topVis;
+    f32  botX1, botY1, botX2, botY2;
+    bool botVis;
+};
+
+static void Wii_ComputeScreenRects(int fbW, int fbH, bool gbaMode, WiiScreenRects* out) {
+    static const float kSizeScales[10] = {
+        0.0f,  // 0: Auto
+        0.50f, // 1: 0.50x
+        0.75f, // 2: 0.75x
+        1.00f, // 3: 1.00x
+        1.25f, // 4: 1.25x
+        1.50f, // 5: 1.50x
+        1.75f, // 6: 1.75x
+        2.00f, // 7: 2.00x
+        2.50f, // 8: 2.50x
+        -1.0f  // 9: Off
+    };
+    static const int kGapPixels[5] = { 0, 2, 8, 16, 32 };
+
+    int s1     = (Settings::screen1Size  >= 0 && Settings::screen1Size  <= 9) ? Settings::screen1Size  : 0;
+    int s2     = (Settings::screen2Size  >= 0 && Settings::screen2Size  <= 9) ? Settings::screen2Size  : 0;
+    int layout = (Settings::screenLayout >= 0 && Settings::screenLayout <= 5) ? Settings::screenLayout : 0;
+    int swap   = (Settings::screenSwap != 0) ? 1 : 0;
+    int gap    = kGapPixels[(Settings::wiiScreenGap >= 0 && Settings::wiiScreenGap <= 4) ? Settings::wiiScreenGap : 1];
+
+    memset(out, 0, sizeof(*out));
+
+    if (gbaMode) {
+        if (s1 == 9) return;
+        float sc = (s1 == 0) ? 2.0f : kSizeScales[s1];
+        float w  = (float)GBA_SCREEN_WIDTH  * sc;
+        float h  = (float)GBA_SCREEN_HEIGHT * sc;
+        float fit = 1.0f;
+        if (w > (float)fbW) fit = (float)fbW / w;
+        if (h * fit > (float)fbH) fit = (float)fbH / h;
+        w *= fit;
+        h *= fit;
+        out->topX1  = ((float)fbW - w) * 0.5f;
+        out->topY1  = ((float)fbH - h) * 0.5f;
+        out->topX2  = out->topX1 + w;
+        out->topY2  = out->topY1 + h;
+        out->topVis = true;
+        return;
+    }
+
+    bool vis1 = (s1 != 9) && (layout != 5);
+    bool vis2 = (s2 != 9) && (layout != 4);
+    if (!vis1 && !vis2) {
+        vis1 = true;
+        s1   = 3; // 1.00x fallback so the screen never goes completely black
+    }
+
+    // Single-screen mode (either layout = Scr1/Scr2 Only, or the other screen is Off).
+    if (vis1 != vis2) {
+        bool onlyTop = vis1;
+        int  sOpt    = onlyTop ? s1 : s2;
+        if (swap) {
+            onlyTop = !onlyTop;
+            sOpt    = onlyTop ? s1 : s2;
+            if (sOpt == 9) sOpt = 0;
+        }
+        float sc = (sOpt == 0) ? 2.50f : kSizeScales[sOpt];
+        float w  = (float)NDS_SCREEN_WIDTH  * sc;
+        float h  = (float)NDS_SCREEN_HEIGHT * sc;
+        float fit = 1.0f;
+        if (w > (float)fbW) fit = (float)fbW / w;
+        if (h * fit > (float)fbH) fit = (float)fbH / h;
+        w *= fit;
+        h *= fit;
+        f32 x1 = ((float)fbW - w) * 0.5f;
+        f32 y1 = ((float)fbH - h) * 0.5f;
+        if (onlyTop) {
+            out->topX1 = x1; out->topY1 = y1; out->topX2 = x1 + w; out->topY2 = y1 + h;
+            out->topVis = true;
+        } else {
+            out->botX1 = x1; out->botY1 = y1; out->botX2 = x1 + w; out->botY2 = y1 + h;
+            out->botVis = true;
+        }
+        return;
+    }
+
+    // Dual-screen modes: compute desired scales for Screen 1 (Top) and Screen 2 (Bottom).
+    float auto1 = 1.0f, auto2 = 1.0f;
+    if (layout == 1) { // Side-by-Side
+        auto1 = auto2 = ((float)fbW - (float)gap) / (2.0f * (float)NDS_SCREEN_WIDTH);
+    } else if (layout == 2) { // Hybrid (Big Screen 1 on Left, Compact Screen 2 on Right)
+        auto1 = 1.75f;
+        auto2 = 0.70f;
+    } else if (layout == 3) { // Hybrid (Big Screen 2 on Left, Compact Screen 1 on Right)
+        auto1 = 0.70f;
+        auto2 = 1.75f;
+    }
+
+    float sc1 = (s1 == 0) ? auto1 : kSizeScales[s1];
+    float sc2 = (s2 == 0) ? auto2 : kSizeScales[s2];
+
+    float w1 = (float)NDS_SCREEN_WIDTH  * sc1;
+    float h1 = (float)NDS_SCREEN_HEIGHT * sc1;
+    float w2 = (float)NDS_SCREEN_WIDTH  * sc2;
+    float h2 = (float)NDS_SCREEN_HEIGHT * sc2;
+
+    // Determine slot order: in HybridBot, Screen 2 starts on the left unless swapped.
+    bool firstIsTop = (layout == 3) ? (swap != 0) : (swap == 0);
+    float wA = firstIsTop ? w1 : w2;
+    float hA = firstIsTop ? h1 : h2;
+    float wB = firstIsTop ? w2 : w1;
+    float hB = firstIsTop ? h2 : h1;
+
+    float fit = 1.0f;
+    if (layout == 0) { // Vertical stack (A over B)
+        float maxW = (wA > wB) ? wA : wB;
+        float totH = hA + (float)gap + hB;
+        if (maxW > (float)fbW) fit = (float)fbW / maxW;
+        if (totH * fit > (float)fbH) {
+            float availH = (float)fbH - (float)gap;
+            if (availH < 32.0f) availH = 32.0f;
+            float f2 = availH / (hA + hB);
+            if (f2 < fit) fit = f2;
+        }
+        wA *= fit; hA *= fit; wB *= fit; hB *= fit;
+        float startY = ((float)fbH - (hA + (float)gap + hB)) * 0.5f;
+        f32 xA = ((float)fbW - wA) * 0.5f, yA = startY;
+        f32 xB = ((float)fbW - wB) * 0.5f, yB = startY + hA + (float)gap;
+        if (firstIsTop) {
+            out->topX1 = xA; out->topY1 = yA; out->topX2 = xA + wA; out->topY2 = yA + hA;
+            out->botX1 = xB; out->botY1 = yB; out->botX2 = xB + wB; out->botY2 = yB + hB;
+        } else {
+            out->botX1 = xA; out->botY1 = yA; out->botX2 = xA + wA; out->botY2 = yA + hA;
+            out->topX1 = xB; out->topY1 = yB; out->topX2 = xB + wB; out->topY2 = yB + hB;
+        }
+    } else { // Horizontal arrangement (A left of B)
+        float maxH = (hA > hB) ? hA : hB;
+        float totW = wA + (float)gap + wB;
+        if (maxH > (float)fbH) fit = (float)fbH / maxH;
+        if (totW * fit > (float)fbW) {
+            float availW = (float)fbW - (float)gap;
+            if (availW < 32.0f) availW = 32.0f;
+            float f2 = availW / (wA + wB);
+            if (f2 < fit) fit = f2;
+        }
+        wA *= fit; hA *= fit; wB *= fit; hB *= fit;
+        float startX = ((float)fbW - (wA + (float)gap + wB)) * 0.5f;
+        f32 xA = startX,                   yA = ((float)fbH - hA) * 0.5f;
+        f32 xB = startX + wA + (float)gap, yB = ((float)fbH - hB) * 0.5f;
+        if (firstIsTop) {
+            out->topX1 = xA; out->topY1 = yA; out->topX2 = xA + wA; out->topY2 = yA + hA;
+            out->botX1 = xB; out->botY1 = yB; out->botX2 = xB + wB; out->botY2 = yB + hB;
+        } else {
+            out->botX1 = xA; out->botY1 = yA; out->botX2 = xA + wA; out->botY2 = yA + hA;
+            out->topX1 = xB; out->topY1 = yB; out->topX2 = xB + wB; out->topY2 = yB + hB;
+        }
+    }
+    out->topVis = true;
+    out->botVis = true;
+}
+
+void Wii_VideoRender(const uint32_t* srcTop, const uint32_t* srcBottom,
+                     bool gbaMode, bool uploadTextures) {
     const int scrW = gbaMode ? GBA_SCREEN_WIDTH  : NDS_SCREEN_WIDTH;
     const int scrH = gbaMode ? GBA_SCREEN_HEIGHT : NDS_SCREEN_HEIGHT;
     const size_t bufSize = (size_t)scrW * scrH * 4;
+    const u8 filterMode = (Settings::screenFilter != 0) ? GX_LINEAR : GX_NEAR;
+    static u8 s_lastFilterMode = 0xFF;
 
-    if (gbaMode != wiiVid.lastGbaMode) {
+    if (gbaMode != wiiVid.lastGbaMode || filterMode != s_lastFilterMode) {
         GX_InitTexObj(&wiiVid.texObjTop,
                       wiiVid.texDataTop,
                       scrW, scrH,
                       GX_TF_RGBA8, GX_CLAMP, GX_CLAMP, GX_FALSE);
-        GX_InitTexObjFilterMode(&wiiVid.texObjTop, GX_NEAR, GX_NEAR);
+        GX_InitTexObjFilterMode(&wiiVid.texObjTop, filterMode, filterMode);
 
         if (!gbaMode) {
             GX_InitTexObj(&wiiVid.texObjBottom,
                           wiiVid.texDataBottom,
                           scrW, scrH,
                           GX_TF_RGBA8, GX_CLAMP, GX_CLAMP, GX_FALSE);
-            GX_InitTexObjFilterMode(&wiiVid.texObjBottom, GX_NEAR, GX_NEAR);
+            GX_InitTexObjFilterMode(&wiiVid.texObjBottom, filterMode, filterMode);
         }
 
+        if (gbaMode != wiiVid.lastGbaMode)
+            uploadTextures = true;
         wiiVid.lastGbaMode = gbaMode;
+        s_lastFilterMode   = filterMode;
+        GX_InvalidateTexAll();
     }
 
-    if (srcTop) {
+    static u8 s_screenTexGen = 0;
+    bool anyTexUpdated = false;
+    if (uploadTextures && srcTop) {
         TileImageRGBA8_fromABGR(srcTop, wiiVid.texDataTop, scrW, scrH);
+        wiiVid.texDataTop[0] = ++s_screenTexGen;
         DCFlushRange(wiiVid.texDataTop, bufSize);
+        anyTexUpdated = true;
     }
-    if (srcBottom && !gbaMode) {
+    if (uploadTextures && srcBottom && !gbaMode) {
         TileImageRGBA8_fromABGR(srcBottom, wiiVid.texDataBottom, scrW, scrH);
+        wiiVid.texDataBottom[0] = ++s_screenTexGen;
         DCFlushRange(wiiVid.texDataBottom, bufSize);
+        anyTexUpdated = true;
     }
 
-    Wii_DebugOverlayFlush();
+    if (Wii_DebugOverlayHasDirty()) {
+        Wii_DebugOverlayFlush();
+        anyTexUpdated = true;
+    }
 
-    GX_InvalidateTexAll();
+    if (anyTexUpdated)
+        GX_InvalidateTexAll();
     GX_LoadPosMtxImm(modelView, GX_PNMTX0);
     GX_SetViewport(0, 0, rmode->fbWidth, rmode->efbHeight, 0, 1);
     GX_SetScissor(0, 0, rmode->fbWidth, rmode->efbHeight);
 
-    if (gbaMode) {
-        const int scale   = 2;
-        const int gbaW    = scrW * scale;
-        const int gbaH    = scrH * scale;
-        const int originX = ((int)rmode->fbWidth  - gbaW) / 2;
-        const int originY = ((int)rmode->efbHeight - gbaH) / 2;
+    WiiScreenRects rects;
+    Wii_ComputeScreenRects((int)rmode->fbWidth, (int)rmode->efbHeight, gbaMode, &rects);
 
-        DrawScreenQuad(&wiiVid.texObjTop,
-                       (f32)originX,        (f32)originY,
-                       (f32)(originX + gbaW), (f32)(originY + gbaH),
-                       false);
-    }
-    else {
-        const int gap     = 2;
-        const int totalW  = scrW;
-        const int totalH  = scrH * 2 + gap;
-        const int originX = ((int)rmode->fbWidth  - totalW) / 2;
-        const int originY = ((int)rmode->efbHeight - totalH) / 2;
+    s_lastTouchRect.left    = rects.botX1;
+    s_lastTouchRect.top     = rects.botY1;
+    s_lastTouchRect.right   = rects.botX2;
+    s_lastTouchRect.bottom  = rects.botY2;
+    s_lastTouchRect.visible = (!gbaMode && rects.botVis);
 
-        const f32 x1    = (f32)originX;
-        const f32 x2    = (f32)(originX + scrW);
-        const f32 topY1 = (f32)originY;
-        const f32 topY2 = (f32)(originY + scrH);
-        const f32 botY1 = (f32)(originY + scrH + gap);
-        const f32 botY2 = (f32)(originY + scrH + gap + scrH);
-
-        DrawScreenQuad(&wiiVid.texObjTop,    x1, topY1, x2, topY2, false);
-        DrawScreenQuad(&wiiVid.texObjBottom, x1, botY1, x2, botY2, false);
-    }
-
-    if (!gbaMode && g_cursorShow) {
-        Wii_DrawCursor(g_cursorX, g_cursorY);
-    }
+    if (rects.topVis)
+        DrawScreenQuad(&wiiVid.texObjTop, rects.topX1, rects.topY1, rects.topX2, rects.topY2, false);
+    if (!gbaMode && rects.botVis)
+        DrawScreenQuad(&wiiVid.texObjBottom, rects.botX1, rects.botY1, rects.botX2, rects.botY2, false);
 
     if (wiiDbg.enabled && wiiDbg.texData) {
         DrawScreenQuad(&wiiDbg.texObj,
@@ -492,6 +695,33 @@ void Wii_VideoRender(const uint32_t* srcTop, const uint32_t* srcBottom, bool gba
                        (f32)DEBUG_OVERLAY_HEIGHT,
                        true);
     }
+
+    if (!gbaMode && g_cursorShow) {
+        Wii_DrawCursor(g_cursorX, g_cursorY);
+    }
+
+    // 2x2 near-black vertex-colored corner pixel so host presenters with duplicate-XFB
+    // filtering always count true 60 Hz VSync frames during static/frameskip hold frames
+    // with zero texture uploads or cache invalidations.
+    static u8 s_vsyncBeat = 0;
+    const u8 c  = (++s_vsyncBeat & 1u) ? 0x04 : 0x00;
+    const f32 bx = (f32)(rmode->fbWidth  - 2);
+    const f32 by = (f32)(rmode->efbHeight - 2);
+    GX_SetNumChans(1);
+    GX_SetChanCtrl(GX_COLOR0A0,
+                   GX_DISABLE, GX_SRC_REG, GX_SRC_VTX,
+                   GX_LIGHTNULL, GX_DF_NONE, GX_AF_NONE);
+    GX_SetNumTexGens(0);
+    GX_SetNumTevStages(1);
+    GX_SetTevOrder(GX_TEVSTAGE0, GX_TEXCOORDNULL, GX_TEXMAP_NULL, GX_COLOR0A0);
+    GX_SetTevOp(GX_TEVSTAGE0, GX_PASSCLR);
+    GX_SetBlendMode(GX_BM_NONE, GX_BL_ONE, GX_BL_ZERO, GX_LO_CLEAR);
+    GX_Begin(GX_QUADS, GX_VTXFMT0, 4);
+        GX_Position3f32(bx,        by,        0.0f); GX_Color4u8(c,c,c,0xFF); GX_TexCoord2f32(0.0f, 0.0f);
+        GX_Position3f32(bx + 2.0f, by,        0.0f); GX_Color4u8(c,c,c,0xFF); GX_TexCoord2f32(1.0f, 0.0f);
+        GX_Position3f32(bx + 2.0f, by + 2.0f, 0.0f); GX_Color4u8(c,c,c,0xFF); GX_TexCoord2f32(1.0f, 1.0f);
+        GX_Position3f32(bx,        by + 2.0f, 0.0f); GX_Color4u8(c,c,c,0xFF); GX_TexCoord2f32(0.0f, 1.0f);
+    GX_End();
 }
 
 void Wii_DrawCursor(float x, float y) {
@@ -518,8 +748,9 @@ void Wii_DrawCursor(float x, float y) {
 }
 
 void Wii_VideoFlushAsync() {
-    GX_DrawDone();
     wiiVid.currentXfb ^= 1;
+    GX_SetZMode(GX_FALSE, GX_ALWAYS, GX_FALSE);
+    GX_SetColorUpdate(GX_TRUE);
     GX_CopyDisp(wiiVid.xfbList[wiiVid.currentXfb], GX_TRUE);
     GX_Flush();
     VIDEO_SetNextFramebuffer(wiiVid.xfbList[wiiVid.currentXfb]);

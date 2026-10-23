@@ -25,6 +25,8 @@ Gpu::Gpu(Core *core): core(core) {
     ready = false;
     running = false;
     drawing = 0;
+    for (int i = 0; i < 4; i++)
+        framePool[i] = new uint32_t[256 * 192 * 2];
 }
 
 Gpu::~Gpu() {
@@ -36,10 +38,12 @@ Gpu::~Gpu() {
 
     while (!framebuffers.empty()) {
         Buffers &buffers = framebuffers.front();
-        delete[] buffers.framebuffer;
         delete[] buffers.hiRes3D;
         framebuffers.pop();
     }
+
+    for (int i = 0; i < 4; i++)
+        delete[] framePool[i];
 }
 
 sptr Gpu::GpuThreadEntry(void *arg) {
@@ -66,25 +70,46 @@ void Gpu::loadState(FILE *file) {
     fread(&powCnt1, sizeof(powCnt1), 1, file);
 }
 
+namespace {
+struct ColorLutInit {
+    uint32_t rgb5To8[32768];
+    uint32_t rgb6LoTo8[4096];
+    uint32_t rgb6HiTo8[64];
+    uint16_t rgb6LoTo5[4096];
+
+    ColorLutInit() {
+        for (uint32_t c = 0; c < 32768; c++) {
+            uint8_t r = (((c >> 0) & 0x1F) << 1) * 255 / 63;
+            uint8_t g = (((c >> 5) & 0x1F) << 1) * 255 / 63;
+            uint8_t b = (((c >> 10) & 0x1F) << 1) * 255 / 63;
+            rgb5To8[c] = (0xFFu << 24) | ((uint32_t)b << 16) | ((uint32_t)g << 8) | r;
+        }
+        for (uint32_t lo = 0; lo < 4096; lo++) {
+            uint8_t r6 = lo & 0x3F;
+            uint8_t g6 = (lo >> 6) & 0x3F;
+            uint8_t r8 = r6 * 255 / 63;
+            uint8_t g8 = g6 * 255 / 63;
+            rgb6LoTo8[lo] = (0xFFu << 24) | ((uint32_t)g8 << 8) | r8;
+            rgb6LoTo5[lo] = BIT(15) | ((g6 >> 1) << 5) | (r6 >> 1);
+        }
+        for (uint32_t hi = 0; hi < 64; hi++) {
+            rgb6HiTo8[hi] = ((uint32_t)(hi * 255 / 63)) << 16;
+        }
+    }
+};
+static const ColorLutInit s_colorLuts;
+} // namespace
+
 uint32_t Gpu::rgb5ToRgb8(uint32_t color) {
-    uint8_t r = (((color >> 0) & 0x1F) << 1) * 255 / 63;
-    uint8_t g = (((color >> 5) & 0x1F) << 1) * 255 / 63;
-    uint8_t b = (((color >> 10) & 0x1F) << 1) * 255 / 63;
-    return (0xFF << 24) | (b << 16) | (g << 8) | r;
+    return s_colorLuts.rgb5To8[color & 0x7FFFu];
 }
 
 uint32_t Gpu::rgb6ToRgb8(uint32_t color) {
-    uint8_t r = ((color >> 0) & 0x3F) * 255 / 63;
-    uint8_t g = ((color >> 6) & 0x3F) * 255 / 63;
-    uint8_t b = ((color >> 12) & 0x3F) * 255 / 63;
-    return (0xFF << 24) | (b << 16) | (g << 8) | r;
+    return s_colorLuts.rgb6LoTo8[color & 0xFFFu] | s_colorLuts.rgb6HiTo8[(color >> 12) & 0x3Fu];
 }
 
 uint16_t Gpu::rgb6ToRgb5(uint32_t color) {
-    uint8_t r = ((color >> 0) & 0x3F) / 2;
-    uint8_t g = ((color >> 6) & 0x3F) / 2;
-    uint8_t b = ((color >> 12) & 0x3F) / 2;
-    return BIT(15) | (b << 10) | (g << 5) | r;
+    return s_colorLuts.rgb6LoTo5[color & 0xFFFu] | (((color >> 13) & 0x1Fu) << 10);
 }
 
 bool Gpu::getFrame(uint32_t *out, bool gbaCrop) {
@@ -173,7 +198,6 @@ bool Gpu::getFrame(uint32_t *out, bool gbaCrop) {
         }
     }
 
-    delete[] buffers.framebuffer;
     delete[] buffers.hiRes3D;
 
     if (Settings::screenGhost) {
@@ -198,7 +222,7 @@ bool Gpu::getFrame(uint32_t *out, bool gbaCrop) {
     return true;
 }
 
-void Gpu::gbaScanline240() {
+void Gpu::gbaHblankDma() {
     if (vCount < 160) {
         if (gpuThreadStack) {
             while (drawing != 0)
@@ -211,6 +235,10 @@ void Gpu::gbaScanline240() {
         core->dma[1].trigger(2);
     }
 
+    core->schedule(GBA_HBLANK_DMA, 308 * 4);
+}
+
+void Gpu::gbaScanline240() {
     dispStat[1] |= BIT(1);
 
     if (dispStat[1] & BIT(4))
@@ -240,7 +268,8 @@ void Gpu::gbaScanline308() {
 
         if (frames == 0 && framebuffers.size() < 2) {
             Buffers buffers;
-            buffers.framebuffer = new uint32_t[256 * 160];
+            buffers.framebuffer = framePool[framePoolIdx];
+            framePoolIdx = (framePoolIdx + 1) & 3;
             memcpy(buffers.framebuffer, core->gpu2D[0].getFramebuffer(), 256 * 160 * sizeof(uint32_t));
 
             PPCIrqState st = PPCIrqLockByMsr();
@@ -430,7 +459,8 @@ void Gpu::scanline355() {
 
         if (frames == 0 && framebuffers.size() < 2) {
             Buffers buffers;
-            buffers.framebuffer = new uint32_t[256 * 192 * 2];
+            buffers.framebuffer = framePool[framePoolIdx];
+            framePoolIdx = (framePoolIdx + 1) & 3;
             if (powCnt1 & BIT(0)) {
                 if (powCnt1 & BIT(15)) {
                     memcpy(&buffers.framebuffer[0], core->gpu2D[0].getFramebuffer(), 256 * 192 * sizeof(uint32_t));

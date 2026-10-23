@@ -66,6 +66,7 @@ private:
 
     int polygonTop[2048] = {};
     int polygonBot[2048] = {};
+    bool polygonSharesSameIdOpaqueEdge[2048] = {};
 
     // Tuxedo Thread Structures
     uint8_t activeThreads = 0;

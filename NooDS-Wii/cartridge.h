@@ -43,7 +43,7 @@ enum NdsCmdMode {
 class Cartridge {
 public:
     Cartridge(Core *core): core(core) {}
-    ~Cartridge();
+    virtual ~Cartridge();
 
     bool setRom(std::string romPath, int romFd = -1, int saveFd = -1, int stateFd = -1, int cheatFd = -1);
     void writeSave();
@@ -125,7 +125,13 @@ private:
 
 class CartridgeGba: public Cartridge {
 public:
+    static constexpr uint32_t GBA_BANK_SHIFT = 18; // 256 KiB per bank across MEM2 + MEM1 (zero arena-boundary waste!)
+    static constexpr uint32_t GBA_BANK_SIZE  = 1u << GBA_BANK_SHIFT;
+    static constexpr uint32_t GBA_BANK_MASK  = GBA_BANK_SIZE - 1u;
+    static constexpr size_t   GBA_MAX_BANKS  = 128; // 128 x 256 KiB = full 32 MiB GBA address space
+
     CartridgeGba(Core *core): Cartridge(core) {}
+    ~CartridgeGba() override;
     void saveState(FILE *file);
     void loadState(FILE *file);
 
@@ -139,6 +145,8 @@ public:
     void sramWrite(uint32_t address, uint8_t value);
 
 private:
+    uint8_t *gbaBanks[GBA_MAX_BANKS] = {};
+
     uint8_t eepromCount = 0;
     uint16_t eepromCmd = 0;
     uint64_t eepromData = 0;
@@ -148,12 +156,17 @@ private:
     bool bankSwap = false;
     bool flashErase = false;
 
+    void freeGbaBanks();
+    uint8_t readRomByte(size_t offset) const;
     bool findString(std::string string);
     virtual bool loadRom();
 };
 
 FORCE_INLINE uint8_t *CartridgeGba::getRom(uint32_t address) {
-    return ((address &= romMask) < romSize) ? &rom[address] : nullptr;
+    address &= romMask;
+    if (address >= (uint32_t)romSize) return nullptr;
+    uint8_t *bank = gbaBanks[address >> GBA_BANK_SHIFT];
+    return bank ? &bank[address & GBA_BANK_MASK] : nullptr;
 }
 
 FORCE_INLINE bool CartridgeGba::isEeprom(uint32_t address) {

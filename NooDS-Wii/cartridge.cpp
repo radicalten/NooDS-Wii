@@ -18,8 +18,21 @@
     along with NooDS-Wii. If not, see <https://www.gnu.org/licenses/>.
 */
 
+#include <algorithm>
+#include <cstdlib>
 #include <cstring>
+#include <malloc.h>
+#include <sys/stat.h>
 #include "core.h"
+
+static std::string JoinBaseSubdir(const std::string &base, const char *subdir, const std::string &leafWithSlash) {
+    std::string cleanBase = base;
+    while (!cleanBase.empty() && (cleanBase.back() == '/' || cleanBase.back() == '\\'))
+        cleanBase.pop_back();
+    std::string dirPath = cleanBase + "/" + subdir;
+    mkdir(dirPath.c_str(), 0777);
+    return dirPath + leafWithSlash;
+}
 
 Cartridge::~Cartridge() {
     writeSave();
@@ -29,17 +42,21 @@ Cartridge::~Cartridge() {
 }
 
 bool Cartridge::setRom(std::string romPath, int romFd, int saveFd, int stateFd, int cheatFd) {
-    std::string basePath = romPath.substr(0, romPath.rfind('.'));
+    size_t dotPos = romPath.rfind('.');
+    size_t slashPos = romPath.find_last_of("/\\");
+    std::string basePath = (dotPos != std::string::npos && (slashPos == std::string::npos || dotPos > slashPos))
+        ? romPath.substr(0, dotPos)
+        : romPath;
     std::string savePath = basePath + (core->id ? (".sv" + std::to_string(core->id + 1)) : ".sav");
     std::string statePath = basePath + (core->id ? (".no" + std::to_string(core->id + 1)) : ".noo");
     std::string cheatPath = basePath + ".cht";
 
-    if (Settings::savesFolder)
-        savePath = Settings::basePath + "/saves" + savePath.substr(savePath.find_last_of("/\\"));
-    if (Settings::statesFolder)
-        statePath = Settings::basePath + "/states" + statePath.substr(statePath.find_last_of("/\\"));
-    if (Settings::cheatsFolder)
-        cheatPath = Settings::basePath + "/cheats" + cheatPath.substr(cheatPath.find_last_of("/\\"));
+    if (Settings::savesFolder && savePath.find_last_of("/\\") != std::string::npos)
+        savePath = JoinBaseSubdir(Settings::basePath, "saves", savePath.substr(savePath.find_last_of("/\\")));
+    if (Settings::statesFolder && statePath.find_last_of("/\\") != std::string::npos)
+        statePath = JoinBaseSubdir(Settings::basePath, "states", statePath.substr(statePath.find_last_of("/\\")));
+    if (Settings::cheatsFolder && cheatPath.find_last_of("/\\") != std::string::npos)
+        cheatPath = JoinBaseSubdir(Settings::basePath, "cheats", cheatPath.substr(cheatPath.find_last_of("/\\")));
 
     bool gba = (this == &core->cartridgeGba);
     if (romFd == -1) this->romPath = romPath; else this->romFd = romFd;
@@ -53,8 +70,14 @@ bool Cartridge::loadRom() {
     romFile = (romFd == -1) ? fopen(romPath.c_str(), "rb") : fdopen(dup(romFd), "rb");
     if (!romFile) return false;
     fseek(romFile, 0, SEEK_END);
-    romSize = ftell(romFile);
+    long rawSize = ftell(romFile);
     fseek(romFile, 0, SEEK_SET);
+    if (rawSize <= 0) {
+        fclose(romFile);
+        romFile = nullptr;
+        return false;
+    }
+    romSize = (int)rawSize;
 
     if (FILE *saveFile = (saveFd == -1) ? fopen(savePath.c_str(), "rb") : fdopen(dup(saveFd), "rb")) {
         fseek(saveFile, 0, SEEK_END);
@@ -773,17 +796,96 @@ void CartridgeGba::loadState(FILE *file) {
     saveDirty = false;
 }
 
-bool CartridgeGba::findString(std::string string) {
-    for (int i = 0; i < romSize; i += 4) {
-        bool found = true;
+#ifdef GEKKO
+#include <gccore.h>
+static uint8_t *s_gbaArena1Base  = nullptr;
+static size_t   s_gbaArena1Bytes = 0;
+static size_t   s_gbaArena1Used  = 0;
 
-        for (size_t j = 0; j < string.length(); j++) {
-            if (i + j >= romSize || rom[i + j] != string[j]) {
+// Reclaim MEM1 (1T-SRAM) space left stranded after libogc's _sbrk_r jumps one-way to MEM2.
+static uint8_t *AllocGbaArena1Bank(size_t allocBytes) {
+    if (!s_gbaArena1Base) {
+        PPCIrqState st = PPCIrqLockByMsr();
+        uintptr_t lo = ((uintptr_t)SYS_GetArena1Lo() + 31u) & ~(uintptr_t)31u;
+        uintptr_t hi = (uintptr_t)SYS_GetArena1Hi();
+        const size_t reserve = 512u * 1024u;
+        if (hi > lo + reserve + CartridgeGba::GBA_BANK_SIZE) {
+            size_t avail = (hi - lo - reserve) & ~((size_t)CartridgeGba::GBA_BANK_SIZE - 1u);
+            s_gbaArena1Base  = (uint8_t*)lo;
+            s_gbaArena1Bytes = avail;
+            SYS_SetArena1Lo((void*)(lo + avail));
+        }
+        PPCIrqUnlockByMsr(st);
+    }
+    if (s_gbaArena1Base && s_gbaArena1Used + allocBytes <= s_gbaArena1Bytes) {
+        uint8_t *p = s_gbaArena1Base + s_gbaArena1Used;
+        s_gbaArena1Used += allocBytes;
+        return p;
+    }
+    return nullptr;
+}
+
+static bool IsGbaArena1Bank(const uint8_t *p) {
+    return s_gbaArena1Base &&
+           p >= s_gbaArena1Base &&
+           p <  s_gbaArena1Base + s_gbaArena1Bytes;
+}
+#endif
+
+CartridgeGba::~CartridgeGba() {
+    writeSave();
+    freeGbaBanks();
+}
+
+void CartridgeGba::freeGbaBanks() {
+    for (size_t b = 0; b < GBA_MAX_BANKS; b++) {
+        if (gbaBanks[b]) {
+#ifdef GEKKO
+            if (!IsGbaArena1Bank(gbaBanks[b]))
+                free(gbaBanks[b]);
+#else
+            free(gbaBanks[b]);
+#endif
+            gbaBanks[b] = nullptr;
+        }
+    }
+#ifdef GEKKO
+    s_gbaArena1Used = 0;
+#endif
+}
+
+uint8_t CartridgeGba::readRomByte(size_t offset) const {
+    if (offset >= (size_t)romSize) return 0xFF;
+    uint8_t *bank = gbaBanks[offset >> GBA_BANK_SHIFT];
+    return bank ? bank[offset & GBA_BANK_MASK] : 0xFF;
+}
+
+bool CartridgeGba::findString(std::string string) {
+    const size_t len = string.length();
+    if (len == 0 || (size_t)romSize < len) return false;
+    const uint8_t c0 = (uint8_t)string[0];
+    const uint8_t c1 = (len > 1) ? (uint8_t)string[1] : 0;
+    const uint8_t c2 = (len > 2) ? (uint8_t)string[2] : 0;
+    const uint8_t c3 = (len > 3) ? (uint8_t)string[3] : 0;
+
+    for (size_t i = 0; i + len <= (size_t)romSize; i += 4) {
+        const uint8_t *bank = gbaBanks[i >> GBA_BANK_SHIFT];
+        if (!bank) break;
+        const uint8_t *p = &bank[i & GBA_BANK_MASK];
+        if (len >= 4) {
+            if (p[0] != c0 || p[1] != c1 || p[2] != c2 || p[3] != c3)
+                continue;
+        } else if (p[0] != c0) {
+            continue;
+        }
+
+        bool found = true;
+        for (size_t j = 0; j < len; j++) {
+            if (readRomByte(i + j) != (uint8_t)string[j]) {
                 found = false;
                 break;
             }
         }
-
         if (found)
             return true;
     }
@@ -801,13 +903,44 @@ bool CartridgeGba::loadRom() {
         saveSizes.push_back(0x20000);
     }
 
+    freeGbaBanks();
     if (!Cartridge::loadRom()) return false;
-    loadRomSection(0, romSize);
+
+    const size_t maxBusBytes = (size_t)GBA_MAX_BANKS * GBA_BANK_SIZE; // 32 MiB
+    if ((size_t)romSize > maxBusBytes)
+        romSize = (int)maxBusBytes;
+
+    size_t loadedBytes = 0;
+    for (size_t b = 0; b < GBA_MAX_BANKS && loadedBytes < (size_t)romSize; b++) {
+        size_t wantBytes = std::min<size_t>(GBA_BANK_SIZE, (size_t)romSize - loadedBytes);
+        // Pad every bank allocation up to a full 4 KB page so direct page-table reads are always safe.
+        size_t allocBytes = (wantBytes + 0xFFFu) & ~0xFFFu;
+        uint8_t *buf = nullptr;
+#ifdef GEKKO
+        buf = AllocGbaArena1Bank(allocBytes);
+#endif
+        if (!buf)
+            buf = (uint8_t*)memalign(32, allocBytes);
+        if (!buf) {
+            fclose(romFile);
+            romFile = nullptr;
+            freeGbaBanks();
+            return false;
+        }
+        if (allocBytes > wantBytes)
+            std::memset(buf + wantBytes, 0xFF, allocBytes - wantBytes);
+        size_t got = fread(buf, 1, wantBytes, romFile);
+        if (got < wantBytes)
+            std::memset(buf + got, 0xFF, wantBytes - got);
+        gbaBanks[b] = buf;
+        loadedBytes += wantBytes;
+    }
+
     fclose(romFile);
     romFile = nullptr;
 
-    if (romSize > 0xAC && rom[0xAC] == 'F') {
-        for (romMask = 1; romMask < romSize; romMask <<= 1);
+    if (romSize > 0xAC && readRomByte(0xAC) == 'F') {
+        for (romMask = 1; romMask < (uint32_t)romSize; romMask <<= 1);
         romMask--;
     }
     else {
@@ -925,10 +1058,11 @@ void CartridgeGba::eepromWrite(uint8_t value) {
 }
 
 uint8_t CartridgeGba::sramRead(uint32_t address) {
-    if (saveSize == 0x8000 && address < 0xE008000) {
-        return save[address - 0xE000000];
+    if (saveSize == 0x8000) {
+        return save[address & 0x7FFF];
     }
-    else if ((saveSize == 0x10000 || saveSize == 0x20000) && address < 0xE010000) {
+    else if (saveSize == 0x10000 || saveSize == 0x20000) {
+        address = 0xE000000 | (address & 0xFFFF);
         if (flashCmd == 0x90 && address == 0xE000000) {
             return 0xC2;
         }
@@ -945,13 +1079,14 @@ uint8_t CartridgeGba::sramRead(uint32_t address) {
 }
 
 void CartridgeGba::sramWrite(uint32_t address, uint8_t value) {
-    if (saveSize == 0x8000 && address < 0xE008000) {
+    if (saveSize == 0x8000) {
         PPCIrqState st = PPCIrqLockByMsr();
-        save[address - 0xE000000] = value;
+        save[address & 0x7FFF] = value;
         saveDirty = true;
         PPCIrqUnlockByMsr(st);
     }
-    else if ((saveSize == 0x10000 || saveSize == 0x20000) && address < 0xE010000) {
+    else if (saveSize == 0x10000 || saveSize == 0x20000) {
+        address = 0xE000000 | (address & 0xFFFF);
         if (flashCmd == 0xA0) {
             if (bankSwap) address += 0x10000;
             PPCIrqState st = PPCIrqLockByMsr();

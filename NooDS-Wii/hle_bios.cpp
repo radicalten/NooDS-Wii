@@ -20,6 +20,7 @@
 
 #include <cmath>
 #include "core.h"
+#include "arm7tdmi_mul.h"
 
 // HLE ARM9 BIOS SWI lookup table
 int (HleBios::*HleBios::swiTable9[])(uint32_t**) = {
@@ -80,6 +81,8 @@ int HleBios::execute(uint8_t vector, uint32_t **registers) {
         // Use the comment from the SWI opcode to lookup what function to execute
         uint32_t address = *registers[15] - (core->interpreter[arm7].isThumb() ? 4 : 6);
         uint8_t comment = core->memory.read<uint8_t>(arm7, address);
+        if (core->gbaMode)
+            core->memory.setGbaBiosOpenBus(0xE3A02004u);
         return (this->*swiTable[std::min<uint8_t>(comment, 0x20)])(registers);
     }
 
@@ -178,8 +181,13 @@ int HleBios::swiVBlankIntrWait(uint32_t **registers) {
 }
 
 int HleBios::swiHalt(uint32_t **registers) {
-    // Halt the CPU
-    core->interpreter[arm7].halt(0);
+    (void)registers;
+    // Halt the CPU unless an enabled interrupt is already pending
+    if (!(core->interpreter[arm7].readIe() & core->interpreter[arm7].readIrf())) {
+        if (core->gbaMode)
+            core->interpreter[arm7].inGbaHaltSwi = true;
+        core->interpreter[arm7].halt(0);
+    }
     return 3;
 }
 
@@ -196,15 +204,59 @@ int HleBios::swiSoundBias(uint32_t **registers) {
     return 3;
 }
 
-int HleBios::swiDivide(uint32_t **registers) {
-    // Calculate the division result and remainder
-    int32_t div = int32_t(*registers[0]) / int32_t(*registers[1]);
-    int32_t mod = int32_t(*registers[0]) % int32_t(*registers[1]);
+static inline int gbaSwiFinish(Core *core, uint32_t retPc, uint32_t biosCyc) {
+    uint16_t waitCnt = core->memory.getWaitCnt();
+    bool isArm = !core->interpreter[1].isThumb();
+    int exitRefill = core->gbaBus.branchRefill(retPc, isArm, waitCnt);
+    int sync = 0;
+    if ((retPc >> 24) >= 0x08u && (retPc >> 24) < 0x0Eu) {
+        if (waitCnt & BIT(14))
+            sync = (GbaBus::romWaitN(retPc, waitCnt) - GbaBus::romWaitS(retPc, waitCnt)) + 1;
+        sync += (GbaBus::romWaitN(retPc, waitCnt) == 4 ? 1 : 0) - (GbaBus::romWaitS(retPc, waitCnt) == 2 ? 1 : 0) - 2;
+    }
+    core->interpreter[1].advanceGbaCycles(int(biosCyc) + exitRefill + sync);
+    core->gbaBus.branched = true;
+    return 3;
+}
 
-    // Return the results
-    *registers[0] = div;
-    *registers[1] = mod;
-    *registers[3] = abs(div);
+int HleBios::swiDivide(uint32_t **registers) {
+    // Hardware-exact signed division matching ARM7/GBA BIOS behavior & cycle timing
+    int32_t num = int32_t(*registers[0]);
+    int32_t den = int32_t(*registers[1]);
+    if (core->gbaMode) {
+        uint64_t un = (num < 0) ? uint64_t(-int64_t(num)) : uint64_t(uint32_t(num));
+        uint64_t ud = (den < 0) ? uint64_t(-int64_t(den)) : uint64_t(uint32_t(den));
+        uint32_t biosCyc = 65u;
+        if (ud != 0 && ud <= un) {
+            int shifts = 0;
+            uint64_t dShift = ud;
+            while (dShift < (1ULL << 31) && (dShift << 1) <= un) {
+                dShift <<= 1;
+                shifts++;
+            }
+            biosCyc = 56u + uint32_t(shifts) * 4u + uint32_t(shifts + 1) * 9u;
+        }
+        uint32_t retPc = *registers[15] - (core->interpreter[1].isThumb() ? 2u : 4u);
+        gbaSwiFinish(core, retPc, biosCyc);
+    }
+
+    if (den == 0) {
+        *registers[0] = (num < 0) ? uint32_t(-1) : 1u;
+        *registers[1] = uint32_t(num);
+        *registers[3] = 1u;
+    }
+    else if (uint32_t(num) == 0x80000000u && den == -1) {
+        *registers[0] = 0x80000000u;
+        *registers[1] = 0u;
+        *registers[3] = 0x80000000u;
+    }
+    else {
+        int32_t div = num / den;
+        int32_t mod = num % den;
+        *registers[0] = uint32_t(div);
+        *registers[1] = uint32_t(mod);
+        *registers[3] = uint32_t(div < 0 ? -div : div);
+    }
     return 3;
 }
 
@@ -215,14 +267,60 @@ int HleBios::swiDivArm(uint32_t **registers) {
 }
 
 int HleBios::swiSquareRoot(uint32_t **registers) {
-    // Calculate the square root result
-    *registers[0] = sqrt(*registers[0]);
+    // Exact integer square root algorithm & GBA BIOS loop timing
+    uint32_t val = *registers[0];
+    uint32_t origVal = val;
+    uint32_t res = 0;
+    uint32_t bit = 1u << 30;
+    while (bit > val)
+        bit >>= 2;
+    while (bit != 0) {
+        if (val >= res + bit) {
+            val -= res + bit;
+            res = (res >> 1) + bit;
+        }
+        else {
+            res >>= 1;
+        }
+        bit >>= 2;
+    }
+    if (core->gbaMode) {
+        uint32_t biosCyc = 94u;
+        if (origVal > 0) {
+            uint32_t r0 = origVal;
+            uint32_t r2 = 1;
+            int upSteps = 0;
+            while (r0 > (r2 << 2) && upSteps < 15) {
+                r2 <<= 1;
+                upSteps++;
+            }
+            uint32_t acc = r2;
+            uint32_t addBit = r2;
+            uint32_t innerCyc = 0;
+            while (addBit != 0) {
+                uint32_t cand = acc + addBit;
+                innerCyc += 25u + uint32_t(Arm7TdmiMul::unsignedMulTicks(cand));
+                if (uint64_t(cand) * cand <= r0) {
+                    acc = cand;
+                    innerCyc += 3u;
+                }
+                addBit >>= 1;
+            }
+            if (upSteps <= 7)
+                biosCyc = 94u + uint32_t(upSteps) * 7u + innerCyc - 109u;
+            else
+                biosCyc = 94u + uint32_t(upSteps) * 7u + innerCyc + uint32_t(upSteps - 7) * 58u + 29u;
+        }
+        uint32_t retPc = *registers[15] - (core->interpreter[1].isThumb() ? 2u : 4u);
+        gbaSwiFinish(core, retPc, biosCyc);
+    }
+    *registers[0] = res;
     return 3;
 }
 
-int HleBios::swiArcTan(uint32_t **registers) {
-    // Calculate the inverse of a fixed-point tangent
-    int32_t square = -(int32_t(*registers[0] * *registers[0]) >> 14);
+static void gbaBiosArcTanCore(uint32_t &r0, uint32_t &r1, uint32_t &r3) {
+    int32_t t = int32_t(r0);
+    int32_t square = -(int32_t(uint32_t(t) * uint32_t(t)) >> 14);
     int32_t result = ((square * 0xA9) >> 14) + 0x390;
     result = ((result * square) >> 14) + 0x91C;
     result = ((result * square) >> 14) + 0xFB6;
@@ -230,69 +328,187 @@ int HleBios::swiArcTan(uint32_t **registers) {
     result = ((result * square) >> 14) + 0x2081;
     result = ((result * square) >> 14) + 0x3651;
     result = ((result * square) >> 14) + 0xA2F9;
-    *registers[0] = int32_t(*registers[0] * result) >> 16;
+    r0 = uint32_t(int32_t(uint32_t(t) * uint32_t(result)) >> 16);
+    r1 = uint32_t(square);
+    r3 = uint32_t(result);
+}
+
+int HleBios::swiArcTan(uint32_t **registers) {
+    int32_t t = int32_t(*registers[0]);
+    gbaBiosArcTanCore(*registers[0], *registers[1], *registers[3]);
+    if (core->gbaMode) {
+        int32_t sq = int32_t(*registers[1]);
+        uint32_t mulTicks = Arm7TdmiMul::signedMulTicks(uint32_t(t)) + 7u * uint32_t(Arm7TdmiMul::signedMulTicks(uint32_t(sq))) + 1u;
+        uint32_t retPc = *registers[15] - (core->interpreter[1].isThumb() ? 2u : 4u);
+        gbaSwiFinish(core, retPc, 85u + mulTicks);
+    }
     return 3;
 }
 
 int HleBios::swiArcTan2(uint32_t **registers) {
-    // Define parameters for calculating inverse tangent with correction processing
-    static const uint8_t offsets[] = { 0, 1, 1, 2, 2, 3, 3, 4 };
-    int32_t x = *registers[0];
-    int32_t y = *registers[1];
-    uint8_t octant = 0;
+    int32_t x = int32_t(*registers[0]);
+    int32_t y = int32_t(*registers[1]);
+    *registers[3] = 0x170;
 
-    // Determine which octant the angle resides in
-    octant += (y < 0) << 2;
-    octant += ((x ^ y) < 0) << 1;
-    octant += ((x ^ y ^ (abs(x) - abs(y))) < 0);
+    if (y == 0) {
+        *registers[0] = (x < 0) ? 0x8000 : 0;
+        return 3;
+    }
+    if (x == 0) {
+        *registers[0] = (y < 0) ? 0xC000 : 0x4000;
+        return 3;
+    }
 
-    // Calculate a tangent within -pi/4 and pi/4, swapping parameters if necessary
-    bool swap = (abs(x) >= abs(y));
-    if (swap) SWAP(x, y);
-    *registers[0] = y ? ((x << 14) / y) : 0;
-
-    // Calculate the tangent's inverse and adjust based on octant
-    swiArcTan(registers);
-    if (!swap) *registers[0] = -*registers[0];
-    *registers[0] += offsets[octant] << 14;
+    uint32_t t = 0, dummy = 0;
+    if (y >= 0) {
+        if (x >= 0) {
+            if (x >= y) {
+                t = uint32_t((int64_t(y) << 14) / x);
+                gbaBiosArcTanCore(t, *registers[1], dummy);
+                *registers[0] = t;
+            }
+            else {
+                t = uint32_t((int64_t(x) << 14) / y);
+                gbaBiosArcTanCore(t, *registers[1], dummy);
+                *registers[0] = 0x4000 - t;
+            }
+        }
+        else {
+            if (-x >= y) {
+                t = uint32_t((int64_t(y) << 14) / x);
+                gbaBiosArcTanCore(t, *registers[1], dummy);
+                *registers[0] = 0x8000 + t;
+            }
+            else {
+                t = uint32_t((int64_t(x) << 14) / y);
+                gbaBiosArcTanCore(t, *registers[1], dummy);
+                *registers[0] = 0x4000 - t;
+            }
+        }
+    }
+    else {
+        if (x <= 0) {
+            if (-x > -y) {
+                t = uint32_t((int64_t(y) << 14) / x);
+                gbaBiosArcTanCore(t, *registers[1], dummy);
+                *registers[0] = 0x8000 + t;
+            }
+            else {
+                t = uint32_t((int64_t(x) << 14) / y);
+                gbaBiosArcTanCore(t, *registers[1], dummy);
+                *registers[0] = 0xC000 - t;
+            }
+        }
+        else {
+            if (x >= -y) {
+                t = uint32_t((int64_t(y) << 14) / x);
+                gbaBiosArcTanCore(t, *registers[1], dummy);
+                *registers[0] = 0x10000 + t;
+            }
+            else {
+                t = uint32_t((int64_t(x) << 14) / y);
+                gbaBiosArcTanCore(t, *registers[1], dummy);
+                *registers[0] = 0xC000 - t;
+            }
+        }
+    }
+    *registers[0] &= 0xFFFF;
     return 3;
 }
 
 int HleBios::swiCpuSet(uint32_t **registers) {
-    // Decode some parameters
+    uint32_t src = *registers[0];
+    uint32_t dst = *registers[1];
+    if (core->gbaMode && (src < 0x02000000u || src >= 0x10000000u))
+        return 3;
+
     bool word = (*registers[2] & BIT(26));
     bool fixed = (*registers[2] & BIT(24));
-    uint32_t size = (*registers[2] & 0xFFFFF) << (1 + word);
+    uint32_t count = *registers[2] & 0xFFFFFu;
+
+    bool prevExec = core->memory.gbaCpuExecActive;
+    core->memory.gbaCpuExecActive = false;
 
     if (word) {
-        // Copy/fill memory from the source to the destination (32-bit)
-        for (uint32_t i = 0; i < size; i += 4) {
-            uint32_t address = *registers[0] + (fixed ? 0 : i);
-            uint32_t value = core->memory.read<uint32_t>(arm7, address);
-            core->memory.write<uint32_t>(arm7, *registers[1] + i, value);
+        // Real BIOS CpuSet 32-bit mode uses LDMIA/STMIA (no unaligned word rotation!)
+        for (uint32_t i = 0; i < count; i++) {
+            uint32_t sRaw = src + (fixed ? 0u : i * 4u);
+            uint32_t dRaw = dst + i * 4u;
+            uint32_t value = core->memory.read<uint32_t>(arm7, sRaw);
+            core->memory.write<uint32_t>(arm7, dRaw, value);
         }
     }
     else {
-        // Copy/fill memory from the source to the destination (16-bit)
-        for (uint32_t i = 0; i < size; i += 2) {
-            uint32_t address = *registers[0] + (fixed ? 0 : i);
-            uint16_t value = core->memory.read<uint16_t>(arm7, address);
-            core->memory.write<uint16_t>(arm7, *registers[1] + i, value);
+        for (uint32_t i = 0; i < count; i++) {
+            uint32_t sRaw = src + (fixed ? 0u : i * 2u);
+            uint32_t dRaw = dst + i * 2u;
+            uint32_t value = core->memory.read<uint16_t>(arm7, sRaw);
+            // ARM7TDMI unaligned LDRH rotates zero-extended halfword right by 8 bits!
+            if (arm7 && (sRaw & 1u))
+                value = (value >> 8) | (value << 24);
+            core->memory.write<uint16_t>(arm7, dRaw, uint16_t(value));
         }
     }
+    core->memory.gbaCpuExecActive = prevExec;
     return 3;
 }
 
 int HleBios::swiCpuFastSet(uint32_t **registers) {
-    // Decode some parameters
-    bool fixed = (*registers[2] & BIT(24));
-    uint32_t size = (*registers[2] & 0xFFFFF) << 2;
+    uint32_t src = *registers[0];
+    uint32_t dst = *registers[1];
+    if (core->gbaMode && (src < 0x02000000u || src >= 0x10000000u))
+        return 3;
 
-    // Copy/fill memory from the source to the destination
-    for (uint32_t i = 0; i < size; i += 4) {
-        uint32_t address = *registers[0] + (fixed ? 0 : i);
-        uint32_t value = core->memory.read<uint32_t>(arm7, address);
-        core->memory.write<uint32_t>(arm7, *registers[1] + i, value);
+    bool fixed = (*registers[2] & BIT(24));
+    uint32_t count = *registers[2] & 0xFFFFFu;
+    if (count == 0)
+        return 3;
+    // Real BIOS LDMIA/STMIA loop transfers 8 words per iteration.
+    count = (count + 7u) & ~7u;
+
+    bool prevExec = core->memory.gbaCpuExecActive;
+    core->memory.gbaCpuExecActive = false;
+    uint16_t waitCnt = core->memory.getWaitCnt();
+    uint32_t totalCycles = 0;
+
+    for (uint32_t blk = 0; blk < count; blk += 8u) {
+        if (fixed) {
+            uint32_t sRaw = src;
+            uint32_t val = core->memory.read<uint32_t>(arm7, sRaw);
+            if (core->gbaMode)
+                totalCycles += core->gbaBus.dataAccess(sRaw, 4, false, waitCnt, false) + 1;
+            for (uint32_t j = 0; j < 8u; j++) {
+                uint32_t dRaw = dst + (blk + j) * 4u;
+                core->memory.write<uint32_t>(arm7, dRaw, val);
+                if (core->gbaMode)
+                    totalCycles += core->gbaBus.dataAccess(dRaw, 4, j > 0, waitCnt, false);
+            }
+            totalCycles += 4;
+        }
+        else {
+            uint32_t vals[8];
+            for (uint32_t j = 0; j < 8u; j++) {
+                uint32_t sRaw = src + (blk + j) * 4u;
+                vals[j] = core->memory.read<uint32_t>(arm7, sRaw);
+                if (core->gbaMode)
+                    totalCycles += core->gbaBus.dataAccess(sRaw, 4, j > 0, waitCnt, false);
+            }
+            if (core->gbaMode)
+                totalCycles += core->gbaBus.stepInternal(1, waitCnt); // LDMIA 1I
+            for (uint32_t j = 0; j < 8u; j++) {
+                uint32_t dRaw = dst + (blk + j) * 4u;
+                core->memory.write<uint32_t>(arm7, dRaw, vals[j]);
+                if (core->gbaMode)
+                    totalCycles += core->gbaBus.dataAccess(dRaw, 4, j > 0, waitCnt, false);
+            }
+            if (core->gbaMode)
+                totalCycles += 4; // loop SUBS + BGT (1 + 3 inside BIOS ROM)
+        }
+    }
+    core->memory.gbaCpuExecActive = prevExec;
+    if (core->gbaMode) {
+        uint32_t retPc = *registers[15] - (core->interpreter[1].isThumb() ? 2u : 4u);
+        gbaSwiFinish(core, retPc, totalCycles + 153u);
     }
     return 3;
 }

@@ -24,24 +24,27 @@
 extern "C" {
 #endif
 
+// Wii Flipper/Hollywood hardware AI DMA configuration:
+// 1,024 big-endian 16-bit stereo frames per DMA buffer at 48,000 Hz
+// -> 4,096 bytes/slice = 46.875 DMA callbacks/sec (21.3333 ms/slice).
+// Exact NDS/GBA 32,768 Hz SPU frames per slice = 32768 / 46.875 = 699.0507.
 #define WIIAUD_OUT_RATE           48000
 #define WIIAUD_FRAMES_PER_BUF     1024
-#define WIIAUD_BUF_BYTES_STEREO   (WIIAUD_FRAMES_PER_BUF * 4)   // 1024 * 2ch * 2bytes
+#define WIIAUD_BUF_BYTES_STEREO   (WIIAUD_FRAMES_PER_BUF * 4)   // 4096 bytes (multiple of 32B)
 #define WIIAUD_BUF_BYTES_MONO     (WIIAUD_FRAMES_PER_BUF * 2)
 
 #define WIIAUD_NDS_RATE              32768
-#define WIIAUD_NDS_FRAMES_PER_VFRAME 548
+#define WIIAUD_NDS_FRAMES_PER_VFRAME 699
 #define WIIAUD_NDS_FRAMES            WIIAUD_NDS_FRAMES_PER_VFRAME
+#define WIIAUD_MAX_SPU_FRAMES        704
 
 #define WIIAUD_GBA_RATE              32768
-#define WIIAUD_GBA_FRAMES_PER_VFRAME 548
+#define WIIAUD_GBA_FRAMES_PER_VFRAME 699
 #define WIIAUD_GBA_FRAMES            WIIAUD_GBA_FRAMES_PER_VFRAME
 
-// Compile-time assert: both paths must use identical frame counts so
-// Spu::getSamples() never sees a size change between NDS and GBA mode.
 #ifdef __cplusplus
 static_assert(WIIAUD_NDS_FRAMES == WIIAUD_GBA_FRAMES,
-    "NDS and GBA frame counts must match to avoid SPU buffer reallocation");
+    "NDS and GBA frame counts must match");
 #endif
 
 #ifdef __cplusplus

@@ -42,6 +42,9 @@ public:
     void writeDmaDad(int channel, uint32_t mask, uint32_t value);
     void writeDmaCnt(int channel, uint32_t mask, uint32_t value);
 
+    bool firstPakWasWrite = false;
+    bool firstPakWasRead = false;
+
 private:
     Core *core;
     bool cpu;
@@ -49,6 +52,7 @@ private:
     uint32_t srcAddrs[4] = {};
     uint32_t dstAddrs[4] = {};
     uint32_t wordCounts[4] = {};
+    uint32_t dmaLatch[4] = {};
 
     uint32_t dmaSad[4] = {};
     uint32_t dmaDad[4] = {};

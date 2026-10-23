@@ -19,6 +19,13 @@
 */
 
 #include "core.h"
+#include "arm7tdmi_mul.h"
+
+// Avoid undefined C++ shifts when ARM rotate amounts are zero or a multiple of 32.
+static inline uint32_t rotateRight32(uint32_t value, unsigned amount) {
+    amount &= 31;
+    return amount ? ((value >> amount) | (value << (32 - amount))) : value;
+}
 
 // Define functions for each ARM shift variation
 #define ALU_FUNCS(func, S) \
@@ -135,14 +142,14 @@ FORCE_INLINE uint32_t Interpreter::rrr(uint32_t opcode) { // Rm,ROR Rs
     // When used as Rm, the program counter is read with +4
     uint32_t value = *registers[opcode & 0xF] + (((opcode & 0xF) == 0xF) << 2);
     uint8_t shift = *registers[(opcode >> 8) & 0xF];
-    return (value << (32 - (shift & 0x1F))) | (value >> ((shift & 0x1F)));
+    return rotateRight32(value, shift);
 }
 
 FORCE_INLINE uint32_t Interpreter::imm(uint32_t opcode) { // #i
     // Rotate 8-bit immediate right by a multiple of 2
     uint32_t value = opcode & 0xFF;
     uint8_t shift = (opcode >> 7) & 0x1E;
-    return (value << (32 - shift)) | (value >> shift);
+    return rotateRight32(value, shift);
 }
 
 FORCE_INLINE uint32_t Interpreter::lliS(uint32_t opcode) { // Rm,LSL #i (S)
@@ -203,7 +210,7 @@ FORCE_INLINE uint32_t Interpreter::rriS(uint32_t opcode) { // Rm,ROR #i (S)
     // A shift of 0 translates to a rotate with carry of 1
     uint32_t value = *registers[opcode & 0xF];
     uint8_t shift = (opcode >> 7) & 0x1F;
-    uint32_t res = shift ? ((value << (32 - shift)) | (value >> shift)) : (((cpsr & BIT(29)) << 2) | (value >> 1));
+    uint32_t res = shift ? rotateRight32(value, shift) : (((cpsr & BIT(29)) << 2) | (value >> 1));
     cpsr = (cpsr & ~BIT(29)) | ((bool)(value & BIT(shift ? (shift - 1) : 0)) << 29);
     return res;
 }
@@ -214,7 +221,7 @@ FORCE_INLINE uint32_t Interpreter::rrrS(uint32_t opcode) { // Rm,ROR Rs (S)
     uint32_t value = *registers[opcode & 0xF] + (((opcode & 0xF) == 0xF) << 2);
     uint8_t shift = *registers[(opcode >> 8) & 0xF];
     if (shift > 0) cpsr = (cpsr & ~BIT(29)) | ((bool)(value & BIT((shift - 1) & 0x1F)) << 29);
-    return (value << (32 - (shift & 0x1F))) | (value >> ((shift & 0x1F)));
+    return rotateRight32(value, shift);
 }
 
 FORCE_INLINE uint32_t Interpreter::immS(uint32_t opcode) { // #i (S)
@@ -222,7 +229,7 @@ FORCE_INLINE uint32_t Interpreter::immS(uint32_t opcode) { // #i (S)
     uint32_t value = opcode & 0xFF;
     uint8_t shift = (opcode >> 7) & 0x1E;
     if (shift > 0) cpsr = (cpsr & ~BIT(29)) | ((bool)(value & BIT(shift - 1)) << 29);
-    return (value << (32 - shift)) | (value >> shift);
+    return rotateRight32(value, shift);
 }
 
 FORCE_INLINE int Interpreter::_and(uint32_t opcode, uint32_t op2) { // AND Rd,Rn,op2
@@ -531,7 +538,7 @@ FORCE_INLINE int Interpreter::rscs(uint32_t opcode, uint32_t op2) { // RSCS Rd,R
     uint32_t *op0 = registers[(opcode >> 12) & 0xF];
     uint32_t op1 = *registers[(opcode >> 16) & 0xF] + (((opcode & 0x20F0010) == 0x00F0010) << 2);
     *op0 = op2 - op1 - 1 + ((cpsr & BIT(29)) >> 29);
-    cpsr = (cpsr & ~0xC0000000) | (*op0 & BIT(31)) | ((*op0 == 0) << 30) | ((op2 >= *op0 &&
+    cpsr = (cpsr & ~0xF0000000) | (*op0 & BIT(31)) | ((*op0 == 0) << 30) | ((op2 >= *op0 &&
         (op1 != -1 || (cpsr & BIT(29)))) << 29) | (((op1 ^ op2) & ~(*op0 ^ op1) & BIT(31)) >> 3);
 
     // Handle pipelining and mode switching
@@ -601,27 +608,25 @@ int Interpreter::mul(uint32_t opcode) { // MUL Rd,Rm,Rs
     // Multiplication
     uint32_t *op0 = registers[(opcode >> 16) & 0xF];
     uint32_t op1 = *registers[opcode & 0xF];
-    int32_t op2 = *registers[(opcode >> 8) & 0xF];
+    uint32_t op2 = *registers[(opcode >> 8) & 0xF];
     *op0 = op1 * op2;
 
     // Calculate timing
     if (!arm7) return 2;
-    int m; for (m = 1; (op2 < (-1 << (m << 3)) || op2 >= (1 << (m << 3))) && m < 4; m++);
-    return m + 1;
+    return Arm7TdmiMul::signedMulTicks(op2) + 1;
 }
 
 int Interpreter::mla(uint32_t opcode) { // MLA Rd,Rm,Rs,Rn
     // Multiplication with accumulate
     uint32_t *op0 = registers[(opcode >> 16) & 0xF];
     uint32_t op1 = *registers[opcode & 0xF];
-    int32_t op2 = *registers[(opcode >> 8) & 0xF];
+    uint32_t op2 = *registers[(opcode >> 8) & 0xF];
     uint32_t op3 = *registers[(opcode >> 12) & 0xF];
     *op0 = op1 * op2 + op3;
 
     // Calculate timing
     if (!arm7) return 2;
-    int m; for (m = 1; (op2 < (-1 << (m << 3)) || op2 >= (1 << (m << 3))) && m < 4; m++);
-    return m + 2;
+    return Arm7TdmiMul::signedMulTicks(op2) + 2;
 }
 
 int Interpreter::umull(uint32_t opcode) { // UMULL RdLo,RdHi,Rm,Rs
@@ -635,8 +640,7 @@ int Interpreter::umull(uint32_t opcode) { // UMULL RdLo,RdHi,Rm,Rs
 
     // Calculate timing
     if (!arm7) return 3;
-    int m; for (m = 1; (op3 < (-1 << (m << 3)) || op3 >= (1 << (m << 3))) && m < 4; m++);
-    return m + 2;
+    return Arm7TdmiMul::unsignedMulTicks(op3) + 2;
 }
 
 int Interpreter::umlal(uint32_t opcode) { // UMLAL RdLo,RdHi,Rm,Rs
@@ -651,8 +655,7 @@ int Interpreter::umlal(uint32_t opcode) { // UMLAL RdLo,RdHi,Rm,Rs
 
     // Calculate timing
     if (!arm7) return 3;
-    int m; for (m = 1; (op3 < (-1 << (m << 3)) || op3 >= (1 << (m << 3))) && m < 4; m++);
-    return m + 3;
+    return Arm7TdmiMul::unsignedMulTicks(op3) + 3;
 }
 
 int Interpreter::smull(uint32_t opcode) { // SMULL RdLo,RdHi,Rm,Rs
@@ -666,8 +669,7 @@ int Interpreter::smull(uint32_t opcode) { // SMULL RdLo,RdHi,Rm,Rs
 
     // Calculate timing
     if (!arm7) return 3;
-    int m; for (m = 1; (op3 < (-1 << (m << 3)) || op3 >= (1 << (m << 3))) && m < 4; m++);
-    return m + 2;
+    return Arm7TdmiMul::signedMulTicks((uint32_t)op3) + 2;
 }
 
 int Interpreter::smlal(uint32_t opcode) { // SMLAL RdLo,RdHi,Rm,Rs
@@ -682,37 +684,40 @@ int Interpreter::smlal(uint32_t opcode) { // SMLAL RdLo,RdHi,Rm,Rs
 
     // Calculate timing
     if (!arm7) return 3;
-    int m; for (m = 1; (op3 < (-1 << (m << 3)) || op3 >= (1 << (m << 3))) && m < 4; m++);
-    return m + 3;
+    return Arm7TdmiMul::signedMulTicks((uint32_t)op3) + 3;
 }
 
 int Interpreter::muls(uint32_t opcode) { // MULS Rd,Rm,Rs
     // Multiplication and set flags
     uint32_t *op0 = registers[(opcode >> 16) & 0xF];
     uint32_t op1 = *registers[opcode & 0xF];
-    int32_t op2 = *registers[(opcode >> 8) & 0xF];
-    *op0 = op1 * op2;
-    cpsr = (cpsr & ~0xC0000000) | (*op0 & BIT(31)) | ((*op0 == 0) << 30);
-
-    // Calculate timing
-    if (!arm7) return 4;
-    int m; for (m = 1; (op2 < (-1 << (m << 3)) || op2 >= (1 << (m << 3))) && m < 4; m++);
-    return m + 1;
+    uint32_t op2 = *registers[(opcode >> 8) & 0xF];
+    if (!arm7) {
+        *op0 = op1 * op2;
+        cpsr = (cpsr & ~0xC0000000) | (*op0 & BIT(31)) | ((*op0 == 0) << 30);
+        return 4;
+    }
+    auto r = Arm7TdmiMul::execute(Arm7TdmiMul::SHORT, op1, op2);
+    *op0 = (uint32_t)r.output;
+    cpsr = (cpsr & ~0xE0000000) | (*op0 & BIT(31)) | ((*op0 == 0) << 30) | ((uint32_t)r.carry << 29);
+    return r.ticks + 1;
 }
 
 int Interpreter::mlas(uint32_t opcode) { // MLAS Rd,Rm,Rs,Rn
     // Multiplication with accumulate and set flags
     uint32_t *op0 = registers[(opcode >> 16) & 0xF];
     uint32_t op1 = *registers[opcode & 0xF];
-    int32_t op2 = *registers[(opcode >> 8) & 0xF];
+    uint32_t op2 = *registers[(opcode >> 8) & 0xF];
     uint32_t op3 = *registers[(opcode >> 12) & 0xF];
-    *op0 = op1 * op2 + op3;
-    cpsr = (cpsr & ~0xC0000000) | (*op0 & BIT(31)) | ((*op0 == 0) << 30);
-
-    // Calculate timing
-    if (!arm7) return 4;
-    int m; for (m = 1; (op2 < (-1 << (m << 3)) || op2 >= (1 << (m << 3))) && m < 4; m++);
-    return m + 2;
+    if (!arm7) {
+        *op0 = op1 * op2 + op3;
+        cpsr = (cpsr & ~0xC0000000) | (*op0 & BIT(31)) | ((*op0 == 0) << 30);
+        return 4;
+    }
+    auto r = Arm7TdmiMul::execute(Arm7TdmiMul::SHORT, op1, op2, op3);
+    *op0 = (uint32_t)r.output;
+    cpsr = (cpsr & ~0xE0000000) | (*op0 & BIT(31)) | ((*op0 == 0) << 30) | ((uint32_t)r.carry << 29);
+    return r.ticks + 2;
 }
 
 int Interpreter::umulls(uint32_t opcode) { // UMULLS RdLo,RdHi,Rm,Rs
@@ -721,14 +726,16 @@ int Interpreter::umulls(uint32_t opcode) { // UMULLS RdLo,RdHi,Rm,Rs
     uint32_t *op1 = registers[(opcode >> 16) & 0xF];
     uint32_t op2 = *registers[opcode & 0xF];
     uint32_t op3 = *registers[(opcode >> 8) & 0xF];
-    uint64_t res = uint64_t(op2) * op3;
-    *op0 = res, *op1 = res >> 32;
-    cpsr = (cpsr & ~0xC0000000) | (*op1 & BIT(31)) | ((res == 0) << 30);
-
-    // Calculate timing
-    if (!arm7) return 5;
-    int m; for (m = 1; (op3 < (-1 << (m << 3)) || op3 >= (1 << (m << 3))) && m < 4; m++);
-    return m + 2;
+    if (!arm7) {
+        uint64_t res = uint64_t(op2) * op3;
+        *op0 = res, *op1 = res >> 32;
+        cpsr = (cpsr & ~0xC0000000) | (*op1 & BIT(31)) | ((res == 0) << 30);
+        return 5;
+    }
+    auto r = Arm7TdmiMul::execute(Arm7TdmiMul::LONG_UNSIGNED, op2, op3);
+    *op0 = (uint32_t)r.output, *op1 = (uint32_t)(r.output >> 32);
+    cpsr = (cpsr & ~0xE0000000) | (*op1 & BIT(31)) | ((r.output == 0) << 30) | ((uint32_t)r.carry << 29);
+    return r.ticks + 2;
 }
 
 int Interpreter::umlals(uint32_t opcode) { // UMLALS RdLo,RdHi,Rm,Rs
@@ -737,48 +744,54 @@ int Interpreter::umlals(uint32_t opcode) { // UMLALS RdLo,RdHi,Rm,Rs
     uint32_t *op1 = registers[(opcode >> 16) & 0xF];
     uint32_t op2 = *registers[opcode & 0xF];
     uint32_t op3 = *registers[(opcode >> 8) & 0xF];
-    uint64_t res = uint64_t(op2) * op3;
-    res += (uint64_t(*op1) << 32) | *op0;
-    *op0 = res, *op1 = res >> 32;
-    cpsr = (cpsr & ~0xC0000000) | (*op1 & BIT(31)) | ((res == 0) << 30);
-
-    // Calculate timing
-    if (!arm7) return 5;
-    int m; for (m = 1; (op3 < (-1 << (m << 3)) || op3 >= (1 << (m << 3))) && m < 4; m++);
-    return m + 3;
+    uint64_t acc = (uint64_t(*op1) << 32) | *op0;
+    if (!arm7) {
+        uint64_t res = uint64_t(op2) * op3 + acc;
+        *op0 = res, *op1 = res >> 32;
+        cpsr = (cpsr & ~0xC0000000) | (*op1 & BIT(31)) | ((res == 0) << 30);
+        return 5;
+    }
+    auto r = Arm7TdmiMul::execute(Arm7TdmiMul::LONG_UNSIGNED, op2, op3, acc);
+    *op0 = (uint32_t)r.output, *op1 = (uint32_t)(r.output >> 32);
+    cpsr = (cpsr & ~0xE0000000) | (*op1 & BIT(31)) | ((r.output == 0) << 30) | ((uint32_t)r.carry << 29);
+    return r.ticks + 3;
 }
 
 int Interpreter::smulls(uint32_t opcode) { // SMULLS RdLo,RdHi,Rm,Rs
     // Signed long multiplication and set flags
     uint32_t *op0 = registers[(opcode >> 12) & 0xF];
     uint32_t *op1 = registers[(opcode >> 16) & 0xF];
-    int32_t op2 = *registers[opcode & 0xF];
-    int32_t op3 = *registers[(opcode >> 8) & 0xF];
-    int64_t res = int64_t(op2) * op3;
-    *op0 = res, *op1 = res >> 32;
-    cpsr = (cpsr & ~0xC0000000) | (*op1 & BIT(31)) | ((res == 0) << 30);
-
-    // Calculate timing
-    if (!arm7) return 5;
-    int m; for (m = 1; (op3 < (-1 << (m << 3)) || op3 >= (1 << (m << 3))) && m < 4; m++);
-    return m + 2;
+    uint32_t op2 = *registers[opcode & 0xF];
+    uint32_t op3 = *registers[(opcode >> 8) & 0xF];
+    if (!arm7) {
+        int64_t res = int64_t(int32_t(op2)) * int32_t(op3);
+        *op0 = res, *op1 = res >> 32;
+        cpsr = (cpsr & ~0xC0000000) | (*op1 & BIT(31)) | ((res == 0) << 30);
+        return 5;
+    }
+    auto r = Arm7TdmiMul::execute(Arm7TdmiMul::LONG_SIGNED, op2, op3);
+    *op0 = (uint32_t)r.output, *op1 = (uint32_t)(r.output >> 32);
+    cpsr = (cpsr & ~0xE0000000) | (*op1 & BIT(31)) | ((r.output == 0) << 30) | ((uint32_t)r.carry << 29);
+    return r.ticks + 2;
 }
 
 int Interpreter::smlals(uint32_t opcode) { // SMLALS RdLo,RdHi,Rm,Rs
     // Signed long multiplication with accumulate and set flags
     uint32_t *op0 = registers[(opcode >> 12) & 0xF];
     uint32_t *op1 = registers[(opcode >> 16) & 0xF];
-    int32_t op2 = *registers[opcode & 0xF];
-    int32_t op3 = *registers[(opcode >> 8) & 0xF];
-    int64_t res = int64_t(op2) * op3;
-    res += (int64_t(*op1) << 32) | *op0;
-    *op0 = res, *op1 = res >> 32;
-    cpsr = (cpsr & ~0xC0000000) | (*op1 & BIT(31)) | ((res == 0) << 30);
-
-    // Calculate timing
-    if (!arm7) return 5;
-    int m; for (m = 1; (op3 < (-1 << (m << 3)) || op3 >= (1 << (m << 3))) && m < 4; m++);
-    return m + 3;
+    uint32_t op2 = *registers[opcode & 0xF];
+    uint32_t op3 = *registers[(opcode >> 8) & 0xF];
+    uint64_t acc = (uint64_t(*op1) << 32) | *op0;
+    if (!arm7) {
+        int64_t res = int64_t(int32_t(op2)) * int32_t(op3) + int64_t(acc);
+        *op0 = res, *op1 = res >> 32;
+        cpsr = (cpsr & ~0xC0000000) | (*op1 & BIT(31)) | ((res == 0) << 30);
+        return 5;
+    }
+    auto r = Arm7TdmiMul::execute(Arm7TdmiMul::LONG_SIGNED, op2, op3, acc);
+    *op0 = (uint32_t)r.output, *op1 = (uint32_t)(r.output >> 32);
+    cpsr = (cpsr & ~0xE0000000) | (*op1 & BIT(31)) | ((r.output == 0) << 30) | ((uint32_t)r.carry << 29);
+    return r.ticks + 3;
 }
 
 int Interpreter::smulbb(uint32_t opcode) { // SMULBB Rd,Rm,Rs
@@ -1232,7 +1245,7 @@ int Interpreter::rorDpT(uint16_t opcode) { // ROR Rd,Rs
     uint32_t *op0 = registers[opcode & 0x7];
     uint32_t op1 = *registers[opcode & 0x7];
     uint8_t op2 = *registers[(opcode >> 3) & 0x7];
-    *op0 = (*op0 << (32 - (op2 & 0x1F))) | (*op0 >> (op2 & 0x1F));
+    *op0 = rotateRight32(*op0, op2);
     cpsr = (cpsr & ~0xC0000000) | (*op0 & BIT(31)) | ((*op0 == 0) << 30);
     if (op2 > 0) cpsr = (cpsr & ~BIT(29)) | ((bool)(op1 & BIT((op2 - 1) & 0x1F)) << 29);
     return 1;
@@ -1339,7 +1352,8 @@ int Interpreter::negDpT(uint16_t opcode) { // NEG Rd,Rs
     uint32_t *op0 = registers[opcode & 0x7];
     uint32_t op2 = *registers[(opcode >> 3) & 0x7];
     *op0 = -op2;
-    cpsr = (cpsr & ~0xF0000000) | (*op0 & BIT(31)) | ((*op0 == 0) << 30) | ((*op0 <= 0) << 29);
+    cpsr = (cpsr & ~0xF0000000) | (*op0 & BIT(31)) | ((*op0 == 0) << 30) |
+        ((op2 == 0) << 29) | ((op2 == 0x80000000) << 28);
     return 1;
 }
 
@@ -1347,12 +1361,14 @@ int Interpreter::mulDpT(uint16_t opcode) { // MUL Rd,Rs
     // Multiplication and set flags (THUMB)
     uint32_t *op0 = registers[opcode & 0x7];
     uint32_t op1 = *registers[(opcode >> 3) & 0x7];
-    int32_t op2 = *registers[opcode & 0x7];
-    *op0 = op1 * op2;
-    cpsr = (cpsr & ~0xC0000000) | (*op0 & BIT(31)) | ((*op0 == 0) << 30);
-
-    // Calculate timing
-    if (!arm7) return 4;
-    int m; for (m = 1; (op2 < (-1 << (m << 3)) || op2 >= (1 << (m << 3))) && m < 4; m++);
-    return m + 1;
+    uint32_t op2 = *registers[opcode & 0x7];
+    if (!arm7) {
+        *op0 = op1 * op2;
+        cpsr = (cpsr & ~0xC0000000) | (*op0 & BIT(31)) | ((*op0 == 0) << 30);
+        return 4;
+    }
+    auto r = Arm7TdmiMul::execute(Arm7TdmiMul::SHORT, op1, op2);
+    *op0 = (uint32_t)r.output;
+    cpsr = (cpsr & ~0xE0000000) | (*op0 & BIT(31)) | ((*op0 == 0) << 30) | ((uint32_t)r.carry << 29);
+    return r.ticks + 1;
 }

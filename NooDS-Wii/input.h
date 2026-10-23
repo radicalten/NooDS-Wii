@@ -25,6 +25,7 @@
 class Core;
 
 class Input {
+    friend class ArmPpcJit;
 public:
     Input(Core *core): core(core) {}
 
@@ -37,6 +38,7 @@ public:
     uint16_t readExtKeyIn() { return extKeyIn; }
 
 private:
+    friend class ArmPpcJit; // guarded ARM9 KEYINPUT read uses the live key register
     Core *core;
 
     uint16_t keyInput = 0x03FF;

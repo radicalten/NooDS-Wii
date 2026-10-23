@@ -32,6 +32,7 @@ extern "C" {
 class Core;
 
 class Gpu {
+    friend class ArmPpcJit;
 public:
     Gpu(Core *core);
     ~Gpu();
@@ -42,6 +43,7 @@ public:
     bool getFrame(uint32_t *out, bool gbaCrop);
     void invalidate3D() { dirty3D |= BIT(0); }
 
+    void gbaHblankDma();
     void gbaScanline240();
     void gbaScanline308();
     void scanline256();
@@ -57,6 +59,7 @@ public:
     void writePowCnt1(uint16_t mask, uint16_t value);
 
 private:
+    friend class ArmPpcJit; // guarded MMIO fast path reads the live DISPSTAT field
     Core *core;
 
     struct Buffers {
@@ -65,6 +68,8 @@ private:
         bool top3D = false;
     };
 
+    uint32_t *framePool[4] = {};
+    uint8_t framePoolIdx = 0;
     std::queue<Buffers> framebuffers;
     volatile bool ready;
 

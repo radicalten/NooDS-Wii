@@ -48,10 +48,12 @@ public:
     // No heap allocation is performed inside this call.
     // ---------------------------------------------------------------------------
     bool getSamples(uint32_t *dst, int count);
+    int  drainSamples(uint32_t *dst, int maxCount, uint32_t *availAfter = nullptr, int minCount = 1);
 
     void runGbaSample();
     void runSample();
     void gbaFifoTimer(int timer);
+    void wakeSpuSchedule();
 
     // GBA register accessors
     uint8_t  readGbaSoundCntL(int channel);
@@ -113,15 +115,18 @@ private:
     //   2. Copy from buffers[readIdx] (the buffer NOT currently being written).
     //   3. Clear ready under lock.
     // ---------------------------------------------------------------------------
-    static const int  SPU_BUF_FRAMES = 548;   // == WIIAUD_NDS_FRAMES == WIIAUD_GBA_FRAMES
-    uint32_t          buffers[2][SPU_BUF_FRAMES];
-    int               writeIdx    = 0;         // index emulator thread writes to
-    uint32_t          bufferPointer = 0;       // how many samples written so far
+    static constexpr uint32_t SPU_RING_SIZE      = 4096;
+    static constexpr uint32_t SPU_RING_MASK      = SPU_RING_SIZE - 1;
+    static constexpr uint32_t SPU_TARGET_LATENCY = 2048; // ~62 ms max buffered ahead
+    static const int          SPU_BUF_FRAMES     = 699;
 
-    volatile bool     ready       = false;     // true when a complete frame is available
+    uint32_t          ringBuf[SPU_RING_SIZE];
+    volatile uint32_t ringWrite     = 0;
+    volatile uint32_t ringRead      = 0;
+    uint32_t          lastPopSample = 0;
 
-    KThrQueue waitQueue1;   // emulator blocks here when audio is behind
-    KThrQueue waitQueue2;   // audio blocks here when emulator is behind
+    KThrQueue waitQueue1;   // emulator blocks here when audio ring is full
+    KThrQueue waitQueue2;   // reserved
 
     // ---- GBA state ----
     int16_t  gbaFrameSequencer    = 0;
@@ -132,9 +137,26 @@ private:
     int8_t   gbaWaveDigit         = 0;
     uint16_t gbaNoiseValue        = 0;
 
+    struct GbaAudioFifo {
+        int8_t data[64] = {};
+        uint8_t head = 0;
+        uint8_t sz = 0;
+        inline size_t size() const { return sz; }
+        inline bool empty() const { return sz == 0; }
+        inline void clear() { head = 0; sz = 0; }
+        inline int8_t front() const { return data[head & 63]; }
+        inline void pop_front() { head = (head + 1) & 63; sz--; }
+        inline void push_back(int8_t v) {
+            if (sz < 64) { data[(head + sz) & 63] = v; sz++; }
+        }
+        inline const int8_t& operator[](size_t i) const { return data[(head + i) & 63]; }
+    };
+
     uint8_t  gbaWaveRam[2][16]    = {};
-    std::deque<int8_t> gbaFifos[2];
+    GbaAudioFifo gbaFifos[2];
     int8_t   gbaSampleA = 0, gbaSampleB = 0;
+    uint32_t spuSilentNextCycle   = 0;
+    uint32_t spuSilentBatch       = 1;
 
     uint16_t enabled              = 0;
 

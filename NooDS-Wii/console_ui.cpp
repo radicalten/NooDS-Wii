@@ -57,7 +57,7 @@ volatile uint8_t ConsoleUI::running;
 std::string ConsoleUI::ndsPath, ConsoleUI::gbaPath;
 std::string ConsoleUI::basePath, ConsoleUI::curPath;
 
-uint32_t ConsoleUI::framebuffer[256 * 192 * 8];
+uint32_t *ConsoleUI::framebuffer = nullptr;
 ScreenLayout ConsoleUI::layout;
 bool ConsoleUI::gbaMode;
 bool ConsoleUI::changed;
@@ -143,6 +143,9 @@ int ConsoleUI::stringWidth(std::string &string) {
 
 void ConsoleUI::initialize(int width, int height,
     std::string root, std::string prefix) {
+
+    if (!framebuffer)
+        framebuffer = new uint32_t[256 * 192 * 8]();
 
     fileTextures[0]   = bmpToTexture(&_binary_src_console_images_file_dark_bmp_start);
     fileTextures[1]   = bmpToTexture(&_binary_src_console_images_file_light_bmp_start);
@@ -324,7 +327,11 @@ void ConsoleUI::mainLoop(MenuTouch (*specialTouch)(),
 }
 
 int ConsoleUI::setPath(std::string path) {
-    if (path.find(".nds", path.length() - 4) != std::string::npos) {
+    size_t dotPos = path.find_last_of('.');
+    std::string ext = (dotPos != std::string::npos) ? path.substr(dotPos) : "";
+    std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+
+    if (ext == ".nds" || ext == ".srl") {
         if (gbaPath != "") {
             if (!message("Loading NDS ROM",
                 "Load the previous GBA ROM alongside this ROM?", 1))
@@ -335,7 +342,7 @@ int ConsoleUI::setPath(std::string path) {
         ndsPath = "";
         return 1;
     }
-    else if (path.find(".gba", path.length() - 4) != std::string::npos) {
+    else if (ext == ".gba" || ext == ".agb") {
         if (ndsPath != "") {
             if (!message("Loading GBA ROM",
                 "Load the previous NDS ROM alongside this ROM?", 1))
@@ -588,29 +595,37 @@ void ConsoleUI::fileBrowser() {
         DIR    *dir = opendir(curPath.c_str());
         dirent *entry;
 
-        while ((entry = readdir(dir))) {
-            std::string name    = entry->d_name;
+        while (dir && (entry = readdir(dir))) {
+            std::string name = entry->d_name;
+            if (name == "." || name == ".." || name.rfind("._", 0) == 0)
+                continue;
             std::string subpath = curPath + "/" + name;
             struct stat substat;
-            stat(subpath.c_str(), &substat);
+            if (stat(subpath.c_str(), &substat) != 0)
+                continue;
 
             if (S_ISDIR(substat.st_mode)) {
                 files.push_back(MenuItem(name, "",
                     folderTextures[menuTheme], 64));
             }
-            else if (name.find(".nds", name.length() - 4) != std::string::npos) {
-                void *texture =
-                    createTexture(NdsIcon(subpath).getIcon(), 32, 32);
-                files.push_back(MenuItem(name, "", texture, 32));
-            }
-            else if (name.find(".gba", name.length() - 4) != std::string::npos) {
-                files.push_back(MenuItem(name, "",
-                    fileTextures[menuTheme], 64));
+            else {
+                size_t dotPos = name.find_last_of('.');
+                std::string ext = (dotPos != std::string::npos) ? name.substr(dotPos) : "";
+                std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+                if (ext == ".nds" || ext == ".srl") {
+                    void *texture =
+                        createTexture(NdsIcon(subpath).getIcon(), 32, 32);
+                    files.push_back(MenuItem(name, "", texture, 32));
+                }
+                else if (ext == ".gba" || ext == ".agb") {
+                    files.push_back(MenuItem(name, "",
+                        fileTextures[menuTheme], 64));
+                }
             }
         }
 
         sort(files.begin(), files.end());
-        closedir(dir);
+        if (dir) closedir(dir);
 
         uint32_t pressed = menu("NooDS", files, index, "Settings", "Exit");
 
@@ -649,7 +664,16 @@ void ConsoleUI::settingsMenu() {
     const std::vector<std::string> toggle      = { "Off", "On" };
     const std::vector<std::string> theme       = { "Dark", "Light" };
     const std::vector<std::string> frames      = { "None", "1 Frame", "2 Frames",
-                                                   "3 Frames", "4 Frames", "5 Frames" };
+                                                   "3 Frames", "4 Frames", "5 Frames",
+                                                   "6 Frames", "7 Frames", "8 Frames",
+                                                   "9 Frames", "10 Frames",
+                                                   "15 Frames", "20 Frames", "30 Frames" };
+    const std::vector<std::string> scrSizes    = { "Auto", "0.50x", "0.75x", "1.00x",
+                                                   "1.25x", "1.50x", "1.75x", "2.00x",
+                                                   "2.50x", "Off" };
+    const std::vector<std::string> wiiLayouts  = { "Vertical", "Side-by-Side",
+                                                   "Hybrid (Top)", "Hybrid (Bottom)",
+                                                   "Screen 1 Only", "Screen 2 Only" };
     const std::vector<std::string> threads     = { "Disabled", "1 Thread", "2 Threads" };
     const std::vector<std::string> position    = { "Center", "Top", "Bottom", "Left", "Right" };
     const std::vector<std::string> rotation    = { "None", "Clockwise", "Counter-Clockwise" };
@@ -670,7 +694,7 @@ void ConsoleUI::settingsMenu() {
             MenuItem("Show FPS Counter",       toggle[showFpsCounter]),
             MenuItem("Menu Theme",             theme[menuTheme]),
             MenuItem("Graphics Settings",      true),
-            MenuItem("Skip Frames",            frames[Settings::frameskip]),
+            MenuItem("Skip Frames",            frames[Settings::frameskipToIndex(Settings::frameskip)]),
             MenuItem("Threaded 2D",            toggle[Settings::threaded2D]),
             MenuItem("Threaded 3D",            threads[Settings::threaded3D]),
             MenuItem("High-Resolution 3D",     toggle[Settings::highRes3D]),
@@ -694,7 +718,11 @@ void ConsoleUI::settingsMenu() {
             MenuItem("Screen Filter",          filter[Settings::screenFilter]),
             MenuItem("Aspect Ratio",           aspect[ScreenLayout::aspectRatio]),
             MenuItem("Integer Scale",          toggle[ScreenLayout::integerScale]),
-            MenuItem("GBA Crop",               toggle[ScreenLayout::gbaCrop])
+            MenuItem("GBA Crop",               toggle[ScreenLayout::gbaCrop]),
+            MenuItem("Wii Layout Mode",        wiiLayouts[Settings::screenLayout]),
+            MenuItem("Screen 1 Size",          scrSizes[Settings::screen1Size]),
+            MenuItem("Screen 2 Size",          scrSizes[Settings::screen2Size]),
+            MenuItem("Swap Screens",           toggle[Settings::screenSwap])
         };
 
         uint32_t pressed = menu("Settings", settings, index, "Controls");
@@ -705,7 +733,7 @@ void ConsoleUI::settingsMenu() {
                 case 2:  Settings::romInRam               = (Settings::romInRam + 1) % 2;    break;
                 case 3:  Settings::fpsLimiter             = (Settings::fpsLimiter + 1) % 2;  break;
                 case 4:  showFpsCounter                   = (showFpsCounter + 1) % 2;        break;
-                case 7:  Settings::frameskip              = (Settings::frameskip + 1) % 6;   break;
+                case 7:  Settings::stepFrameskip(+1);                                        break;
                 case 8:  Settings::threaded2D             = (Settings::threaded2D + 1) % 2;  break;
                 case 9:  Settings::threaded3D             = (Settings::threaded3D + 1) % 3;  break;
                 case 10: Settings::highRes3D              = (Settings::highRes3D + 1) % 2;   break;
@@ -726,6 +754,10 @@ void ConsoleUI::settingsMenu() {
                 case 29: ScreenLayout::aspectRatio        = (ScreenLayout::aspectRatio + 1) % 4;       break;
                 case 30: ScreenLayout::integerScale       = (ScreenLayout::integerScale + 1) % 2;      break;
                 case 31: ScreenLayout::gbaCrop            = (ScreenLayout::gbaCrop + 1) % 2;           break;
+                case 32: Settings::screenLayout           = (Settings::screenLayout + 1) % 6;          break;
+                case 33: Settings::screen1Size            = (Settings::screen1Size + 1) % 10;          break;
+                case 34: Settings::screen2Size            = (Settings::screen2Size + 1) % 10;          break;
+                case 35: Settings::screenSwap             = (Settings::screenSwap + 1) % 2;            break;
                 case 5:
                     menuTheme = (menuTheme + 1) % 2;
                     palette   = &themeColors[menuTheme * 7];

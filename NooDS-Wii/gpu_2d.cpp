@@ -84,13 +84,23 @@ void Gpu2D::loadState(FILE *file) {
     fread(&masterBright, sizeof(masterBright), 1, file);
 }
 
+namespace {
+struct Gpu2DLuts {
+    uint32_t rgb5To6[32768];
+    Gpu2DLuts() {
+        for (uint32_t c = 0; c < 32768; c++) {
+            uint8_t r = ((c << 1) & 0x3E);
+            uint8_t g = ((c >> 4) & 0x3E);
+            uint8_t b = ((c >> 9) & 0x3E);
+            rgb5To6[c] = ((uint32_t)b << 12) | ((uint32_t)g << 6) | r;
+        }
+    }
+};
+static const Gpu2DLuts s_gpu2DLuts;
+} // namespace
+
 uint32_t Gpu2D::rgb5ToRgb6(uint32_t color) {
-    // Convert an RGB5 value to an RGB6 value (the way the 2D engine does it)
-    // Also keep the extra bits because some of them are used to keep track of stuff
-    uint8_t r = ((color << 1) & 0x3E);
-    uint8_t g = ((color >> 4) & 0x3E);
-    uint8_t b = ((color >> 9) & 0x3E);
-    return (color & 0xFFFC0000) | (b << 12) | (g << 6) | r;
+    return (color & 0xFFFC0000u) | s_gpu2DLuts.rgb5To6[color & 0x7FFFu];
 }
 
 void Gpu2D::reloadRegisters() {
@@ -114,10 +124,22 @@ void Gpu2D::updateWindows(int line) {
 void Gpu2D::drawGbaScanline(int line) {
     // Clear layers with the backdrop (first palette index)
     uint32_t backdrop = U8TO16(palette, 0) & ~BIT(15);
+    const uint8_t bldMode = (bldCnt >> 6) & 0x3;
+
+    // Fast path when no BG or OBJ layers are enabled on this scanline
+    if ((dispCnt & 0x1F00) == 0 && bldMode == 0) {
+        uint32_t *dst = &framebuffer[line * 256];
+        for (int i = 0; i < 240; i++) dst[i] = backdrop;
+        return;
+    }
+
+    const bool needBlendLayers = (bldMode != 0) || ((dispCnt & BIT(12)) != 0);
     for (int i = 0; i < 240; i++) layers[0][i] = backdrop;
-    memcpy(layers[1], layers[0], 240 * sizeof(uint32_t));
     memset(priorities, 4, sizeof(priorities));
-    memset(blendBits, 5, sizeof(blendBits));
+    if (needBlendLayers) {
+        memcpy(layers[1], layers[0], 240 * sizeof(uint32_t));
+        memset(blendBits, 5, sizeof(blendBits));
+    }
 
     // Draw the objects, object window first if enabled
     if (dispCnt & BIT(12)) {
@@ -152,6 +174,21 @@ void Gpu2D::drawGbaScanline(int line) {
     default:
         LOG_CRIT("Unknown GBA BG mode: %d\n", mode);
         break;
+    }
+
+    // Fast path when mode == 0 and no semi-transparent sprite pixels exist on the line
+    if (bldMode == 0) {
+        if (!needBlendLayers) {
+            memcpy(&framebuffer[line * 256], layers[0], 240 * sizeof(uint32_t));
+            return;
+        }
+        uint32_t orBits = 0;
+        for (int i = 0; i < 240; i++)
+            orBits |= layers[0][i];
+        if (!(orBits & BIT(25))) {
+            memcpy(&framebuffer[line * 256], layers[0], 240 * sizeof(uint32_t));
+            return;
+        }
     }
 
     // Blend the layers to form the final image
@@ -221,12 +258,60 @@ void Gpu2D::drawGbaScanline(int line) {
 }
 
 void Gpu2D::drawScanline(int line) {
+    const uint8_t dispMode = (dispCnt >> 16) & 0x3;
+    const uint8_t bgMode = dispCnt & 0x7;
+
+    // Fast early bypass when display mode is not 2D layer composition (mode 0 = off, mode 2 = direct VRAM)
+    // and display capture is not sampling Engine A's raw 2D composition output (layers[0]).
+    if (dispMode != 1 && (engine == 1 || !(core->gpu.readDispCapCnt() & BIT(31)))) {
+        // Keep internal affine reference registers advancing if an affine BG is enabled
+        if (bgMode >= 1 && (dispCnt & 0x0C00)) {
+            if ((dispCnt & BIT(11)) && (bgMode <= 5)) {
+                internalX[1] += bgPB[1];
+                internalY[1] += bgPD[1];
+            }
+            if ((dispCnt & BIT(10)) && (bgMode == 2 || bgMode == 4 || bgMode == 5 || bgMode == 6)) {
+                internalX[0] += bgPB[0];
+                internalY[0] += bgPD[0];
+            }
+        }
+        if (dispMode == 0) {
+            memset(&framebuffer[line * 256], 0xFF, 256 * sizeof(uint32_t));
+        } else if (dispMode == 2) {
+            uint32_t addr = 0x6800000 + ((dispCnt >> 1) & 0x60000) + line * 256 * 2;
+            uint32_t *dst = &framebuffer[line * 256];
+            if (uint8_t *vramPtr = core->memory.readMap9A[addr >> 12]) {
+                vramPtr += (addr & 0xFFE);
+                for (int i = 0; i < 256; i++)
+                    dst[i] = rgb5ToRgb6(U8TO16(vramPtr, i * 2));
+            } else {
+                for (int i = 0; i < 256; i++)
+                    dst[i] = rgb5ToRgb6(core->memory.read<uint16_t>(0, addr + i * 2));
+            }
+        } else {
+            LOG_CRIT("Unimplemented engine %c display mode: display FIFO\n", (engine == 0) ? 'A' : 'B');
+        }
+        goto apply_master_bright;
+    }
+
+    {
     // Clear layers with the backdrop (first palette index)
     uint32_t backdrop = U8TO16(palette, 0) & ~BIT(15);
+    const uint8_t bldMode = (bldCnt >> 6) & 0x3;
+    const bool needBlendLayers = (bldMode != 0) || ((dispCnt & BIT(12)) != 0) || ((dispCnt & BIT(3)) && (dispCnt & BIT(8)));
+
+    if ((dispCnt & 0x1F00) == 0 && bldMode == 0) {
+        uint32_t col = rgb5ToRgb6(backdrop);
+        for (int i = 0; i < 256; i++) layers[0][i] = col;
+        goto copy_display_mode;
+    }
+
     for (int i = 0; i < 256; i++) layers[0][i] = backdrop;
-    memcpy(layers[1], layers[0], sizeof(layers[0]));
     memset(priorities, 4, sizeof(priorities));
-    memset(blendBits, 5, sizeof(blendBits));
+    if (needBlendLayers) {
+        memcpy(layers[1], layers[0], sizeof(layers[0]));
+        memset(blendBits, 5, sizeof(blendBits));
+    }
 
     // Draw the objects, object window first if enabled
     if (dispCnt & BIT(12)) {
@@ -235,7 +320,7 @@ void Gpu2D::drawScanline(int line) {
     }
 
     // Draw the background layers depending on the BG mode
-    switch (uint8_t mode = (dispCnt & 0x7)) {
+    switch (uint8_t mode = bgMode) {
     case 0:
         if (dispCnt & BIT(11)) drawText<0>(3, line);
         if (dispCnt & BIT(10)) drawText<0>(2, line);
@@ -285,6 +370,12 @@ void Gpu2D::drawScanline(int line) {
     default:
         LOG_CRIT("Unknown engine %c BG mode: %d\n", (engine == 0) ? 'A' : 'B', mode);
         break;
+    }
+
+    if (!needBlendLayers) {
+        for (int i = 0; i < 256; i++)
+            layers[0][i] = rgb5ToRgb6(layers[0][i]);
+        goto copy_display_mode;
     }
 
     // Blend the layers to form the final image
@@ -374,28 +465,29 @@ void Gpu2D::drawScanline(int line) {
         }
     }
 
+copy_display_mode:
     // Copy the final image to the framebuffer
-    switch ((dispCnt >> 16) & 0x3) { // Display mode
-    case 0: // Display off
-        // Fill the display with white
+    switch (dispMode) {
+    case 0:
         memset(&framebuffer[line * 256], 0xFF, 256 * sizeof(uint32_t));
         break;
-
-    case 1: // Layers
+    case 1:
         memcpy(&framebuffer[line * 256], layers[0], 256 * sizeof(uint32_t));
         break;
-
-    case 2: // VRAM display
-        // Draw raw bitmap data from a VRAM block
-        for (uint32_t addr = 0x6800000 + ((dispCnt >> 1) & 0x60000) + line * 256 * 2, i = 0; i < 256; i++)
-            framebuffer[line * 256 + i] = rgb5ToRgb6(core->memory.read<uint16_t>(0, addr + i * 2));
+    case 2: {
+        uint32_t addr = 0x6800000 + ((dispCnt >> 1) & 0x60000) + line * 256 * 2;
+        uint32_t *dst = &framebuffer[line * 256];
+        for (int i = 0; i < 256; i++)
+            dst[i] = rgb5ToRgb6(core->memory.read<uint16_t>(0, addr + i * 2));
         break;
-
-    case 3: // Main memory display
+    }
+    default:
         LOG_CRIT("Unimplemented engine %c display mode: display FIFO\n", (engine == 0) ? 'A' : 'B');
         break;
     }
+    }
 
+apply_master_bright:
     // Apply master brightness (DS-only, 18-bit)
     switch ((masterBright >> 14) & 0x3) { // Mode
     case 1: // Increase
@@ -509,6 +601,58 @@ template <bool gbaMode> void Gpu2D::drawText(int bg, int line) {
     // If the background is 512 pixels wide, move 2 sections to skip the second X section
     if (yOffset >= 256 && (bgCnt[bg] & BIT(15)))
         tileBase += (bgCnt[bg] & BIT(14)) ? 0x1000 : 0x800;
+
+    // With mosaic enabled and a horizontal period above 1, the fetched pixel
+    // repeats across each horizontal mosaic block (the vertical snap is
+    // already in yOffset). Fetch once per block and replicate the pixel,
+    // stepping by whole blocks so no per-pixel modulo or redundant VRAM
+    // reads are needed. A period of 1 is a visual no-op, so those layers
+    // keep the fast tile path below.
+    if ((bgCnt[bg] & BIT(6)) && (mosaic & 0xF)) {
+        int periodH = (mosaic & 0xF) + 1;
+        int width = gbaMode ? 240 : 256;
+        uint8_t *extPal = (bgCnt[bg] & BIT(7)) ?
+            ((dispCnt & BIT(30)) ? extPalettes[bg + (bg < 2 && (bgCnt[bg] & BIT(13))) * 2] : nullptr) : nullptr;
+        for (int x = 0; x < width; x += periodH) {
+            // Move the tile address to the current tile; x is a block start,
+            // so the snapped sample offset is x itself
+            int xOffset = (bgHOfs[bg] + x) & 0x1FF;
+            uint32_t tileAddr = tileBase + ((xOffset & 0xF8) >> 2);
+
+            // If the X-offset exceeds 256 and the background is 512 pixels wide, move to the next 256x256 section
+            if (xOffset >= 256 && (bgCnt[bg] & BIT(14)))
+                tileAddr += 0x800;
+
+            // Get the current tile and the pixel offsets within it, accounting for flips
+            uint16_t tile = core->memory.read<uint16_t>(gbaMode, tileAddr);
+            int px = (tile & BIT(10)) ? (7 - (xOffset & 7)) : (xOffset & 7);
+            int py = (tile & BIT(11)) ? (7 - (yOffset & 7)) : (yOffset & 7);
+
+            // Fetch the block's pixel once
+            uint16_t color;
+            if (bgCnt[bg] & BIT(7)) { // 8-bit
+                uint8_t *pal = extPal ? &extPal[(tile >> 3) & 0x1E00] : palette;
+                uint8_t index = core->memory.read<uint8_t>(gbaMode, indexBase + (tile & 0x3FF) * 64 + py * 8 + px);
+                if (!index)
+                    continue;
+                color = U8TO16(pal, index * 2) | BIT(15);
+            }
+            else { // 4-bit
+                uint8_t *pal = &palette[(tile & 0xF000) >> 7];
+                uint32_t indices = core->memory.read<uint32_t>(gbaMode, indexBase + (tile & 0x3FF) * 32 + py * 4);
+                uint8_t index = (indices >> (px * 4)) & 0xF;
+                if (!index)
+                    continue;
+                color = U8TO16(pal, index * 2) | BIT(15);
+            }
+
+            // Replicate the pixel across the rest of the block
+            int end = std::min(x + periodH, width);
+            for (int i = x; i < end; i++)
+                drawBgPixel(bg, line, i, color);
+        }
+        return;
+    }
 
     // Draw a line
     int width = (gbaMode ? 240 : 256) + (bgHOfs[bg] & 0x7);

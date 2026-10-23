@@ -44,6 +44,9 @@ public:
     template <bool, int> static void runCoreSingle(Core &core);
     static void runCoreNds(Core &core);
     static void runCoreDsi(Core &core);
+#if NOODS_NDS_TASK_PROFILE
+    static void dumpNdsTaskProfile(FILE *f);
+#endif
 
     uint16_t getOpcode16();
     uint32_t getOpcode32();
@@ -54,8 +57,18 @@ public:
     void interrupt();
 
     bool isThumb() { return cpsr & BIT(5); }
+    bool isPrivileged() const { return (cpsr & 0x1F) != 0x10; }
     uint32_t getPC() { return *registers[15]; }
     int handleHleIrq();
+    int takeAbort(uint8_t vector, uint32_t lrVal);
+    void advanceGbaCycles(int c);
+    void stallGbaDmaCycles(uint32_t c);
+    void runGbaOpcode();
+
+    bool mpuDataCheck = false;
+    bool dataAbort = false;
+    bool inGbaHaltSwi = false;
+    bool irqFromHalt = false;
 
     uint8_t readIme() { return ime; }
     uint32_t readIe() { return ie; }
@@ -66,6 +79,9 @@ public:
     void writeIe(uint32_t mask, uint32_t value);
     void writeIrf(uint32_t mask, uint32_t value);
     void writePostFlg(uint8_t value);
+
+    friend struct NoodsTestHarness;
+    friend class ArmPpcJit;
 
 private:
     Core *core;
@@ -83,7 +99,9 @@ private:
     uint32_t registersUnd[2] = {};
 
     uint32_t cpsr = 0, *spsr = nullptr;
-    uint32_t spsrFiq = 0, spsrSvc = 0, spsrAbt = 0, spsrIrq = 0, spsrUnd = 0;
+    // Dust initializes every banked SPSR to User mode (0x10); reserved mode bit 4
+    // must remain set when an MSR field mask leaves it untouched.
+    uint32_t spsrFiq = 0x10, spsrSvc = 0x10, spsrAbt = 0x10, spsrIrq = 0x10, spsrUnd = 0x10;
 
     uint32_t cycles = 0;
     bool dsiCycle = false;
@@ -98,8 +116,9 @@ private:
     static const uint8_t condition[0x100];
     static const uint8_t bitCount[0x100];
 
-    int runOpcode();
+    int runOpcode(uint32_t remIndep = 1, uint32_t remShared = 1);
     int exception(uint8_t vector);
+    int undefinedException(bool thumb);
     void flushPipeline();
     void swapRegisters(uint32_t value);
     void setCpsr(uint32_t value, bool save = false);

@@ -20,6 +20,9 @@
 
 #include <cstring>
 #include "core.h"
+#if NOODS_JIT
+#include "arm_jit.h"
+#endif
 
 Dldi::~Dldi() {
     // Ensure the SD image is closed
@@ -75,6 +78,9 @@ void Dldi::patchRom(uint8_t *rom, uint32_t offset, uint32_t size) {
         // Confirm that a driver has been patched
         LOG_INFO("Patched DLDI driver at ROM offset 0x%X\n", offset + i);
         patched = true;
+#if NOODS_JIT
+        ArmPpcJit::invalidateAll();
+#endif
     }
 }
 

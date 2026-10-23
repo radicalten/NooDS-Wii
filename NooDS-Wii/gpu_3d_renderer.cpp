@@ -71,13 +71,70 @@ void Gpu3DRenderer::loadState(FILE *file) {
     fread(toonTable, 2, sizeof(toonTable) / 2, file);
 }
 
+namespace {
+struct Gpu3DRenderLuts {
+    uint32_t rgb5To6[32768];
+    uint32_t alpha5To6[32];
+    struct UDivEntry {
+        uint32_t mul;
+        uint8_t add;
+        uint8_t shift;
+    } udiv[1025];
+
+    Gpu3DRenderLuts() {
+        for (uint32_t c = 0; c < 32768; c++) {
+            uint32_t r = ((c >> 0) & 0x1F) * 2; if (r > 0) r++;
+            uint32_t g = ((c >> 5) & 0x1F) * 2; if (g > 0) g++;
+            uint32_t b = ((c >> 10) & 0x1F) * 2; if (b > 0) b++;
+            rgb5To6[c] = (b << 12) | (g << 6) | r;
+        }
+        for (uint32_t a = 0; a < 32; a++) {
+            uint32_t a6 = a * 2; if (a6 > 0) a6++;
+            alpha5To6[a] = a6 << 18;
+        }
+        udiv[0] = { 0, 2, 0 };
+        for (uint32_t d = 1; d <= 1024; d++) {
+            if ((d & (d - 1)) == 0) {
+                uint8_t sh = 0;
+                for (uint32_t t = d; t > 1; t >>= 1) sh++;
+                udiv[d] = { 0, 2, sh };
+            } else {
+                uint64_t nc = ((uint64_t)(0xFFFFFFFFu / d) * d) - 1u;
+                for (uint32_t p = 32; p < 64; p++) {
+                    uint64_t twoP = 1ULL << p;
+                    uint64_t rem = (twoP - 1u) % d;
+                    if (twoP > nc * (d - 1u - rem)) {
+                        uint64_t m = (twoP + d - 1u - rem) / d;
+                        if (m < (1ULL << 32))
+                            udiv[d] = { (uint32_t)m, 0, (uint8_t)(p - 32) };
+                        else
+                            udiv[d] = { (uint32_t)m, 1, (uint8_t)(p - 32) };
+                        break;
+                    }
+                }
+            }
+        }
+    }
+};
+static const Gpu3DRenderLuts s_3dLuts;
+
+static inline uint32_t udivSpan(uint32_t n, uint32_t d) {
+    if (__builtin_expect(d <= 1024, 1)) {
+        const auto &e = s_3dLuts.udiv[d];
+        if (e.add == 2) return n >> e.shift;
+        uint32_t q = (uint32_t)(((uint64_t)n * e.mul) >> 32);
+        if (e.add == 1) {
+            q = ((n - q) >> 1) + q;
+            return q >> (e.shift - 1);
+        }
+        return q >> e.shift;
+    }
+    return n / d;
+}
+} // namespace
+
 uint32_t Gpu3DRenderer::rgba5ToRgba6(uint32_t color) {
-    // Convert an RGBA5 value to an RGBA6 value
-    uint8_t r = ((color >> 0) & 0x1F) * 2; if (r > 0) r++;
-    uint8_t g = ((color >> 5) & 0x1F) * 2; if (g > 0) g++;
-    uint8_t b = ((color >> 10) & 0x1F) * 2; if (b > 0) b++;
-    uint8_t a = ((color >> 15) & 0x1F) * 2; if (a > 0) a++;
-    return (a << 18) | (b << 12) | (g << 6) | r;
+    return s_3dLuts.alpha5To6[(color >> 15) & 0x1Fu] | s_3dLuts.rgb5To6[color & 0x7FFFu];
 }
 
 uint32_t *Gpu3DRenderer::getLine(int line) {
@@ -145,9 +202,12 @@ uint32_t *Gpu3DRenderer::getLine1(int line) {
 void Gpu3DRenderer::drawScanline(int line) {
     if (line == 0) {
         // Calculate the scanline bounds for each polygon
-        for (int i = 0; i < core->gpu3D.polygonCountOut; i++) {
+        const int polyCount = core->gpu3D.polygonCountOut;
+        const bool edgeMark = (disp3DCnt & BIT(5)) != 0;
+        for (int i = 0; i < polyCount; i++) {
             polygonTop[i] = 192 * 2;
             polygonBot[i] = 0 * 2;
+            polygonSharesSameIdOpaqueEdge[i] = false;
 
             _Polygon *polygon = &core->gpu3D.polygonsOut[i];
             for (int j = 0; j < polygon->size; j++) {
@@ -157,6 +217,38 @@ void Gpu3DRenderer::drawScanline(int line) {
             }
 
             if (polygonTop[i] == polygonBot[i]) polygonBot[i]++;
+        }
+
+        if (edgeMark) {
+            for (int i = 0; i < polyCount; i++) {
+                _Polygon *polygon = &core->gpu3D.polygonsOut[i];
+                if (polygon->size != 3 || polygon->alpha != 63 || polygonSharesSameIdOpaqueEdge[i])
+                    continue;
+                for (int otherIndex = i + 1; otherIndex < polyCount; otherIndex++) {
+                    _Polygon *other = &core->gpu3D.polygonsOut[otherIndex];
+                    if (other->size < 3 || other->alpha != 63 || other->id != polygon->id)
+                        continue;
+                    bool shared = false;
+                    for (int a = 0; a < polygon->size && !shared; a++) {
+                        Vertex *a0 = &core->gpu3D.verticesOut[polygon->vertices + a];
+                        Vertex *a1 = &core->gpu3D.verticesOut[polygon->vertices + ((a + 1) % polygon->size)];
+                        for (int b = 0; b < other->size; b++) {
+                            Vertex *b0 = &core->gpu3D.verticesOut[other->vertices + b];
+                            Vertex *b1 = &core->gpu3D.verticesOut[other->vertices + ((b + 1) % other->size)];
+                            if ((a0->x == b0->x && a0->y == b0->y && a1->x == b1->x && a1->y == b1->y) ||
+                                (a0->x == b1->x && a0->y == b1->y && a1->x == b0->x && a1->y == b0->y)) {
+                                shared = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (shared) {
+                        polygonSharesSameIdOpaqueEdge[i] = true;
+                        if (other->size == 3)
+                            polygonSharesSameIdOpaqueEdge[otherIndex] = true;
+                    }
+                }
+            }
         }
 
         resShift = Settings::highRes3D;
@@ -301,7 +393,8 @@ void Gpu3DRenderer::drawScanline1(int line) {
 
     stencilClear[line] = false;
 
-    std::vector<int> translucent;
+    int translucent[2048];
+    int translucentCount = 0;
 
     for (int i = 0; i < core->gpu3D.polygonCountOut; i++) {
         if (line < polygonTop[i] || line >= polygonBot[i])
@@ -309,12 +402,12 @@ void Gpu3DRenderer::drawScanline1(int line) {
 
         _Polygon *polygon = &core->gpu3D.polygonsOut[i];
         if (polygon->alpha < 0x3F || polygon->textureFmt == 1 || polygon->textureFmt == 6)
-            translucent.push_back(i);
+            translucent[translucentCount++] = i;
         else
             drawPolygon(line, i);
     }
 
-    for (unsigned int i = 0; i < translucent.size(); i++)
+    for (int i = 0; i < translucentCount; i++)
         drawPolygon(line, translucent[i]);
 }
 
@@ -420,9 +513,9 @@ uint32_t Gpu3DRenderer::interpolateLinear(uint32_t v1, uint32_t v2, uint32_t x1,
     if (x >= x2) return v2;
 
     if (v1 <= v2)
-        return v1 + (v2 - v1) * (x - x1) / (x2 - x1);
+        return v1 + udivSpan((v2 - v1) * (x - x1), x2 - x1);
     else
-        return v2 + (v1 - v2) * (x2 - x) / (x2 - x1);
+        return v2 + udivSpan((v1 - v2) * (x2 - x), x2 - x1);
 }
 
 uint32_t Gpu3DRenderer::interpolateLinRev(uint32_t v1, uint32_t v2, uint32_t x1, uint32_t x, uint32_t x2) {
@@ -430,9 +523,9 @@ uint32_t Gpu3DRenderer::interpolateLinRev(uint32_t v1, uint32_t v2, uint32_t x1,
     if (x >= x2) return v2;
 
     if (v1 <= v2)
-        return v2 - (v2 - v1) * (x2 - x) / (x2 - x1);
+        return v2 - udivSpan((v2 - v1) * (x2 - x), x2 - x1);
     else
-        return v1 - (v1 - v2) * (x - x1) / (x2 - x1);
+        return v1 - udivSpan((v1 - v2) * (x - x1), x2 - x1);
 }
 
 uint32_t Gpu3DRenderer::interpolateFactor(uint32_t factor, uint32_t shift, uint32_t v1, uint32_t v2) {
@@ -623,6 +716,44 @@ void Gpu3DRenderer::drawPolygon(int line, int polygonIndex) {
     if (polygon->crossed)
         SWAP(vertices[2], vertices[3]);
 
+    bool shallowXMajorEdge = false;
+    if (polygon->size == 4) {
+        for (int edge = 0; edge < 4; edge++) {
+            Vertex *a = vertices[edge];
+            Vertex *b = vertices[(edge + 1) & 3];
+            if (abs(b->x - a->x) > abs(b->y - a->y) * 4)
+                shallowXMajorEdge = true;
+        }
+    }
+
+    bool duplicateAdjacent = false;
+    bool allSameY = true;
+    bool thinTriangle = false;
+    for (int i = 0; i < polygon->size; i++) {
+        int next = (i + 1) % polygon->size;
+        if (vertices[i]->x == vertices[next]->x && vertices[i]->y == vertices[next]->y)
+            duplicateAdjacent = true;
+        if (vertices[i]->y != vertices[0]->y)
+            allSameY = false;
+    }
+    if (polygon->size == 3 && !duplicateAdjacent && !allSameY) {
+        int64_t dx1 = int64_t(vertices[1]->x) - vertices[0]->x;
+        int64_t dy1 = int64_t(vertices[1]->y) - vertices[0]->y;
+        int64_t dx2 = int64_t(vertices[2]->x) - vertices[0]->x;
+        int64_t dy2 = int64_t(vertices[2]->y) - vertices[0]->y;
+        int64_t area = dx1 * dy2 - dy1 * dx2;
+        if (area == 0) return;
+
+        int64_t maxDelta = abs(vertices[1]->x - vertices[0]->x);
+        if (abs(vertices[1]->y - vertices[0]->y) > maxDelta) maxDelta = abs(vertices[1]->y - vertices[0]->y);
+        if (abs(vertices[2]->x - vertices[0]->x) > maxDelta) maxDelta = abs(vertices[2]->x - vertices[0]->x);
+        if (abs(vertices[2]->y - vertices[0]->y) > maxDelta) maxDelta = abs(vertices[2]->y - vertices[0]->y);
+        if (abs(vertices[2]->x - vertices[1]->x) > maxDelta) maxDelta = abs(vertices[2]->x - vertices[1]->x);
+        if (abs(vertices[2]->y - vertices[1]->y) > maxDelta) maxDelta = abs(vertices[2]->y - vertices[1]->y);
+
+        thinTriangle = (area > -maxDelta && area < maxDelta);
+    }
+
     int start = 0;
     for (int i = 0; i < polygon->size; i++) {
         if (vertices[start]->y > vertices[i]->y)
@@ -654,8 +785,41 @@ void Gpu3DRenderer::drawPolygon(int line, int polygonIndex) {
     if (vertices[v[0]]->y > vertices[v[1]]->y) SWAP(v[0], v[1]);
     if (vertices[v[2]]->y > vertices[v[3]]->y) SWAP(v[2], v[3]);
 
+    // Degenerate horizontal polygons use one of their surviving line segments,
+    // rather than the two independently selected scanline chains above.
+    bool horizontalLine = polygon->size >= 3;
+    for (int i = 1; i < polygon->size; i++)
+        if (vertices[i]->y != vertices[0]->y) horizontalLine = false;
+    if (horizontalLine && line == vertices[0]->y) {
+        int left = -1, right = -1;
+        bool clippedAtLeft = false;
+        for (int i = 0; i < polygon->size; i++)
+            if (vertices[i]->x == 0) clippedAtLeft = true;
+
+        if (clippedAtLeft) {
+            for (int i = 0; i < polygon->size; i++) {
+                if (vertices[i]->x == 0 && left < 0) left = i;
+                if (vertices[i]->x > 0 && (right < 0 || vertices[i]->x < vertices[right]->x)) right = i;
+            }
+        }
+        else {
+            for (int i = 0; i < polygon->size; i++) {
+                if (polygon->size == 4 && i == 2) continue;
+                if (left < 0 || vertices[i]->x < vertices[left]->x) left = i;
+                if (right < 0 || vertices[i]->x > vertices[right]->x) right = i;
+            }
+        }
+
+        if (left >= 0 && right >= 0) {
+            v[0] = left; v[1] = right;
+            v[2] = left; v[3] = right;
+        }
+    }
+
     uint32_t x1, x2, x3, x4;
     uint32_t x1a = 0x3F, x2a = 0x3F, x3a = 0x3F, x4a = 0x3F;
+    bool aaRightXMajor = false;
+    int aaRightX0 = 0, aaRightY0 = 0, aaRightX1 = 0, aaRightY1 = 0;
 
     if (vertices[v[0]]->y == vertices[v[1]]->y) {
         x1 = vertices[v[0]]->x;
@@ -691,10 +855,17 @@ void Gpu3DRenderer::drawPolygon(int line, int polygonIndex) {
         x2 >>= 1;
     }
     else {
-        if (vertices[v[0]]->x > vertices[v[1]]->x)
-            x1 = interpolateLinRev(vertices[v[0]]->x << 6, vertices[v[1]]->x << 6, vertices[v[0]]->y, line, vertices[v[1]]->y) - 1;
-        else
+        int dx = abs(vertices[v[1]]->x - vertices[v[0]]->x);
+        int dy = vertices[v[1]]->y - vertices[v[0]]->y;
+        if (vertices[v[0]]->x > vertices[v[1]]->x) {
+            x1 = interpolateLinRev(vertices[v[0]]->x << 6, vertices[v[1]]->x << 6, vertices[v[0]]->y, line, vertices[v[1]]->y);
+            if (dx == dy || line == vertices[v[0]]->y || (x1 & 0x3F) != 0) x1--;
+        }
+        else {
             x1 = interpolateLinear(vertices[v[0]]->x << 6, vertices[v[1]]->x << 6, vertices[v[0]]->y, line, vertices[v[1]]->y);
+            if (dx > 0 && dx < dy && line > vertices[v[0]]->y && (x1 & 0x3F) == 0 && x1 >= 0x40)
+                x1 -= 0x40;
+        }
 
         if (disp3DCnt & BIT(4)) {
             if (abs(vertices[v[1]]->x - vertices[v[0]]->x) == vertices[v[1]]->y - vertices[v[0]]->y)
@@ -721,9 +892,13 @@ void Gpu3DRenderer::drawPolygon(int line, int polygonIndex) {
         x4 = x3;
     }
     else if (abs(vertices[v[3]]->x - vertices[v[2]]->x) > vertices[v[3]]->y - vertices[v[2]]->y) {
+        aaRightXMajor = true;
+        aaRightX0 = vertices[v[2]]->x;
+        aaRightY0 = vertices[v[2]]->y;
+        aaRightX1 = vertices[v[3]]->x;
+        aaRightY1 = vertices[v[3]]->y;
         x3 = interpolateLinear(vertices[v[2]]->x << 1, vertices[v[3]]->x << 1, vertices[v[2]]->y, line, vertices[v[3]]->y) + 1;
         x4 = interpolateLinear(vertices[v[2]]->x << 1, vertices[v[3]]->x << 1, vertices[v[2]]->y, line + 1, vertices[v[3]]->y) + 1;
-
         bool negative = (vertices[v[2]]->x > vertices[v[3]]->x);
 
         if (negative) {
@@ -745,10 +920,17 @@ void Gpu3DRenderer::drawPolygon(int line, int polygonIndex) {
         x4 >>= 1;
     }
     else {
-        if (vertices[v[2]]->x > vertices[v[3]]->x)
-            x3 = interpolateLinRev(vertices[v[2]]->x << 6, vertices[v[3]]->x << 6, vertices[v[2]]->y, line, vertices[v[3]]->y) - 1;
-        else
+        int dx = abs(vertices[v[3]]->x - vertices[v[2]]->x);
+        int dy = vertices[v[3]]->y - vertices[v[2]]->y;
+        if (vertices[v[2]]->x > vertices[v[3]]->x) {
+            x3 = interpolateLinRev(vertices[v[2]]->x << 6, vertices[v[3]]->x << 6, vertices[v[2]]->y, line, vertices[v[3]]->y);
+            if (dx == dy || line == vertices[v[2]]->y || (x3 & 0x3F) != 0) x3--;
+        }
+        else {
             x3 = interpolateLinear(vertices[v[2]]->x << 6, vertices[v[3]]->x << 6, vertices[v[2]]->y, line, vertices[v[3]]->y);
+            if (dx > 0 && dx < dy && line > vertices[v[2]]->y && (x3 & 0x3F) == 0 && x3 >= 0x40)
+                x3 -= 0x40;
+        }
 
         if (disp3DCnt & BIT(4)) {
             if (abs(vertices[v[3]]->x - vertices[v[2]]->x) == vertices[v[3]]->y - vertices[v[2]]->y)
@@ -768,13 +950,119 @@ void Gpu3DRenderer::drawPolygon(int line, int polygonIndex) {
     if (x2 > x3) { x3 = x2; }
     if (x3 > x4) { x3 = x4; x3a = 0x3F - x3a; x4a = 0x3F - x4a; }
 
-    if (x1 > x4) {
+    bool oldRightEdgeWasVertical = (vertices[v[2]]->x == vertices[v[3]]->x);
+    bool swappedEdges = (x1 > x4);
+    if (swappedEdges) {
         SWAP(v[0], v[2]);
         SWAP(v[1], v[3]);
         SWAP(x1, x3);
         SWAP(x2, x4);
         SWAP(x1a, x3a);
         SWAP(x2a, x4a);
+    }
+
+    // The vertical-right-edge shift follows the edge after chain reordering,
+    // but must not be applied twice to an edge that was already vertical.
+    if (swappedEdges && !oldRightEdgeWasVertical && polygon->alpha == 63 && !(disp3DCnt & BIT(4)) &&
+        vertices[v[2]]->x == vertices[v[3]]->x &&
+        (vertices[v[0]]->x != vertices[v[1]]->x || vertices[v[0]]->x != vertices[v[2]]->x) && x3 > 0) {
+        x3--;
+        x4--;
+    }
+
+    // Correct the exact-boundary bias on reordered opaque quad Y-major edges.
+    if (polygon->size == 4 && polygon->alpha == 63 && !(disp3DCnt & BIT(4))) {
+        if (swappedEdges) {
+            int leftDx = abs(vertices[v[1]]->x - vertices[v[0]]->x);
+            int leftDy = vertices[v[1]]->y - vertices[v[0]]->y;
+            if (leftDx > 0 && leftDx < leftDy && vertices[v[0]]->x > vertices[v[1]]->x &&
+                line > vertices[v[0]]->y) {
+                uint32_t leftRaw = interpolateLinRev(vertices[v[0]]->x << 6, vertices[v[1]]->x << 6,
+                    vertices[v[0]]->y, line, vertices[v[1]]->y);
+                if ((leftRaw & 0x3F) == 0 && x1 > 0) x1--;
+            }
+
+            int rightDx = abs(vertices[v[3]]->x - vertices[v[2]]->x);
+            int rightDy = vertices[v[3]]->y - vertices[v[2]]->y;
+            if (rightDx > 0 && rightDx < rightDy && vertices[v[2]]->x < vertices[v[3]]->x &&
+                line > vertices[v[2]]->y) {
+                uint32_t rightRaw = interpolateLinear(vertices[v[2]]->x << 6, vertices[v[3]]->x << 6,
+                    vertices[v[2]]->y, line, vertices[v[3]]->y);
+                if ((rightRaw & 0x3F) == 0) { x3++; x4++; }
+            }
+        }
+        else if (x1 == x4 && vertices[v[0]]->x < vertices[v[1]]->x) {
+            int leftDx = abs(vertices[v[1]]->x - vertices[v[0]]->x);
+            int leftDy = vertices[v[1]]->y - vertices[v[0]]->y;
+            if (leftDx > 0 && leftDx < leftDy && line == vertices[v[0]]->y + 1 && x1 > 0) {
+                uint32_t leftRaw = interpolateLinear(vertices[v[0]]->x << 6, vertices[v[1]]->x << 6,
+                    vertices[v[0]]->y, line, vertices[v[1]]->y);
+                if ((leftRaw & 0x3F) != 0) x1--;
+            }
+        }
+    }
+
+    // A translucent blended quad can also need the exact-boundary correction
+    // after its original vertical right edge moves to a Y-major right span.
+    if (polygon->size == 4 && polygon->alpha > 0 && polygon->alpha < 63 &&
+        (disp3DCnt & BIT(3)) && !(disp3DCnt & BIT(4)) &&
+        swappedEdges && oldRightEdgeWasVertical) {
+        int rightDx = abs(vertices[v[3]]->x - vertices[v[2]]->x);
+        int rightDy = vertices[v[3]]->y - vertices[v[2]]->y;
+        if (rightDx > 0 && rightDx < rightDy && vertices[v[2]]->x < vertices[v[3]]->x &&
+            line > vertices[v[2]]->y) {
+            uint32_t rightRaw = interpolateLinear(vertices[v[2]]->x << 6, vertices[v[3]]->x << 6,
+                vertices[v[2]]->y, line, vertices[v[3]]->y);
+            if ((rightRaw & 0x3F) == 0) { x3++; x4++; }
+        }
+    }
+
+    // X-major translucent triangle edges use the DS's quantized 18-bit
+    // slope accumulator rather than a fresh exact division on every row.
+    if (polygon->size == 3 && polygon->alpha > 0 && polygon->alpha < 63 &&
+        !(disp3DCnt & (BIT(4) | BIT(5)))) {
+        int32_t edge0 = v[0], edge1 = v[1];
+        int32_t x0 = vertices[edge0]->x, y0 = vertices[edge0]->y;
+        int32_t x1v = vertices[edge1]->x, y1v = vertices[edge1]->y;
+        if (y0 > y1v) {
+            int32_t tmp = x0; x0 = x1v; x1v = tmp;
+            tmp = y0; y0 = y1v; y1v = tmp;
+        }
+        int32_t edgeDx = x1v - x0;
+        int32_t edgeDy = y1v - y0;
+        int32_t edgeXLen = abs(edgeDx);
+        if (edgeDy > 0 && edgeXLen > edgeDy) {
+            int32_t reciprocal = (1 << 18) / edgeDy;
+            int32_t increment = abs(edgeDx * reciprocal);
+            bool negative = (edgeDx < 0);
+            bool xMajor = increment > 0x40000;
+            if (xMajor) {
+                int32_t dx;
+                bool rightSide = swappedEdges;
+                if (rightSide)
+                    dx = negative ? 0x60000 : increment - 0x20000;
+                else
+                    dx = negative ? increment + 0x20000 : 0x20000;
+                dx += (line - y0) * increment;
+
+                int32_t edgeStart = negative ? x0 - (dx >> 18) : x0 + (dx >> 18);
+                int32_t edgeMin = (x1v < x0) ? x1v : x0;
+                int32_t edgeMax = ((x1v > x0) ? x1v : x0) - 1;
+                if (edgeStart < edgeMin) edgeStart = edgeMin;
+                if (edgeStart > edgeMax) edgeStart = edgeMax;
+
+                int32_t edgeLength;
+                if (rightSide ^ negative)
+                    edgeLength = (dx >> 18) - ((dx - increment) >> 18);
+                else
+                    edgeLength = ((dx + increment) >> 18) - (dx >> 18);
+
+                if (edgeLength > 0 && edgeStart >= 0 && edgeStart < 256) {
+                    x1 = (uint32_t)edgeStart;
+                    x2 = (uint32_t)(edgeStart + edgeLength - 1);
+                }
+            }
+        }
     }
 
     uint32_t xe1[2], xe[2], xe2[2];
@@ -793,6 +1081,9 @@ void Gpu3DRenderer::drawPolygon(int line, int polygonIndex) {
         hideLeft = false;
     }
 
+    if (polygon->size == 3 && duplicateAdjacent)
+        hideLeft = false;
+
     if (abs(vertices[v[3]]->x - vertices[v[2]]->x) > abs(vertices[v[3]]->y - vertices[v[2]]->y)) {
         xe1[1] = vertices[v[2]]->x;
         xe[1] = x4;
@@ -805,6 +1096,16 @@ void Gpu3DRenderer::drawPolygon(int line, int polygonIndex) {
         xe2[1] = vertices[v[3]]->y;
         hideRight = (vertices[v[2]]->x != vertices[v[3]]->x);
     }
+
+    if (thinTriangle && line >= polygonTop[polygonIndex] +
+        (polygonBot[polygonIndex] - polygonTop[polygonIndex] + 1) / 2)
+        hideRight = true;
+
+    // When chain reordering moves an originally vertical right edge, the DS
+    // keeps its always-filled edge decision for a non-X-major right span.
+    if (polygon->size == 4 && swappedEdges && oldRightEdgeWasVertical &&
+        abs(vertices[v[3]]->x - vertices[v[2]]->x) <= abs(vertices[v[3]]->y - vertices[v[2]]->y))
+        hideRight = false;
 
     uint32_t ws[4];
     if (polygon->wShift >= 0) {
@@ -865,16 +1166,136 @@ void Gpu3DRenderer::drawPolygon(int line, int polygonIndex) {
         stencilClear[line] = false;
     }
 
+    const bool sharesSameIdOpaqueEdge = polygonSharesSameIdOpaqueEdge[polygonIndex];
+
     uint32_t x1e = x1, x4e = ++x4;
 
-    if (polygon->alpha != 0 && !(disp3DCnt & (BIT(4) | BIT(5)))) {
+    if (polygon->alpha != 0 && !(disp3DCnt & BIT(4)) &&
+        (!(disp3DCnt & BIT(5)) || (polygon->size == 3 && sharesSameIdOpaqueEdge))) {
         if (hideLeft) x1e = x2 + 1;
         if (hideRight) x4e = x3;
         if (!(hideLeft && hideRight) && x4e <= x1e)
             x4e = x1e + 1;
     }
 
+    // A duplicated top vertex in a line-shaped quad emits the far sample of
+    // the collapsed first span, not the whole zero-width start.
+    if (polygon->size == 4 && polygon->alpha == 63 &&
+        !(disp3DCnt & (BIT(4) | BIT(5))) && !swappedEdges && hideLeft &&
+        line == polygonTop[polygonIndex] &&
+        vertices[v[0]]->x == vertices[v[2]]->x && vertices[v[0]]->y == vertices[v[2]]->y &&
+        x1 == x2 && x2 == x3 && x4 > x1 + 2)
+        x1e = x4 - 1;
+
+    // Once both edge chains collapse onto the same line, keep its leftmost
+    // sample; ordinary left-edge hiding otherwise drops it on every row.
+    if (polygon->size == 4 && polygon->alpha == 63 &&
+        !(disp3DCnt & (BIT(4) | BIT(5))) && !swappedEdges && hideLeft &&
+        vertices[v[0]]->x == vertices[v[2]]->x && vertices[v[0]]->y == vertices[v[2]]->y &&
+        vertices[v[1]]->x == vertices[v[3]]->x && vertices[v[1]]->y == vertices[v[3]]->y &&
+        line > vertices[v[0]]->y) {
+        x1e = x1;
+        const uint32_t lineRaw = interpolateLinear(vertices[v[0]]->x << 6, vertices[v[1]]->x << 6,
+            vertices[v[0]]->y, line, vertices[v[1]]->y);
+        const uint32_t nextRaw = interpolateLinear(vertices[v[0]]->x << 6, vertices[v[1]]->x << 6,
+            vertices[v[0]]->y, line + 1, vertices[v[1]]->y);
+        // Exact half-pixel endpoints belong to the lower sample on this shared line.
+        if ((lineRaw & 0x3F) == 0x20 && x1 > 0) {
+            x1--;
+            x1e = x1;
+        }
+        if ((nextRaw & 0x3F) == 0x20 && x4 > 0) {
+            x4--;
+            x4e = x4;
+        }
+    }
+
+    // Shared-start quads retain the next fixed-point sample at this specific
+    // Q6 edge phase; include x2 instead of discarding the last covered pixel.
+    if (polygon->size == 4 && polygon->alpha == 63 &&
+        !(disp3DCnt & (BIT(4) | BIT(5))) && !swappedEdges && hideLeft &&
+        vertices[v[0]]->x == vertices[v[2]]->x && vertices[v[0]]->y == vertices[v[2]]->y &&
+        (vertices[v[1]]->x != vertices[v[3]]->x || vertices[v[1]]->y != vertices[v[3]]->y) &&
+        vertices[v[0]]->x < vertices[v[1]]->x && vertices[v[0]]->y < vertices[v[1]]->y &&
+        x2 > x1) {
+        const uint32_t leftRaw = interpolateLinear(vertices[v[0]]->x << 6, vertices[v[1]]->x << 6,
+            vertices[v[0]]->y, line, vertices[v[1]]->y);
+        if ((leftRaw & 0x3F) == 0x31)
+            x1e = x2;
+    }
+
+    // On a positive X-major left edge, the edge pixel at x2 is included
+    // on scanlines where the quantized edge advance equals the integer
+    // slope. The bottom-most scanline also includes a collapsed edge pixel.
+    if (polygon->size == 4 && polygon->alpha == 63 &&
+        !(disp3DCnt & (BIT(4) | BIT(5))) && !swappedEdges && hideLeft &&
+        vertices[v[0]]->x < vertices[v[1]]->x &&
+        vertices[v[0]]->y < vertices[v[1]]->y &&
+        vertices[v[1]]->y == vertices[v[2]]->y) {
+        const int32_t leftDx = vertices[v[1]]->x - vertices[v[0]]->x;
+        const int32_t leftDy = vertices[v[1]]->y - vertices[v[0]]->y;
+        if (leftDx > leftDy && leftDy > 0 && x2 >= x1 &&
+            (int32_t)(x2 - x1) == leftDx / leftDy)
+            x1e = x2;
+        if (line == polygonBot[polygonIndex] - 1 && vertices[v[1]]->y == vertices[v[2]]->y) {
+            if (x1 == x2)
+                x1e = x1;
+            if (x3 + 1 == x4)
+                x4e = x4;
+        }
+    }
+
+    // When the bottom edge is clipped at the screen boundary, include both
+    // scanline edge spans rather than dropping their endpoint pixels.
+    if (polygon->size == 4 && polygon->alpha == 63 &&
+        !(disp3DCnt & (BIT(4) | BIT(5))) && !swappedEdges &&
+        line == polygonBot[polygonIndex] - 1 &&
+        vertices[v[1]]->y >= 192 && vertices[v[2]]->y >= 192) {
+        if (x1 > 0) x1--;
+        x1e = x1;
+        x4e = x4;
+    }
+
     bool horizontal = (line == polygonTop[polygonIndex] || line == polygonBot[polygonIndex] - 1);
+
+    // A flat-bottom opaque quad with an X-major down-right edge has one
+    // exclusive sample on swapped rows, but keeps its full closing endpoint.
+    const bool flatBottomXMajorQuad = polygon->size == 4 && polygon->alpha == 63 &&
+        !(disp3DCnt & (BIT(4) | BIT(5))) &&
+        vertices[0]->y < vertices[1]->y && vertices[1]->y == vertices[2]->y &&
+        vertices[0]->y < vertices[3]->y && vertices[3]->y < vertices[1]->y &&
+        vertices[3]->x < vertices[0]->x && vertices[0]->x < vertices[1]->x &&
+        vertices[1]->x < vertices[2]->x &&
+        vertices[1]->x - vertices[0]->x > vertices[1]->y - vertices[0]->y;
+    if (flatBottomXMajorQuad && x2 > x1) {
+        if (swappedEdges && !horizontal && x1e == x1)
+            x1e = x2;
+        else if (!swappedEdges && horizontal && line == polygonBot[polygonIndex] - 1 && x1e > x1)
+            x1e = x1;
+    }
+
+    // A wireframe quad's advancing X-major left edge carries the next
+    // endpoint onto the following scanline instead of drawing it early.
+    if (polygon->alpha == 0 && polygon->size == 4 && !horizontal && !swappedEdges &&
+        vertices[v[0]]->x < vertices[v[1]]->x &&
+        abs(vertices[v[1]]->x - vertices[v[0]]->x) > vertices[v[1]]->y - vertices[v[0]]->y &&
+        line > vertices[v[0]]->y && line <= vertices[v[1]]->y) {
+        const uint32_t rowX1 = x1;
+        const bool deferEnd = (x2 > x1);
+        uint32_t previousX1 = interpolateLinear(vertices[v[0]]->x << 1, vertices[v[1]]->x << 1,
+            vertices[v[0]]->y, line - 1, vertices[v[1]]->y) + 1;
+        uint32_t previousX2 = interpolateLinear(vertices[v[0]]->x << 1, vertices[v[1]]->x << 1,
+            vertices[v[0]]->y, line, vertices[v[1]]->y) + 1;
+        previousX1 >>= 1;
+        previousX2 >>= 1;
+        if (previousX2 > previousX1) previousX2--;
+        if (previousX2 > previousX1 && previousX2 < x1) {
+            x1 = previousX2;
+            x1e = previousX2;
+        }
+        if (deferEnd)
+            x2 = rowX1;
+    }
 
     int lastS = 0xFFFF, lastT = 0xFFFF;
     uint32_t texel;
@@ -922,8 +1343,16 @@ void Gpu3DRenderer::drawPolygon(int line, int polygonIndex) {
                 (depthBuffer[1][i] >= depth - margin && depthBuffer[1][i] <= depth + margin);
         }
         else {
-            depthPass[0] = (depthBuffer[0][i] > depth);
-            depthPass[1] = (disp3DCnt & BIT(4)) && (attribBuffer[0][i] & BIT(14)) && (depthBuffer[1][i] > depth);
+            bool topQuadOutlineEdge = polygon->size == 4 && polygon->alpha == 63 &&
+                (disp3DCnt & BIT(5)) && shallowXMajorEdge &&
+                line == polygonTop[polygonIndex] + 1 && x >= (int)x3;
+            bool sameIdOutlineEdge = topQuadOutlineEdge && (attribBuffer[0][i] & BIT(14)) &&
+                ((attribBuffer[0][i] & 0x3F) == polygon->id);
+            uint32_t pixelDepth24 = (uint32_t)depth & 0x00FFFFFF;
+            bool wrappedDepthPass = (((uint32_t)depthBuffer[0][i] & 0x00FFFFFF) > pixelDepth24);
+            depthPass[0] = (depthBuffer[0][i] > depth) || (sameIdOutlineEdge && wrappedDepthPass);
+            depthPass[1] = (disp3DCnt & BIT(4)) && (attribBuffer[0][i] & BIT(14)) &&
+                (depthBuffer[1][i] > depth);
         }
 
         if (polygon->mode == 3) {
@@ -1047,10 +1476,49 @@ void Gpu3DRenderer::drawPolygon(int line, int polygonIndex) {
                 depthBuffer[1][i] = depthBuffer[0][i];
                 attribBuffer[1][i] = attribBuffer[0][i];
 
-                if (x <= x2)
+                if (x <= x2 && x >= x3) {
+                    uint8_t leftAlpha = interpolateLinear(x1a, x2a, x1, x, x2);
+                    uint8_t rightAlpha = interpolateLinear(x3a, x4a, x3, x, x4);
+                    edgeAlpha = (leftAlpha > rightAlpha) ? leftAlpha : rightAlpha;
+                }
+                else if (x <= x2)
                     edgeAlpha = interpolateLinear(x1a, x2a, x1, x, x2);
                 else if (x >= x3)
                     edgeAlpha = interpolateLinear(x3a, x4a, x3, x, x4);
+
+                // DS edge coverage uses a truncated 18-bit reciprocal. A few
+                // X-major endpoint samples therefore have exactly zero coverage
+                // even when the linear edge-alpha interpolation rounds above zero.
+                if (aaRightXMajor && !swappedEdges && x > x2 && x >= x3 &&
+                    polygon->alpha == 63 && polygon->size > 4) {
+                    int edgeDx = abs(aaRightX1 - aaRightX0);
+                    int edgeDy = aaRightY1 - aaRightY0;
+                    if (edgeDx > 0 && edgeDy > 0) {
+                        int increment = edgeDx * ((1 << 18) / edgeDy);
+                        if (increment > 0x40000) {
+                            bool negative = aaRightX1 < aaRightX0;
+                            int dx = negative ? 0x60000 : (increment - 0x20000);
+                            dx += (line - aaRightY0) * increment;
+                            int dxWhole = dx >> 18;
+                            int length = (negative ? ((dx + increment) >> 18) - dxWhole :
+                                dxWhole - ((dx - increment) >> 18));
+                            int startX = negative ? edgeDx - dxWhole : dxWhole;
+                            startX = startX - length + 1;
+                            int xMin = (aaRightX0 < aaRightX1) ? aaRightX0 : aaRightX1;
+                            int xMax = ((aaRightX0 > aaRightX1) ? aaRightX0 : aaRightX1) - 1;
+                            int edgeEnd = negative ? aaRightX0 - dxWhole : aaRightX0 + dxWhole;
+                            if (edgeEnd < xMin) edgeEnd = xMin;
+                            if (edgeEnd > xMax) edgeEnd = xMax;
+                            int edgeStart = xMin + startX;
+                            if ((int)x >= edgeStart && (int)x <= edgeEnd) {
+                                int startCov = (((startX << 10) + 0x1FF) * edgeDy) / edgeDx;
+                                int xCov = (startCov & 0x3FF) + ((int)x - edgeStart) * ((edgeDy << 10) / edgeDx);
+                                int coverage = 31 - (xCov >> 5);
+                                if (coverage <= 0) edgeAlpha = 0;
+                            }
+                        }
+                    }
+                }
             }
 
             framebuffer[layer][i] = BIT(26) | color;

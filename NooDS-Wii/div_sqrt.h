@@ -40,8 +40,8 @@ public:
     uint32_t readDivResultH() { return divResult >> 32; }
     uint32_t readDivRemResultL() { return divRemResult; }
     uint32_t readDivRemResultH() { return divRemResult >> 32; }
-    uint16_t readSqrtCnt() { return sqrtCnt; }
-    uint32_t readSqrtResult() { return sqrtResult; }
+    uint16_t readSqrtCnt();
+    uint32_t readSqrtResult();
     uint32_t readSqrtParamL() { return sqrtParam; }
     uint32_t readSqrtParamH() { return sqrtParam >> 32; }
 
@@ -53,6 +53,7 @@ public:
     void writeSqrtCnt(uint16_t mask, uint16_t value);
     void writeSqrtParamL(uint32_t mask, uint32_t value);
     void writeSqrtParamH(uint32_t mask, uint32_t value);
+    void resetCycles(uint32_t elapsedCycles);
 
 private:
     Core *core;
@@ -66,7 +67,10 @@ private:
     uint16_t sqrtCnt = 0;
     uint32_t sqrtResult = 0;
     uint64_t sqrtParam = 0;
+    uint32_t sqrtReadyCycle = 0;
 
     void divide();
     void squareRoot();
+    void updateSquareRoot();
+    void scheduleSquareRoot();
 };

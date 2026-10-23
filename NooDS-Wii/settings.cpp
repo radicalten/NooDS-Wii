@@ -35,9 +35,40 @@ int Settings::monoAudio   = 0;   // default: stereo
 int Settings::savesFolder  = 0;
 int Settings::statesFolder = 1;
 int Settings::cheatsFolder = 1;
-int Settings::screenFilter = 2;
-int Settings::arm7Hle     = 0;
-int Settings::dsiMode     = 0;
+int Settings::screenFilter = 0;
+int Settings::screenLayout = 0;
+int Settings::screen1Size  = 0;
+int Settings::screen2Size  = 0;
+int Settings::screenSwap   = 0;
+int Settings::wiiScreenGap = 1;
+int Settings::armJit       = 1;
+int Settings::arm7Hle      = 0;
+int Settings::dsiMode      = 0;
+
+const int Settings::FRAMESKIP_VALUES[Settings::FRAMESKIP_COUNT] = {
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 15, 20, 30
+};
+
+int Settings::frameskipToIndex(int fs) {
+    int bestIdx  = 0;
+    int bestDiff = (fs < 0) ? -fs : fs;
+    for (int i = 1; i < FRAMESKIP_COUNT; i++) {
+        int d = fs - FRAMESKIP_VALUES[i];
+        if (d < 0) d = -d;
+        if (d < bestDiff) {
+            bestDiff = d;
+            bestIdx  = i;
+        }
+    }
+    return bestIdx;
+}
+
+void Settings::stepFrameskip(int dir) {
+    int idx = frameskipToIndex(frameskip);
+    idx = (idx + dir) % FRAMESKIP_COUNT;
+    if (idx < 0) idx += FRAMESKIP_COUNT;
+    frameskip = FRAMESKIP_VALUES[idx];
+}
 
 std::string Settings::bios9Path    = "bios9.bin";
 std::string Settings::bios7Path    = "bios7.bin";
@@ -62,6 +93,12 @@ std::vector<Setting> Settings::settings = {
     Setting("statesFolder", &statesFolder, false),
     Setting("cheatsFolder", &cheatsFolder, false),
     Setting("screenFilter", &screenFilter, false),
+    Setting("screenLayout", &screenLayout, false),
+    Setting("screen1Size",  &screen1Size,  false),
+    Setting("screen2Size",  &screen2Size,  false),
+    Setting("screenSwap",   &screenSwap,   false),
+    Setting("wiiScreenGap", &wiiScreenGap, false),
+    Setting("armJit",       &armJit,       false),
     Setting("arm7Hle",      &arm7Hle,      false),
     Setting("dsiMode",      &dsiMode,      false),
     Setting("bios9Path",    &bios9Path,    true),
@@ -77,20 +114,25 @@ void Settings::add(std::vector<Setting> &settings) {
 }
 
 bool Settings::load(std::string path) {
-    // Set the base path and ensure all folders exist.
-    mkdir((basePath = path).c_str() MKDIR_ARGS);
-    mkdir((basePath + "/saves").c_str()  MKDIR_ARGS);
-    mkdir((basePath + "/states").c_str() MKDIR_ARGS);
-    mkdir((basePath + "/cheats").c_str() MKDIR_ARGS);
+    basePath = path;
+    while (basePath.size() > 1 && basePath.back() == '/' && basePath[basePath.size() - 2] != ':')
+        basePath.pop_back();
+    const std::string sep = (!basePath.empty() && basePath.back() == '/') ? "" : "/";
+
+    // Ensure all folders exist.
+    mkdir(basePath.c_str() MKDIR_ARGS);
+    mkdir((basePath + sep + "saves").c_str()  MKDIR_ARGS);
+    mkdir((basePath + sep + "states").c_str() MKDIR_ARGS);
+    mkdir((basePath + sep + "cheats").c_str() MKDIR_ARGS);
 
     // Open the settings file; write defaults if it does not exist.
-    FILE *file = fopen((basePath + "/noods.ini").c_str(), "r");
+    FILE *file = fopen((basePath + sep + "noods.ini").c_str(), "r");
     if (!file) {
-        Settings::bios9Path    = basePath + "/bios9.bin";
-        Settings::bios7Path    = basePath + "/bios7.bin";
-        Settings::firmwarePath = basePath + "/firmware.bin";
-        Settings::gbaBiosPath  = basePath + "/gba_bios.bin";
-        Settings::sdImagePath  = basePath + "/sd.img";
+        Settings::bios9Path    = basePath + sep + "bios9.bin";
+        Settings::bios7Path    = basePath + sep + "bios7.bin";
+        Settings::firmwarePath = basePath + sep + "firmware.bin";
+        Settings::gbaBiosPath  = basePath + sep + "gba_bios.bin";
+        Settings::sdImagePath  = basePath + sep + "sd.img";
         Settings::save();
         return false;
     }
@@ -105,9 +147,10 @@ bool Settings::load(std::string path) {
         std::string name = line.substr(0, split);
         for (size_t i = 0; i < settings.size(); i++) {
             if (name != settings[i].name) continue;
-            // Strip the trailing newline from the value.
-            std::string value = line.substr(split + 1,
-                                            line.size() - split - 2);
+            // Strip any trailing CR/LF characters from the value.
+            std::string value = line.substr(split + 1);
+            while (!value.empty() && (value.back() == '\n' || value.back() == '\r'))
+                value.pop_back();
             if (settings[i].isString)
                 *(std::string*)settings[i].value = value;
             else if (!value.empty() &&
@@ -118,11 +161,20 @@ bool Settings::load(std::string path) {
     }
 
     fclose(file);
+    frameskip = FRAMESKIP_VALUES[frameskipToIndex(frameskip)];
+    if (screenLayout < 0 || screenLayout > 5) screenLayout = 0;
+    if (screen1Size  < 0 || screen1Size  > 9) screen1Size  = 0;
+    if (screen2Size  < 0 || screen2Size  > 9) screen2Size  = 0;
+    if (screenSwap   < 0 || screenSwap   > 1) screenSwap   = 0;
+    if (wiiScreenGap < 0 || wiiScreenGap > 4) wiiScreenGap = 1;
+    if (screenFilter < 0 || screenFilter > 2) screenFilter = 0;
+    armJit = (armJit != 0) ? 1 : 0;
     return true;
 }
 
 bool Settings::save() {
-    FILE *file = fopen((basePath + "/noods.ini").c_str(), "w");
+    const std::string sep = (!basePath.empty() && basePath.back() == '/') ? "" : "/";
+    FILE *file = fopen((basePath + sep + "noods.ini").c_str(), "w");
     if (!file) return false;
 
     for (size_t i = 0; i < settings.size(); i++) {

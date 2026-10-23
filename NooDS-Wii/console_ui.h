@@ -78,7 +78,7 @@ class ConsoleUI {
 public:
     static Core *core;
     static volatile uint8_t running;
-    static uint32_t framebuffer[256 * 192 * 8];
+    static uint32_t *framebuffer;
     static ScreenLayout layout;
     static bool gbaMode;
 

@@ -26,6 +26,7 @@
 class Core;
 
 class Ipc {
+    friend class ArmPpcJit;
 public:
     Ipc(Core *core): core(core) {}
     void saveState(FILE *file);
@@ -40,6 +41,8 @@ public:
     void writeIpcFifoSend(bool arm7, uint32_t mask, uint32_t value);
 
 private:
+    friend class ArmPpcJit; // guarded MMIO fast path reads the live IPCSYNC field
+
     Core *core;
     std::deque<uint32_t> fifos[2];
 
