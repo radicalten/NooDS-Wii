@@ -57,6 +57,7 @@ public:
     static int armJit;          // 0=Off (Interpreter), 1=On (PPC JIT Recompiler)
     static int arm7Hle;
     static int dsiMode;
+    static int stylusEdgeClamp; // 0=Off (release outside), 1=On (clamp to nearest edge)
 
     static constexpr int FRAMESKIP_COUNT = 14;
     static const int     FRAMESKIP_VALUES[FRAMESKIP_COUNT];

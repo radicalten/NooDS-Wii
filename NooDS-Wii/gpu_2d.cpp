@@ -103,6 +103,108 @@ uint32_t Gpu2D::rgb5ToRgb6(uint32_t color) {
     return (color & 0xFFFC0000u) | s_gpu2DLuts.rgb5To6[color & 0x7FFFu];
 }
 
+// v1.72: brightness LUTs for master-bright (avoid per-pixel div)
+uint8_t Gpu2D::s_brightIncTable[64][17];
+uint8_t Gpu2D::s_brightDecTable[64][17];
+bool Gpu2D::s_brightTablesReady = false;
+uint8_t Gpu2D::s_brightIncTable5[32][17];
+uint8_t Gpu2D::s_brightDecTable5[32][17];
+void Gpu2D::ensureBrightTables() {
+    if (s_brightTablesReady) return;
+    for (int c=0;c<64;c++) for(int f=0;f<17;f++) {
+        s_brightIncTable[c][f] = c + (63 - c) * f / 16;
+        s_brightDecTable[c][f] = c - c * f / 16;
+    }
+    for (int c=0;c<32;c++) for(int f=0;f<17;f++) {
+        s_brightIncTable5[c][f] = c + (31 - c) * f / 16;
+        s_brightDecTable5[c][f] = c - c * f / 16;
+    }
+    s_brightTablesReady = true;
+}
+// v1.73: alpha blend LUT for 6-bit (eva 0..16, evb=16-eva)
+uint8_t Gpu2D::s_alphaLUT[17][4096];
+bool Gpu2D::s_alphaLUTReady = false;
+void Gpu2D::ensureAlphaLUT() {
+    if (s_alphaLUTReady) return;
+    for (int eva=0; eva<17; eva++) {
+        int evb = 16 - eva;
+        for (int src=0; src<64; src++) for (int dst=0; dst<64; dst++) {
+            int idx = (src<<6) | dst;
+            s_alphaLUT[eva][idx] = (src*eva + dst*evb)/16;
+            if (s_alphaLUT[eva][idx] > 63) s_alphaLUT[eva][idx]=63;
+        }
+    }
+    s_alphaLUTReady = true;
+}
+FORCE_INLINE uint8_t Gpu2D::alphaBlend6(uint8_t src, uint8_t dst, uint8_t eva) {
+    if (eva>16) eva=16;
+    return s_alphaLUT[eva][(src<<6)|dst];
+}
+FORCE_INLINE uint16_t Gpu2D::fastRead16(uint32_t addr) {
+    uint8_t *p = core->memory.readMap9A[addr >> 12];
+    if (__builtin_expect(p != nullptr, 1)) {
+        uint16_t v; __builtin_memcpy(&v, p + (addr & 0xFFF), 2);
+#ifdef ENDIAN_BIG
+        return __builtin_bswap16(v);
+#else
+        return v;
+#endif
+    }
+    return core->memory.read<uint16_t>(0, addr);
+}
+FORCE_INLINE uint32_t Gpu2D::fastRead32(uint32_t addr) {
+    uint8_t *p = core->memory.readMap9A[addr >> 12];
+    if (__builtin_expect(p != nullptr, 1)) {
+        uint32_t v; __builtin_memcpy(&v, p + (addr & 0xFFF), 4);
+#ifdef ENDIAN_BIG
+        return __builtin_bswap32(v);
+#else
+        return v;
+#endif
+    }
+    return core->memory.read<uint32_t>(0, addr);
+}
+template<bool GBA> FORCE_INLINE uint16_t Gpu2D::fastRead16T(uint32_t addr) {
+    if constexpr(GBA) return core->memory.read<uint16_t>(true, addr);
+    else return fastRead16(addr);
+}
+template<bool GBA> FORCE_INLINE uint32_t Gpu2D::fastRead32T(uint32_t addr) {
+    if constexpr(GBA) return core->memory.read<uint32_t>(true, addr);
+    else return fastRead32(addr);
+}
+template<bool GBA> FORCE_INLINE uint8_t Gpu2D::fastRead8T(uint32_t addr) {
+    if constexpr(GBA) return core->memory.read<uint8_t>(true, addr);
+    else return fastRead8(addr);
+}
+FORCE_INLINE uint8_t Gpu2D::fastRead8(uint32_t addr) {
+    uint8_t *p = core->memory.readMap9A[addr >> 12];
+    if (__builtin_expect(p != nullptr, 1)) {
+        return *(p + (addr & 0xFFF));
+    }
+    return core->memory.read<uint8_t>(0, addr);
+}
+void Gpu2D::buildWindowMask(int line) {
+    if (!(dispCnt & 0xE000)) {
+        // fast: all enabled (include blend bit 5)
+        memset(winMaskCache, 0x3F, sizeof(winMaskCache));
+        winMaskValid = true;
+        return;
+    }
+    for (int x=0;x<256;x++) {
+        uint16_t enabled;
+        if ((dispCnt & BIT(13)) && winVFlag[0] && (x >= winX1[0] && x < winX2[0]) != winHFlip[0])
+            enabled = winIn & 0x3F;
+        else if ((dispCnt & BIT(14)) && winVFlag[1] && (x >= winX1[1] && x < winX2[1]) != winHFlip[1])
+            enabled = (winIn >> 8) & 0x3F;
+        else if ((dispCnt & BIT(15)) && (framebuffer[line * 256 + x] & BIT(24)))
+            enabled = (winOut >> 8) & 0x3F;
+        else
+            enabled = winOut & 0x3F;
+        winMaskCache[x] = enabled & 0x3F;
+    }
+    winMaskValid = true;
+}
+
 void Gpu2D::reloadRegisters() {
     // Reload internal registers at the start of a frame
     internalX[0] = bgX[0];
@@ -191,6 +293,7 @@ void Gpu2D::drawGbaScanline(int line) {
         }
     }
 
+    if (dispCnt & 0xE000) buildWindowMask(line); else winMaskValid=false;
     // Blend the layers to form the final image
     for (int mode = (bldCnt >> 6) & 0x3, i = 0; i < 240; i++) {
         // Check if blending can/should be performed
@@ -206,21 +309,12 @@ void Gpu2D::drawGbaScanline(int line) {
             continue;
         }
 
-        // Skip blending if the pixel is in the bounds of a window that has it disabled
-        if (dispCnt & 0xE000) { // Windows enabled
-            uint8_t enabled;
-            if ((dispCnt & BIT(13)) && winVFlag[0] && (i >= winX1[0] && i < winX2[0]) != winHFlip[0])
-                enabled = winIn >> 0; // Window 0
-            else if ((dispCnt & BIT(14)) && winVFlag[1] && (i >= winX1[1] && i < winX2[1]) != winHFlip[1])
-                enabled = winIn >> 8; // Window 1
-            else if ((dispCnt & BIT(15)) && (framebuffer[line * 256 + i] & BIT(24)))
-                enabled = winOut >> 8; // Object window
-            else
-                enabled = winOut >> 0; // Outside of windows
-            if (!(enabled & BIT(5))) continue;
+        // Skip blending if the pixel is in the bounds of a window that has it disabled — v1.74 LUT
+        if (dispCnt & 0xE000) {
+            if (!(winMaskCache[i] & BIT(5))) continue;
         }
 
-        // Apply blending, using 15-bit colors in GBA mode
+        // Apply blending, using 15-bit colors in GBA mode — v1.74 LUT
         switch (mode) {
         case 1: // Alpha blending
         alpha: {
@@ -233,21 +327,23 @@ void Gpu2D::drawGbaScanline(int line) {
             continue;
         }
 
-        case 2: // Brightness increase
+        case 2: // Brightness increase — v1.74 LUT
             if (bldY) {
-                uint8_t r = (layers[0][i] >> 0) & 0x1F; r += (31 - r) * bldY / 16;
-                uint8_t g = (layers[0][i] >> 5) & 0x1F; g += (31 - g) * bldY / 16;
-                uint8_t b = (layers[0][i] >> 10) & 0x1F; b += (31 - b) * bldY / 16;
-                layers[0][i] = (b << 10) | (g << 5) | r;
+                ensureBrightTables();
+                uint8_t r = s_brightIncTable5[(layers[0][i]>>0)&0x1F][bldY];
+                uint8_t g = s_brightIncTable5[(layers[0][i]>>5)&0x1F][bldY];
+                uint8_t b = s_brightIncTable5[(layers[0][i]>>10)&0x1F][bldY];
+                layers[0][i] = (b<<10)|(g<<5)|r;
             }
             continue;
 
-        case 3: // Brightness decrease
+        case 3: // Brightness decrease — v1.74 LUT
             if (bldY) {
-                uint8_t r = (layers[0][i] >> 0) & 0x1F; r -= r * bldY / 16;
-                uint8_t g = (layers[0][i] >> 5) & 0x1F; g -= g * bldY / 16;
-                uint8_t b = (layers[0][i] >> 10) & 0x1F; b -= b * bldY / 16;
-                layers[0][i] = (b << 10) | (g << 5) | r;
+                ensureBrightTables();
+                uint8_t r = s_brightDecTable5[(layers[0][i]>>0)&0x1F][bldY];
+                uint8_t g = s_brightDecTable5[(layers[0][i]>>5)&0x1F][bldY];
+                uint8_t b = s_brightDecTable5[(layers[0][i]>>10)&0x1F][bldY];
+                layers[0][i] = (b<<10)|(g<<5)|r;
             }
             continue;
         }
@@ -286,7 +382,7 @@ void Gpu2D::drawScanline(int line) {
                     dst[i] = rgb5ToRgb6(U8TO16(vramPtr, i * 2));
             } else {
                 for (int i = 0; i < 256; i++)
-                    dst[i] = rgb5ToRgb6(core->memory.read<uint16_t>(0, addr + i * 2));
+                    dst[i] = rgb5ToRgb6(fastRead16(addr + i * 2));
             }
         } else {
             LOG_CRIT("Unimplemented engine %c display mode: display FIFO\n", (engine == 0) ? 'A' : 'B');
@@ -378,6 +474,8 @@ void Gpu2D::drawScanline(int line) {
         goto copy_display_mode;
     }
 
+    // v1.74: prebuild window mask for blend stage (framebuffer OBJ window now valid)
+    if (dispCnt & 0xE000) buildWindowMask(line); else winMaskValid = false;
     // Blend the layers to form the final image
     for (int mode = (bldCnt >> 6) & 0x3, i = 0; i < 256; i++) {
         // Check if blending can/should be performed
@@ -417,49 +515,51 @@ void Gpu2D::drawScanline(int line) {
             }
         }
 
-        // Skip blending if the pixel is in the bounds of a window that has it disabled
-        if (dispCnt & 0xE000) { // Windows enabled
-            uint8_t enabled;
-            if ((dispCnt & BIT(13)) && winVFlag[0] && (i >= winX1[0] && i < winX2[0]) != winHFlip[0])
-                enabled = winIn >> 0; // Window 0
-            else if ((dispCnt & BIT(14)) && winVFlag[1] && (i >= winX1[1] && i < winX2[1]) != winHFlip[1])
-                enabled = winIn >> 8; // Window 1
-            else if ((dispCnt & BIT(15)) && (framebuffer[line * 256 + i] & BIT(24)))
-                enabled = winOut >> 8; // Object window
-            else
-                enabled = winOut >> 0; // Outside of windows
-            if (!(enabled & BIT(5))) continue;
+        // Skip blending if the pixel is in the bounds of a window that has it disabled — v1.74 via prebuilt mask
+        if (dispCnt & 0xE000) {
+            if (!(winMaskCache[i] & BIT(5))) continue;
         }
 
-        // Apply blending, using 18-bit colors in DS mode
+        // Apply blending, using 18-bit colors in DS mode — v1.73 alpha LUT fast path, v1.74 brightness LUT
         switch (mode) {
         case 1: // Alpha blending
         alpha: {
             uint32_t blend = (layers[1][i] & BIT(26)) ? layers[1][i] : rgb5ToRgb6(layers[1][i]);
             uint8_t eva = std::min((bldAlpha >> 0) & 0x1F, 16);
             uint8_t evb = std::min((bldAlpha >> 8) & 0x1F, 16);
-            uint8_t r = std::min((((layers[0][i] >> 0) & 0x3F) * eva + ((blend >> 0) & 0x3F) * evb) / 16, 63U);
-            uint8_t g = std::min((((layers[0][i] >> 6) & 0x3F) * eva + ((blend >> 6) & 0x3F) * evb) / 16, 63U);
-            uint8_t b = std::min((((layers[0][i] >> 12) & 0x3F) * eva + ((blend >> 12) & 0x3F) * evb) / 16, 63U);
-            layers[0][i] = (b << 12) | (g << 6) | r;
-            continue;
-        }
-
-        case 2: // Brightness increase
-            if (bldY) {
-                uint8_t r = (layers[0][i] >> 0) & 0x3F; r += (63 - r) * bldY / 16;
-                uint8_t g = (layers[0][i] >> 6) & 0x3F; g += (63 - g) * bldY / 16;
-                uint8_t b = (layers[0][i] >> 12) & 0x3F; b += (63 - b) * bldY / 16;
+            // Fast LUT when eva+evb==16 (common), otherwise fallback
+            if (eva + evb == 16) {
+                ensureAlphaLUT();
+                uint8_t r = alphaBlend6((layers[0][i]>>0)&0x3F, (blend>>0)&0x3F, eva);
+                uint8_t g = alphaBlend6((layers[0][i]>>6)&0x3F, (blend>>6)&0x3F, eva);
+                uint8_t b = alphaBlend6((layers[0][i]>>12)&0x3F, (blend>>12)&0x3F, eva);
+                layers[0][i] = (b<<12)|(g<<6)|r;
+            } else {
+                uint8_t r = std::min((((layers[0][i] >> 0) & 0x3F) * eva + ((blend >> 0) & 0x3F) * evb) / 16, 63U);
+                uint8_t g = std::min((((layers[0][i] >> 6) & 0x3F) * eva + ((blend >> 6) & 0x3F) * evb) / 16, 63U);
+                uint8_t b = std::min((((layers[0][i] >> 12) & 0x3F) * eva + ((blend >> 12) & 0x3F) * evb) / 16, 63U);
                 layers[0][i] = (b << 12) | (g << 6) | r;
             }
             continue;
+        }
 
-        case 3: // Brightness decrease
+        case 2: // Brightness increase — v1.74 LUT (no div)
             if (bldY) {
-                uint8_t r = (layers[0][i] >> 0) & 0x3F; r -= r * bldY / 16;
-                uint8_t g = (layers[0][i] >> 6) & 0x3F; g -= g * bldY / 16;
-                uint8_t b = (layers[0][i] >> 12) & 0x3F; b -= b * bldY / 16;
-                layers[0][i] = (b << 12) | (g << 6) | r;
+                ensureBrightTables();
+                uint8_t r = s_brightIncTable[(layers[0][i]>>0)&0x3F][bldY];
+                uint8_t g = s_brightIncTable[(layers[0][i]>>6)&0x3F][bldY];
+                uint8_t b = s_brightIncTable[(layers[0][i]>>12)&0x3F][bldY];
+                layers[0][i] = (b<<12)|(g<<6)|r;
+            }
+            continue;
+
+        case 3: // Brightness decrease — v1.74 LUT
+            if (bldY) {
+                ensureBrightTables();
+                uint8_t r = s_brightDecTable[(layers[0][i]>>0)&0x3F][bldY];
+                uint8_t g = s_brightDecTable[(layers[0][i]>>6)&0x3F][bldY];
+                uint8_t b = s_brightDecTable[(layers[0][i]>>12)&0x3F][bldY];
+                layers[0][i] = (b<<12)|(g<<6)|r;
             }
             continue;
         }
@@ -478,7 +578,7 @@ copy_display_mode:
         uint32_t addr = 0x6800000 + ((dispCnt >> 1) & 0x60000) + line * 256 * 2;
         uint32_t *dst = &framebuffer[line * 256];
         for (int i = 0; i < 256; i++)
-            dst[i] = rgb5ToRgb6(core->memory.read<uint16_t>(0, addr + i * 2));
+            dst[i] = rgb5ToRgb6(fastRead16(addr + i * 2));
         break;
     }
     default:
@@ -488,87 +588,89 @@ copy_display_mode:
     }
 
 apply_master_bright:
-    // Apply master brightness (DS-only, 18-bit)
-    switch ((masterBright >> 14) & 0x3) { // Mode
-    case 1: // Increase
-        if (uint8_t factor = std::min(masterBright & 0x1F, 16)) {
-            for (int i = 0; i < 256; i++) {
-                uint32_t *pixel = &framebuffer[line * 256 + i];
-                uint8_t r = (*pixel >> 0) & 0x3F; r += (63 - r) * factor / 16;
-                uint8_t g = (*pixel >> 6) & 0x3F; g += (63 - g) * factor / 16;
-                uint8_t b = (*pixel >> 12) & 0x3F; b += (63 - b) * factor / 16;
-                *pixel = (b << 12) | (g << 6) | r;
+    // Apply master brightness (DS-only, 18-bit) — v1.72 LUT accelerated
+    switch ((masterBright >> 14) & 0x3) {
+    case 1: {
+        uint8_t factor = std::min<uint8_t>(masterBright & 0x1F, 16);
+        if (factor) {
+            ensureBrightTables();
+            for (int i=0;i<256;i++) {
+                uint32_t *pixel = &framebuffer[line*256+i];
+                uint8_t r = s_brightIncTable[(*pixel>>0)&0x3F][factor];
+                uint8_t g = s_brightIncTable[(*pixel>>6)&0x3F][factor];
+                uint8_t b = s_brightIncTable[(*pixel>>12)&0x3F][factor];
+                *pixel = (b<<12)|(g<<6)|r;
             }
         }
         break;
-
-    case 2: // Decrease
-        if (uint8_t factor = std::min(masterBright & 0x1F, 16)) {
-            for (int i = 0; i < 256; i++) {
-                uint32_t *pixel = &framebuffer[line * 256 + i];
-                uint8_t r = (*pixel >> 0) & 0x3F; r -= r * factor / 16;
-                uint8_t g = (*pixel >> 6) & 0x3F; g -= g * factor / 16;
-                uint8_t b = (*pixel >> 12) & 0x3F; b -= b * factor / 16;
-                *pixel = (b << 12) | (g << 6) | r;
+    }
+    case 2: {
+        uint8_t factor = std::min<uint8_t>(masterBright & 0x1F, 16);
+        if (factor) {
+            ensureBrightTables();
+            for (int i=0;i<256;i++) {
+                uint32_t *pixel = &framebuffer[line*256+i];
+                uint8_t r = s_brightDecTable[(*pixel>>0)&0x3F][factor];
+                uint8_t g = s_brightDecTable[(*pixel>>6)&0x3F][factor];
+                uint8_t b = s_brightDecTable[(*pixel>>12)&0x3F][factor];
+                *pixel = (b<<12)|(g<<6)|r;
             }
         }
         break;
+    }
     }
 }
 
-void Gpu2D::drawBgPixel(int bg, int line, int x, uint32_t pixel) {
-    // Skip the pixel if it's in the bounds of a window that has its layer disabled
-    if (dispCnt & 0xE000) { // Windows enabled
-        uint8_t enabled;
-        if ((dispCnt & BIT(13)) && winVFlag[0] && (x >= winX1[0] && x < winX2[0]) != winHFlip[0])
-            enabled = winIn >> 0; // Window 0
-        else if ((dispCnt & BIT(14)) && winVFlag[1] && (x >= winX1[1] && x < winX2[1]) != winHFlip[1])
-            enabled = winIn >> 8; // Window 1
-        else if ((dispCnt & BIT(15)) && (framebuffer[line * 256 + x] & BIT(24)))
-            enabled = winOut >> 8; // Object window
-        else
-            enabled = winOut >> 0; // Outside of windows
-        if (!(enabled & BIT(bg))) return;
+FORCE_INLINE void Gpu2D::drawBgPixel(int bg, int line, int x, uint32_t pixel) {
+    // v1.72: use precomputed window mask when valid, otherwise fast window check
+    if (__builtin_expect(dispCnt & 0xE000, 0)) {
+        if (winMaskValid) {
+            if (!(winMaskCache[x] & BIT(bg))) return;
+        } else {
+            uint16_t enabled;
+            if ((dispCnt & BIT(13)) && winVFlag[0] && (x >= winX1[0] && x < winX2[0]) != winHFlip[0])
+                enabled = winIn;
+            else if ((dispCnt & BIT(14)) && winVFlag[1] && (x >= winX1[1] && x < winX2[1]) != winHFlip[1])
+                enabled = winIn >> 8;
+            else if ((dispCnt & BIT(15)) && (framebuffer[line * 256 + x] & BIT(24)))
+                enabled = winOut >> 8;
+            else
+                enabled = winOut;
+            if (!(enabled & BIT(bg))) return;
+        }
     }
-
-    // Draw the pixel to one of 2 layers, depending on priority, for later blending
-    if ((bgCnt[bg] & 0x3) <= priorities[0][x]) { // Higher than topmost
-        // Move the topmost pixel to the second topmost
+    int prio = bgCnt[bg] & 0x3;
+    if (__builtin_expect(prio <= priorities[0][x], 1)) {
         layers[1][x] = layers[0][x];
         priorities[1][x] = priorities[0][x];
         blendBits[1][x] = blendBits[0][x];
-
-        // Update the topmost pixel
         layers[0][x] = pixel;
-        priorities[0][x] = bgCnt[bg] & 0x3;
+        priorities[0][x] = prio;
         blendBits[0][x] = bg;
-    }
-    else if ((bgCnt[bg] & 0x3) <= priorities[1][x]) { // Higher than second topmost
-        // Update the second topmost pixel
+    } else if (prio <= priorities[1][x]) {
         layers[1][x] = pixel;
-        priorities[1][x] = bgCnt[bg] & 0x3;
+        priorities[1][x] = prio;
         blendBits[1][x] = bg;
     }
 }
-
-void Gpu2D::drawObjPixel(int line, int x, uint32_t pixel, int8_t priority) {
-    // Skip the pixel if it's in the bounds of a window that has objects disabled
-    if (dispCnt & 0xE000) { // Windows enabled
-        uint8_t enabled;
-        if ((dispCnt & BIT(13)) && winVFlag[0] && (x >= winX1[0] && x < winX2[0]) != winHFlip[0])
-            enabled = winIn >> 0; // Window 0
-        else if ((dispCnt & BIT(14)) && winVFlag[1] && (x >= winX1[1] && x < winX2[1]) != winHFlip[1])
-            enabled = winIn >> 8; // Window 1
-        else if ((dispCnt & BIT(15)) && (framebuffer[line * 256 + x] & BIT(24)))
-            enabled = winOut >> 8; // Object window
-        else
-            enabled = winOut >> 0; // Outside of windows
-        if (!(enabled & BIT(4))) return;
+FORCE_INLINE void Gpu2D::drawObjPixel(int line, int x, uint32_t pixel, int8_t priority) {
+    if (__builtin_expect(dispCnt & 0xE000, 0)) {
+        if (winMaskValid) {
+            if (!(winMaskCache[x] & BIT(4))) return;
+        } else {
+            uint16_t enabled;
+            if ((dispCnt & BIT(13)) && winVFlag[0] && (x >= winX1[0] && x < winX2[0]) != winHFlip[0])
+                enabled = winIn;
+            else if ((dispCnt & BIT(14)) && winVFlag[1] && (x >= winX1[1] && x < winX2[1]) != winHFlip[1])
+                enabled = winIn >> 8;
+            else if ((dispCnt & BIT(15)) && (framebuffer[line * 256 + x] & BIT(24)))
+                enabled = winOut >> 8;
+            else
+                enabled = winOut;
+            if (!(enabled & BIT(4))) return;
+        }
     }
-
-    // Draw a pixel to the top layer if the old one is transparent or lower priority
-    // Objects are drawn first, and are treated as one layer, so they don't push pixels down
-    if (!(layers[0][x] & BIT(15)) || priority < priorities[0][x]) {
+    if (__builtin_expect(!(layers[0][x] & BIT(15)) || priority < priorities[0][x], 1)) {
         layers[0][x] = pixel;
         priorities[0][x] = priority;
         blendBits[0][x] = 4;
@@ -624,7 +726,7 @@ template <bool gbaMode> void Gpu2D::drawText(int bg, int line) {
                 tileAddr += 0x800;
 
             // Get the current tile and the pixel offsets within it, accounting for flips
-            uint16_t tile = core->memory.read<uint16_t>(gbaMode, tileAddr);
+            uint16_t tile = fastRead16T<gbaMode>(tileAddr);
             int px = (tile & BIT(10)) ? (7 - (xOffset & 7)) : (xOffset & 7);
             int py = (tile & BIT(11)) ? (7 - (yOffset & 7)) : (yOffset & 7);
 
@@ -632,14 +734,14 @@ template <bool gbaMode> void Gpu2D::drawText(int bg, int line) {
             uint16_t color;
             if (bgCnt[bg] & BIT(7)) { // 8-bit
                 uint8_t *pal = extPal ? &extPal[(tile >> 3) & 0x1E00] : palette;
-                uint8_t index = core->memory.read<uint8_t>(gbaMode, indexBase + (tile & 0x3FF) * 64 + py * 8 + px);
+                uint8_t index = fastRead8T<gbaMode>(indexBase + (tile & 0x3FF) * 64 + py * 8 + px);
                 if (!index)
                     continue;
                 color = U8TO16(pal, index * 2) | BIT(15);
             }
             else { // 4-bit
                 uint8_t *pal = &palette[(tile & 0xF000) >> 7];
-                uint32_t indices = core->memory.read<uint32_t>(gbaMode, indexBase + (tile & 0x3FF) * 32 + py * 4);
+                uint32_t indices = fastRead32T<gbaMode>(indexBase + (tile & 0x3FF) * 32 + py * 4);
                 uint8_t index = (indices >> (px * 4)) & 0xF;
                 if (!index)
                     continue;
@@ -669,13 +771,13 @@ template <bool gbaMode> void Gpu2D::drawText(int bg, int line) {
                 tileAddr += 0x800;
 
             // Get the current tile and its palette
-            uint16_t tile = core->memory.read<uint16_t>(gbaMode, tileAddr);
+            uint16_t tile = fastRead16T<gbaMode>(tileAddr);
             uint8_t *pal = extPal ? &extPal[(tile >> 3) & 0x1E00] : palette;
 
             // Get the palette indices for the current line of the tile, flipped vertically if enabled
             uint32_t indexAddr = indexBase + (tile & 0x3FF) * 64 + ((tile & BIT(11)) ? (7 - (yOffset & 7)) : (yOffset & 7)) * 8;
-            uint64_t indices = core->memory.read<uint32_t>(gbaMode, indexAddr) |
-                ((uint64_t)core->memory.read<uint32_t>(gbaMode, indexAddr + 4) << 32);
+            uint64_t indices = fastRead32T<gbaMode>(indexAddr) |
+                ((uint64_t)fastRead32T<gbaMode>(indexAddr + 4) << 32);
 
             // Draw the current line of the tile, flipped horizontally if enabled
             for (int x = i - (xOffset & 7) + ((tile & BIT(10)) ? 7 : 0); indices != 0; ((tile & BIT(10)) ? x-- : x++), indices >>= 8) {
@@ -696,7 +798,7 @@ template <bool gbaMode> void Gpu2D::drawText(int bg, int line) {
                 tileAddr += 0x800;
 
             // Get the current tile
-            uint16_t tile = core->memory.read<uint16_t>(gbaMode, tileAddr);
+            uint16_t tile = fastRead16T<gbaMode>(tileAddr);
 
             // Get the tile's palette
             // In 4-bit mode, the tile can select from multiple 16-color palettes
@@ -704,7 +806,7 @@ template <bool gbaMode> void Gpu2D::drawText(int bg, int line) {
 
             // Get the palette indices for the current line of the tile, flipped vertically if enabled
             uint32_t indexAddr = indexBase + (tile & 0x3FF) * 32 + ((tile & BIT(11)) ? (7 - (yOffset & 7)) : (yOffset & 7)) * 4;
-            uint32_t indices = core->memory.read<uint32_t>(gbaMode, indexAddr);
+            uint32_t indices = fastRead32T<gbaMode>(indexAddr);
 
             // Draw the current line of the tile, flipped horizontally if enabled
             for (int x = i - (xOffset & 7) + ((tile & BIT(10)) ? 7 : 0); indices != 0; ((tile & BIT(10)) ? x-- : x++), indices >>= 4) {
@@ -745,11 +847,11 @@ template <bool gbaMode> void Gpu2D::drawAffine(int bg, int line) {
 
         // Read the current tile
         uint32_t tileAddr = tileBase + (y / 8) * (size / 8) + (x / 8);
-        uint8_t tile = core->memory.read<uint8_t>(gbaMode, tileAddr);
+        uint8_t tile = fastRead8T<gbaMode>(tileAddr);
 
         // Read the palette index for the current pixel of the tile
         uint32_t indexAddr = indexBase + tile * 64 + (y & 7) * 8 + (x & 7);
-        uint8_t index = core->memory.read<uint8_t>(gbaMode, indexAddr);
+        uint8_t index = fastRead8T<gbaMode>(indexAddr);
 
         // Draw a pixel if it isn't transparent
         if (index)
@@ -793,7 +895,7 @@ void Gpu2D::drawExtended(int bg, int line) {
                 }
 
                 // Draw a pixel if it isn't transparent
-                uint16_t pixel = core->memory.read<uint16_t>(0, dataBase + (y * sizeX + x) * 2);
+                uint16_t pixel = fastRead16(dataBase + (y * sizeX + x) * 2);
                 if (pixel & BIT(15))
                     drawBgPixel(bg, line, i, pixel);
             }
@@ -815,7 +917,7 @@ void Gpu2D::drawExtended(int bg, int line) {
                 }
 
                 // Read the palette index for the current pixel
-                uint8_t index = core->memory.read<uint8_t>(0, dataBase + y * sizeX + x);
+                uint8_t index = fastRead8(dataBase + y * sizeX + x);
 
                 // Draw a pixel if it isn't transparent
                 if (index)
@@ -851,7 +953,7 @@ void Gpu2D::drawExtended(int bg, int line) {
 
             // Read the current tile
             uint32_t tileAddr = tileBase + ((y / 8) * (size / 8) + (x / 8)) * 2;
-            uint16_t tile = core->memory.read<uint16_t>(0, tileAddr);
+            uint16_t tile = fastRead16(tileAddr);
 
             // Switch to an extended palette selected by the tile if enabled
             if (dispCnt & BIT(30)) {
@@ -863,7 +965,7 @@ void Gpu2D::drawExtended(int bg, int line) {
             uint32_t indexAddr = indexBase + (tile & 0x3FF) * 64 + // Tile offset
                 (((tile & BIT(11)) ? (7 - y) : y) & 7) * 8 + // Vertical offset, flipped if enabled
                 (((tile & BIT(10)) ? (7 - x) : x) & 7); // Horizontal offset, flipped if enabled
-            uint8_t index = core->memory.read<uint8_t>(0, indexAddr);
+            uint8_t index = fastRead8(indexAddr);
 
             // Draw the pixel if it isn't transparent
             if (index)
@@ -959,7 +1061,7 @@ void Gpu2D::drawLarge(int bg, int line) {
             y &= (sizeY / 4) - 1;
 
         // Read the palette index for the current pixel
-        uint8_t index = core->memory.read<uint8_t>(0, bgVramAddr + y * sizeX + x);
+        uint8_t index = fastRead8(bgVramAddr + y * sizeX + x);
 
         // Draw a pixel if it isn't transparent
         if (index)
@@ -1054,7 +1156,7 @@ template <bool gbaMode> void Gpu2D::drawObjects(int line, bool window) {
                     if (rotscaleY < 0 || rotscaleY >= height) continue;
 
                     // Draw a pixel
-                    uint16_t pixel = core->memory.read<uint16_t>(0, dataBase + (rotscaleY * bitmapWidth + rotscaleX) * 2);
+                    uint16_t pixel = fastRead16(dataBase + (rotscaleY * bitmapWidth + rotscaleX) * 2);
                     if (pixel & BIT(15))
                         drawObjPixel(line, offset, pixel, priority);
                 }
@@ -1070,7 +1172,7 @@ template <bool gbaMode> void Gpu2D::drawObjects(int line, bool window) {
                     if (offset < 0 || offset >= (gbaMode ? 240 : 256)) continue;
 
                     // Draw a pixel
-                    uint16_t pixel = core->memory.read<uint16_t>(0, dataBase + j * 2);
+                    uint16_t pixel = fastRead16(dataBase + j * 2);
                     if (pixel & BIT(15))
                         drawObjPixel(line, offset, pixel, priority);
                 }
@@ -1126,7 +1228,7 @@ template <bool gbaMode> void Gpu2D::drawObjects(int line, bool window) {
                     if (rotscaleY < 0 || rotscaleY >= height) continue;
 
                     // Get the palette index for the current pixel
-                    uint8_t index = core->memory.read<uint8_t>(gbaMode, tileBase +
+                    uint8_t index = fastRead8T<gbaMode>( tileBase +
                         ((rotscaleY / 8) * mapWidth + rotscaleY % 8) * 8 + (rotscaleX / 8) * 64 + rotscaleX % 8);
 
                     if (index && type == 2) { // Object window
@@ -1166,7 +1268,7 @@ template <bool gbaMode> void Gpu2D::drawObjects(int line, bool window) {
                     if (rotscaleY < 0 || rotscaleY >= height) continue;
 
                     // Get the palette index for the current pixel
-                    uint8_t index = core->memory.read<uint8_t>(gbaMode, tileBase +
+                    uint8_t index = fastRead8T<gbaMode>( tileBase +
                         ((rotscaleY / 8) * mapWidth + rotscaleY % 8) * 4 + (rotscaleX / 8) * 32 + (rotscaleX % 8) / 2);
                     index = (rotscaleX & 1) ? ((index & 0xF0) >> 4) : (index & 0x0F);
 
@@ -1213,7 +1315,7 @@ template <bool gbaMode> void Gpu2D::drawObjects(int line, bool window) {
                 if (offset < 0 || offset >= (gbaMode ? 240 : 256)) continue;
 
                 // Get the palette index for the current pixel
-                uint8_t index = core->memory.read<uint8_t>(gbaMode, tileBase + (j / 8) * 64 + j % 8);
+                uint8_t index = fastRead8T<gbaMode>( tileBase + (j / 8) * 64 + j % 8);
 
                 if (index && type == 2) { // Object window
                     // Mark object window pixels with an extra bit, and don't draw anything
@@ -1250,7 +1352,7 @@ template <bool gbaMode> void Gpu2D::drawObjects(int line, bool window) {
                 if (offset < 0 || offset >= (gbaMode ? 240 : 256)) continue;
 
                 // Get the palette index for the current pixel
-                uint8_t index = core->memory.read<uint8_t>(gbaMode, tileBase + (j / 8) * 32 + (j % 8) / 2);
+                uint8_t index = fastRead8T<gbaMode>( tileBase + (j / 8) * 32 + (j % 8) / 2);
                 index = (j & 1) ? ((index & 0xF0) >> 4) : (index & 0x0F);
 
                 if (index && type == 2) { // Object window

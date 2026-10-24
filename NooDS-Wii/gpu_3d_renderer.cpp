@@ -217,6 +217,30 @@ void Gpu3DRenderer::drawScanline(int line) {
             }
 
             if (polygonTop[i] == polygonBot[i]) polygonBot[i]++;
+            // v1.72: cache texture/palette base pointers for fast per-pixel fetch (safe for dynamic scenes — recomputed each frame)
+            _Polygon *poly = &core->gpu3D.polygonsOut[i];
+            if (poly->textureFmt != 0) {
+                uint8_t *texSlot = core->memory.tex3D[poly->textureAddr >> 17];
+                uint32_t texOff = poly->textureAddr & 0x1FFFF;
+                cachedTexSlot0[i] = texSlot ? texSlot + texOff : nullptr;
+                uint32_t endAddr = poly->textureAddr + poly->sizeS * poly->sizeT * (poly->textureFmt==7?2:1);
+                uint32_t endSlot = endAddr >> 17;
+                if (endSlot != (poly->textureAddr>>17) && endSlot < 4)
+                    cachedTexSlot1[i] = core->memory.tex3D[endSlot];
+                else
+                    cachedTexSlot1[i] = nullptr;
+                uint8_t *palSlot = (poly->paletteAddr < (6<<14)) ? core->memory.pal3D[poly->paletteAddr >> 14] : nullptr;
+                cachedPalSlot[i] = palSlot ? palSlot + (poly->paletteAddr & 0x3FFF) : nullptr;
+                cachedUseFastTex[i] = (cachedTexSlot0[i] && (endSlot == (poly->textureAddr>>17) || !cachedTexSlot1[i]) && cachedPalSlot[i]);
+                if (poly->textureFmt==5) {
+                    uint32_t palTexAddr = 0x20000 + (poly->textureAddr % 0x20000)/2 + ((poly->textureAddr/0x20000==2)?0x10000:0);
+                    uint8_t *p = core->memory.tex3D[palTexAddr>>17];
+                    cachedTexPalBase[i] = p ? p + (palTexAddr & 0x1FFFF) : nullptr;
+                } else cachedTexPalBase[i]=nullptr;
+            } else {
+                cachedTexSlot0[i]=cachedTexSlot1[i]=cachedPalSlot[i]=cachedTexPalBase[i]=nullptr;
+                cachedUseFastTex[i]=false;
+            }
         }
 
         if (edgeMark) {
@@ -252,6 +276,21 @@ void Gpu3DRenderer::drawScanline(int line) {
         }
 
         resShift = Settings::highRes3D;
+        // v1.73: build per-scanline active polygon lists (single pass, O(poly*height) once vs per-line scan)
+        {
+            int h = 192 << resShift;
+            for (int y=0;y<h;y++) { linePolyCount[y]=0; linePolyOverflow[y]=false; }
+            for (int i=0;i<polyCount;i++) {
+                int top = polygonTop[i]; if (top<0) top=0; if (top>=h) continue;
+                int bot = polygonBot[i]; if (bot>h) bot=h; if (bot<0) continue;
+                for (int y=top; y<bot; y++) {
+                    int c = linePolyCount[y];
+                    if (c < 256) linePolyIndices[y][c] = i;
+                    else linePolyOverflow[y]=true;
+                    linePolyCount[y]++;
+                }
+            }
+        }
 
         // Clean up previous frame threads
         for (int i = 0; i < activeThreads; i++) {
@@ -395,18 +434,28 @@ void Gpu3DRenderer::drawScanline1(int line) {
 
     int translucent[2048];
     int translucentCount = 0;
-
-    for (int i = 0; i < core->gpu3D.polygonCountOut; i++) {
-        if (line < polygonTop[i] || line >= polygonBot[i])
-            continue;
-
-        _Polygon *polygon = &core->gpu3D.polygonsOut[i];
-        if (polygon->alpha < 0x3F || polygon->textureFmt == 1 || polygon->textureFmt == 6)
-            translucent[translucentCount++] = i;
-        else
-            drawPolygon(line, i);
+    // v1.73: use prebuilt per-line lists (built once at line 0)
+    int cnt = linePolyCount[line];
+    if (!linePolyOverflow[line]) {
+        for (int k=0;k<cnt;k++) {
+            int i = linePolyIndices[line][k];
+            _Polygon *polygon = &core->gpu3D.polygonsOut[i];
+            if (polygon->alpha < 0x3F || polygon->textureFmt == 1 || polygon->textureFmt == 6)
+                translucent[translucentCount++] = i;
+            else
+                drawPolygon(line, i);
+        }
+    } else {
+        // overflow fallback: original scan (rare, >256 polys in one line)
+        for (int i = 0; i < core->gpu3D.polygonCountOut; i++) {
+            if (line < polygonTop[i] || line >= polygonBot[i]) continue;
+            _Polygon *polygon = &core->gpu3D.polygonsOut[i];
+            if (polygon->alpha < 0x3F || polygon->textureFmt == 1 || polygon->textureFmt == 6)
+                translucent[translucentCount++] = i;
+            else
+                drawPolygon(line, i);
+        }
     }
-
     for (int i = 0; i < translucentCount; i++)
         drawPolygon(line, translucent[i]);
 }
@@ -508,136 +557,157 @@ uint8_t *Gpu3DRenderer::getPalette(uint32_t address) {
     return slot ? &slot[address & 0x3FFF] : nullptr;
 }
 
-uint32_t Gpu3DRenderer::interpolateLinear(uint32_t v1, uint32_t v2, uint32_t x1, uint32_t x, uint32_t x2) {
-    if (x <= x1) return v1;
-    if (x >= x2) return v2;
-
+FORCE_INLINE uint32_t Gpu3DRenderer::interpolateLinear(uint32_t v1, uint32_t v2, uint32_t x1, uint32_t x, uint32_t x2) {
+    if (__builtin_expect(x <= x1, 0)) return v1;
+    if (__builtin_expect(x >= x2, 0)) return v2;
+    if (v1 == v2) return v1;
     if (v1 <= v2)
         return v1 + udivSpan((v2 - v1) * (x - x1), x2 - x1);
     else
         return v2 + udivSpan((v1 - v2) * (x2 - x), x2 - x1);
 }
-
-uint32_t Gpu3DRenderer::interpolateLinRev(uint32_t v1, uint32_t v2, uint32_t x1, uint32_t x, uint32_t x2) {
-    if (x <= x1) return v1;
-    if (x >= x2) return v2;
-
+FORCE_INLINE uint32_t Gpu3DRenderer::interpolateLinRev(uint32_t v1, uint32_t v2, uint32_t x1, uint32_t x, uint32_t x2) {
+    if (__builtin_expect(x <= x1, 0)) return v1;
+    if (__builtin_expect(x >= x2, 0)) return v2;
+    if (v1 == v2) return v1;
     if (v1 <= v2)
         return v2 - udivSpan((v2 - v1) * (x2 - x), x2 - x1);
     else
         return v1 - udivSpan((v1 - v2) * (x - x1), x2 - x1);
 }
-
-uint32_t Gpu3DRenderer::interpolateFactor(uint32_t factor, uint32_t shift, uint32_t v1, uint32_t v2) {
+FORCE_INLINE uint32_t Gpu3DRenderer::interpolateFactor(uint32_t factor, uint32_t shift, uint32_t v1, uint32_t v2) {
+    if (v1 == v2) return v1;
     if (v1 <= v2)
         return v1 + (((v2 - v1) * factor) >> shift);
     else
         return v2 + (((v1 - v2) * ((1 << shift) - factor)) >> shift);
 }
-
-uint32_t Gpu3DRenderer::interpolateColor(uint32_t c1, uint32_t c2, uint32_t x1, uint32_t x, uint32_t x2) {
-    uint32_t r = interpolateLinear((c1 >> 0) & 0x3F, (c2 >> 0) & 0x3F, x1, x, x2);
-    uint32_t g = interpolateLinear((c1 >> 6) & 0x3F, (c2 >> 6) & 0x3F, x1, x, x2);
-    uint32_t b = interpolateLinear((c1 >> 12) & 0x3F, (c2 >> 12) & 0x3F, x1, x, x2);
+FORCE_INLINE uint32_t Gpu3DRenderer::interpolateColor(uint32_t c1, uint32_t c2, uint32_t x1, uint32_t x, uint32_t x2) {
+    // v1.72: fast path when colors equal on that channel
+    uint32_t r1=(c1>>0)&0x3F, r2=(c2>>0)&0x3F;
+    uint32_t g1=(c1>>6)&0x3F, g2=(c2>>6)&0x3F;
+    uint32_t b1=(c1>>12)&0x3F,b2=(c2>>12)&0x3F;
+    uint32_t r = (r1==r2)?r1:interpolateLinear(r1,r2,x1,x,x2);
+    uint32_t g = (g1==g2)?g1:interpolateLinear(g1,g2,x1,x,x2);
+    uint32_t b = (b1==b2)?b1:interpolateLinear(b1,b2,x1,x,x2);
     uint32_t a = (((c1 >> 18) & 0x3F) > ((c2 >> 18) & 0x3F)) ? ((c1 >> 18) & 0x3F) : ((c2 >> 18) & 0x3F);
     return (a << 18) | (b << 12) | (g << 6) | r;
 }
 
 uint32_t Gpu3DRenderer::readTexture(_Polygon *polygon, int s, int t) {
+    return readTextureCached(-1, polygon, s, t);
+}
+uint32_t Gpu3DRenderer::readTextureCached(int polyIdx, _Polygon *polygon, int s, int t) {
+    // v1.72: branchless clamp/wrap using bit ops where possible
     if (polygon->repeatS) {
         if (polygon->flipS && (s & polygon->sizeS))
             s = -1 - s;
         s &= polygon->sizeS - 1;
+    } else {
+        // branchless clamp: s = max(0, min(s, sizeS-1))
+        s = s < 0 ? 0 : (s >= polygon->sizeS ? polygon->sizeS - 1 : s);
     }
-    else if (s < 0) {
-        s = 0;
-    }
-    else if (s >= polygon->sizeS) {
-        s = polygon->sizeS - 1;
-    }
-
     if (polygon->repeatT) {
         if (polygon->flipT && (t & polygon->sizeT))
             t = -1 - t;
         t &= polygon->sizeT - 1;
-    }
-    else if (t < 0) {
-        t = 0;
-    }
-    else if (t >= polygon->sizeT) {
-        t = polygon->sizeT - 1;
+    } else {
+        t = t < 0 ? 0 : (t >= polygon->sizeT ? polygon->sizeT - 1 : t);
     }
 
     switch (polygon->textureFmt) {
     case 1: {
-        uint32_t address = polygon->textureAddr + (t * polygon->sizeS + s);
-        uint8_t *data = getTexture(address);
-        if (!data) return 0;
-        uint8_t index = *data;
-
-        uint8_t *palette = getPalette(polygon->paletteAddr);
+        uint8_t index;
+        if (polyIdx >=0 && cachedUseFastTex[polyIdx]) {
+            index = cachedTexSlot0[polyIdx][t * polygon->sizeS + s];
+        } else {
+            uint32_t address = polygon->textureAddr + (t * polygon->sizeS + s);
+            uint8_t *data = getTexture(address);
+            if (!data) return 0;
+            index = *data;
+        }
+        uint8_t *palette = (polyIdx>=0 && cachedPalSlot[polyIdx]) ? cachedPalSlot[polyIdx] : getPalette(polygon->paletteAddr);
         if (!palette) return 0;
-
         uint16_t color = U8TO16(palette, (index & 0x1F) * 2) & ~BIT(15);
         uint8_t alpha = (index >> 5) * 4 + (index >> 5) / 2;
         return rgba5ToRgba6((alpha << 15) | color);
     }
 
     case 2: {
-        uint32_t address = polygon->textureAddr + (t * polygon->sizeS + s) / 4;
-        uint8_t *data = getTexture(address);
-        if (!data) return 0;
-        uint8_t index = (*data >> ((s % 4) * 2)) & 0x03;
-
+        uint8_t index;
+        if (polyIdx >=0 && cachedUseFastTex[polyIdx]) {
+            uint32_t off = (t * polygon->sizeS + s) / 4;
+            uint8_t data = cachedTexSlot0[polyIdx][off];
+            index = (data >> ((s % 4) * 2)) & 0x03;
+        } else {
+            uint32_t address = polygon->textureAddr + (t * polygon->sizeS + s) / 4;
+            uint8_t *data = getTexture(address);
+            if (!data) return 0;
+            index = (*data >> ((s % 4) * 2)) & 0x03;
+        }
         if (polygon->transparent0 && index == 0)
             return 0;
-
-        uint8_t *palette = getPalette(polygon->paletteAddr);
+        uint8_t *palette = (polyIdx>=0 && cachedPalSlot[polyIdx]) ? cachedPalSlot[polyIdx] : getPalette(polygon->paletteAddr);
         if (!palette) return 0;
-
         return rgba5ToRgba6((0x1F << 15) | U8TO16(palette, index * 2));
     }
 
     case 3: {
-        uint32_t address = polygon->textureAddr + (t * polygon->sizeS + s) / 2;
-        uint8_t *data = getTexture(address);
-        if (!data) return 0;
-        uint8_t index = (*data >> ((s % 2) * 4)) & 0x0F;
-
+        uint8_t index;
+        if (polyIdx >=0 && cachedUseFastTex[polyIdx]) {
+            uint32_t off = (t * polygon->sizeS + s) / 2;
+            uint8_t data = cachedTexSlot0[polyIdx][off];
+            index = (data >> ((s % 2) * 4)) & 0x0F;
+        } else {
+            uint32_t address = polygon->textureAddr + (t * polygon->sizeS + s) / 2;
+            uint8_t *data = getTexture(address);
+            if (!data) return 0;
+            index = (*data >> ((s % 2) * 4)) & 0x0F;
+        }
         if (polygon->transparent0 && index == 0)
             return 0;
-
-        uint8_t *palette = getPalette(polygon->paletteAddr);
+        uint8_t *palette = (polyIdx>=0 && cachedPalSlot[polyIdx]) ? cachedPalSlot[polyIdx] : getPalette(polygon->paletteAddr);
         if (!palette) return 0;
-
         return rgba5ToRgba6((0x1F << 15) | U8TO16(palette, index * 2));
     }
 
     case 4: {
-        uint32_t address = polygon->textureAddr + (t * polygon->sizeS + s);
-        uint8_t *data = getTexture(address);
-        if (!data) return 0;
-        uint8_t index = *data;
-
+        uint8_t index;
+        if (polyIdx >=0 && cachedUseFastTex[polyIdx]) {
+            index = cachedTexSlot0[polyIdx][t * polygon->sizeS + s];
+        } else {
+            uint32_t address = polygon->textureAddr + (t * polygon->sizeS + s);
+            uint8_t *data = getTexture(address);
+            if (!data) return 0;
+            index = *data;
+        }
         if (polygon->transparent0 && index == 0)
             return 0;
-
-        uint8_t *palette = getPalette(polygon->paletteAddr);
+        uint8_t *palette = (polyIdx>=0 && cachedPalSlot[polyIdx]) ? cachedPalSlot[polyIdx] : getPalette(polygon->paletteAddr);
         if (!palette) return 0;
-
         return rgba5ToRgba6((0x1F << 15) | U8TO16(palette, index * 2));
     }
 
     case 5: {
         int tile = (t / 4) * (polygon->sizeS / 4) + (s / 4);
         uint32_t address = polygon->textureAddr + (tile * 4 + t % 4);
-        uint8_t *data = getTexture(address);
-        if (!data) return 0;
-        uint8_t index = (*data >> ((s % 4) * 2)) & 0x03;
-
-        address = 0x20000 + (polygon->textureAddr % 0x20000) / 2 + ((polygon->textureAddr / 0x20000 == 2) ? 0x10000 : 0);
-        if (!(data = getTexture(address))) return 0;
-        uint16_t palBase = U8TO16(data, tile * 2);
+        uint8_t *data;
+        uint8_t index;
+        if (polyIdx>=0 && cachedTexSlot0[polyIdx]) {
+            // texture data is contiguous from slot base; tile addressing falls inside slot0 for size <=64KB
+            data = cachedTexSlot0[polyIdx] + ((address - polygon->textureAddr) & 0x1FFFF);
+            if (!data) return 0;
+            index = (*data >> ((s % 4) * 2)) & 0x03;
+            // palTex uses separate slot
+            if (cachedTexPalBase[polyIdx]) data = cachedTexPalBase[polyIdx] + (tile * 2);
+            else { address = 0x20000 + (polygon->textureAddr % 0x20000) / 2 + ((polygon->textureAddr / 0x20000 == 2) ? 0x10000 : 0); if (!(data = getTexture(address + tile * 2))) return 0; }
+        } else {
+            if (!(data = getTexture(address))) return 0;
+            index = (*data >> ((s % 4) * 2)) & 0x03;
+            address = 0x20000 + (polygon->textureAddr % 0x20000) / 2 + ((polygon->textureAddr / 0x20000 == 2) ? 0x10000 : 0);
+            if (!(data = getTexture(address + tile * 2))) return 0;
+        }
+        uint16_t palBase = U8TO16(data, 0);
         uint8_t *palette = getPalette(polygon->paletteAddr + (palBase & 0x3FFF) * 4);
         if (!palette) return 0;
 
@@ -683,26 +753,39 @@ uint32_t Gpu3DRenderer::readTexture(_Polygon *polygon, int s, int t) {
     }
 
     case 6: {
-        uint32_t address = polygon->textureAddr + (t * polygon->sizeS + s);
-        uint8_t *data = getTexture(address);
-        if (!data) return 0;
-        uint8_t index = *data;
-
-        uint8_t *palette = getPalette(polygon->paletteAddr);
+        uint8_t index;
+        if (polyIdx >=0 && cachedUseFastTex[polyIdx]) {
+            index = cachedTexSlot0[polyIdx][t * polygon->sizeS + s];
+        } else {
+            uint32_t address = polygon->textureAddr + (t * polygon->sizeS + s);
+            uint8_t *data = getTexture(address);
+            if (!data) return 0;
+            index = *data;
+        }
+        uint8_t *palette = (polyIdx>=0 && cachedPalSlot[polyIdx]) ? cachedPalSlot[polyIdx] : getPalette(polygon->paletteAddr);
         if (!palette) return 0;
-
         uint16_t color = U8TO16(palette, (index & 0x07) * 2) & ~BIT(15);
         uint8_t alpha = index >> 3;
         return rgba5ToRgba6((alpha << 15) | color);
     }
 
     default: {
-        uint8_t *data = getTexture(polygon->textureAddr);
-        if (!data) return 0;
-
-        uint16_t color = U8TO16(data, (t * polygon->sizeS + s) * 2);
-        uint8_t alpha = (color & BIT(15)) ? 0x1F : 0;
-        return rgba5ToRgba6((alpha << 15) | color);
+        uint8_t *data;
+        if (polyIdx>=0 && cachedUseFastTex[polyIdx]) {
+            data = cachedTexSlot0[polyIdx] - (polygon->textureAddr & 0x1FFFF) + (polygon->textureAddr & 0x1FFFF); // base already offset, but offset for default is different (direct color)
+            // For default (direct color) the tex is at base address, we need base+ (t*sizeS+s)*2
+            // cachedTexSlot0 is base at texAddr, so offset*2
+            uint32_t off = (t * polygon->sizeS + s) * 2;
+            uint16_t color = U8TO16(data, off);
+            uint8_t alpha = (color & BIT(15)) ? 0x1F : 0;
+            return rgba5ToRgba6((alpha << 15) | color);
+        } else {
+            data = getTexture(polygon->textureAddr);
+            if (!data) return 0;
+            uint16_t color = U8TO16(data, (t * polygon->sizeS + s) * 2);
+            uint8_t alpha = (color & BIT(15)) ? 0x1F : 0;
+            return rgba5ToRgba6((alpha << 15) | color);
+        }
     }}
 }
 
@@ -1300,7 +1383,48 @@ void Gpu3DRenderer::drawPolygon(int line, int polygonIndex) {
     int lastS = 0xFFFF, lastT = 0xFFFF;
     uint32_t texel;
 
+    // v1.75: DDA for linear spans (factor==-1) — avoid per-pixel divisions
+    struct DDA { int32_t cur; int32_t q; int32_t r; int32_t err; bool inc; int w; };
+    auto initDDA = [](DDA &d, uint32_t v0, uint32_t v1, int spanW){
+        d.w = spanW;
+        if (v0 <= v1) {
+            uint32_t delta = v1 - v0;
+            d.q = delta / (uint32_t)spanW;
+            d.r = delta % (uint32_t)spanW;
+            d.cur = (int32_t)v0;
+            d.err = 0;
+            d.inc = true;
+        } else {
+            uint32_t delta = v0 - v1;
+            d.q = delta / (uint32_t)spanW;
+            d.r = delta % (uint32_t)spanW;
+            d.cur = (int32_t)v0;
+            d.err = spanW - 1;
+            d.inc = false;
+        }
+    };
+    bool isLinear = (we[0] == we[1] && !(we[0] & 0x7F) && polygon->alpha != 0);
+    int spanW = (int)(x4 - x1); if (spanW <= 0) spanW = 1;
+    DDA dDepth, dR, dG, dB, dS, dT;
+    if (isLinear) {
+        if (polygon->wBuffer) initDDA(dDepth, we[0], we[1], spanW);
+        else initDDA(dDepth, ze[0], ze[1], spanW);
+        initDDA(dR, re[0], re[1], spanW);
+        initDDA(dG, ge[0], ge[1], spanW);
+        initDDA(dB, be[0], be[1], spanW);
+        if (polygon->textureFmt != 0) {
+            initDDA(dS, se[0]+0xFFFF, se[1]+0xFFFF, spanW);
+            initDDA(dT, te[0]+0xFFFF, te[1]+0xFFFF, spanW);
+        }
+    }
+    struct DDAGuard {
+        DDA *a,*b,*c,*d,*e,*f;
+        DDAGuard(DDA *aa,DDA *bb,DDA *cc,DDA *dd,DDA *ee,DDA *ff):a(aa),b(bb),c(cc),d(dd),e(ee),f(ff){}
+        ~DDAGuard(){ auto s=[](DDA *p){ if(!p) return; if(p->inc){ p->cur+=p->q; p->err+=p->r; if(p->err>=p->w){p->cur++; p->err-=p->w;}} else { p->cur-=p->q; p->err+=p->r; if(p->err>=p->w){p->cur--; p->err-=p->w;}}}; s(a); s(b); s(c); s(d); s(e); s(f); }
+    };
+    if (isLinear) {
     for (uint32_t x = x1; x < x4; x++) {
+        DDAGuard _guard(&dDepth, &dR, &dG, &dB, polygon->textureFmt? &dS:nullptr, polygon->textureFmt? &dT:nullptr);
         if (!horizontal && polygon->alpha == 0 && x == x2 + 1 && x3 > x2)
             x = x3;
 
@@ -1310,29 +1434,11 @@ void Gpu3DRenderer::drawPolygon(int line, int polygonIndex) {
         bool layer = 0;
         int i = line * 256 * 2 + x;
 
-        uint32_t factor;
-        if (we[0] == we[1] && !(we[0] & 0x7F))
-            factor = -1;
-        else if (x <= x1)
-            factor = 0;
-        else if (x >= x4)
-            factor = (1 << 8);
-        else if (resShift && ((x - x1) >> 8))
-            factor = (uint64_t(we[0] * (x - x1)) << 8) / (we[1] * (x4 - x) + we[0] * (x - x1));
-        else
-            factor = ((we[0] * (x - x1)) << 8) / (we[1] * (x4 - x) + we[0] * (x - x1));
-
-        int32_t depth;
+        // v1.75 linear fast path — DDA (no per-pixel div)
+        int32_t depth = dDepth.cur;
         if (polygon->wBuffer) {
-            depth = (factor == -1) ? interpolateLinear(we[0], we[1], x1, x, x4) :
-                interpolateFactor(factor, 8, we[0], we[1]);
-            if (polygon->wShift > 0)
-                depth <<= polygon->wShift;
-            else if (polygon->wShift < 0)
-                depth >>= -polygon->wShift;
-        }
-        else {
-            depth = interpolateLinear(ze[0], ze[1], x1, x, x4);
+            if (polygon->wShift > 0) depth <<= polygon->wShift;
+            else if (polygon->wShift < 0) depth >>= -polygon->wShift;
         }
 
         bool depthPass[2];
@@ -1373,33 +1479,18 @@ void Gpu3DRenderer::drawPolygon(int line, int polygonIndex) {
             layer = 1;
         }
 
-        uint32_t rv, gv, bv;
-        if (factor == -1) {
-            rv = interpolateLinear(re[0], re[1], x1, x, x4) >> 3;
-            gv = interpolateLinear(ge[0], ge[1], x1, x, x4) >> 3;
-            bv = interpolateLinear(be[0], be[1], x1, x, x4) >> 3;
-        }
-        else {
-            rv = interpolateFactor(factor, 8, re[0], re[1]) >> 3;
-            gv = interpolateFactor(factor, 8, ge[0], ge[1]) >> 3;
-            bv = interpolateFactor(factor, 8, be[0], be[1]) >> 3;
-        }
+        uint32_t rv = (uint32_t)dR.cur >> 3;
+        uint32_t gv = (uint32_t)dG.cur >> 3;
+        uint32_t bv = (uint32_t)dB.cur >> 3;
         uint32_t color = ((polygon->alpha ? polygon->alpha : 0x3F) << 18) | (bv << 12) | (gv << 6) | rv;
 
         if (polygon->textureFmt != 0) {
-            int s, t;
-            if (factor == -1) {
-                s = (int)(interpolateLinear(se[0] + 0xFFFF, se[1] + 0xFFFF, x1, x, x4) - 0xFFFF) >> 4;
-                t = (int)(interpolateLinear(te[0] + 0xFFFF, te[1] + 0xFFFF, x1, x, x4) - 0xFFFF) >> 4;
-            }
-            else {
-                s = (int)(interpolateFactor(factor, 8, se[0] + 0xFFFF, se[1] + 0xFFFF) - 0xFFFF) >> 4;
-                t = (int)(interpolateFactor(factor, 8, te[0] + 0xFFFF, te[1] + 0xFFFF) - 0xFFFF) >> 4;
-            }
+            int s = (int)(dS.cur - 0xFFFF) >> 4;
+            int t = (int)(dT.cur - 0xFFFF) >> 4;
 
             if (s != lastS || t != lastT) {
                 lastS = s; lastT = t;
-                texel = readTexture(polygon, s, t);
+                texel = readTextureCached(polygonIndex, polygon, s, t);
             }
 
             switch (polygon->mode) {
@@ -1539,6 +1630,248 @@ void Gpu3DRenderer::drawPolygon(int line, int polygonIndex) {
                 attribBuffer[1][i] = (attribBuffer[1][i] & (0x1FC03F | (polygon->fog << 13))) | BIT(12) | (polygon->id << 6);
             }
         }
+    }
+    } else {
+    for (uint32_t x = x1; x < x4; x++) {
+        if (!horizontal && polygon->alpha == 0 && x == x2 + 1 && x3 > x2)
+            x = x3;
+
+        if (x >= (256 << resShift))
+            break;
+
+        bool layer = 0;
+        int i = line * 256 * 2 + x;
+
+        uint32_t factor;
+        if (we[0] == we[1] && !(we[0] & 0x7F))
+            factor = -1;
+        else if (x <= x1)
+            factor = 0;
+        else if (x >= x4)
+            factor = (1 << 8);
+        else if (resShift && ((x - x1) >> 8))
+            factor = (uint64_t(we[0] * (x - x1)) << 8) / (we[1] * (x4 - x) + we[0] * (x - x1));
+        else
+            factor = ((we[0] * (x - x1)) << 8) / (we[1] * (x4 - x) + we[0] * (x - x1));
+
+        int32_t depth;
+        if (polygon->wBuffer) {
+            depth = (factor == -1) ? interpolateLinear(we[0], we[1], x1, x, x4) :
+                interpolateFactor(factor, 8, we[0], we[1]);
+            if (polygon->wShift > 0)
+                depth <<= polygon->wShift;
+            else if (polygon->wShift < 0)
+                depth >>= -polygon->wShift;
+        }
+        else {
+            depth = interpolateLinear(ze[0], ze[1], x1, x, x4);
+        }
+
+        bool depthPass[2];
+        if (polygon->depthTestEqual) {
+            uint32_t margin = (polygon->wBuffer ? 0xFF : 0x200);
+            depthPass[0] = (depthBuffer[0][i] >= depth - margin && depthBuffer[0][i] <= depth + margin);
+            depthPass[1] = (disp3DCnt & BIT(4)) && (attribBuffer[0][i] & BIT(14)) &&
+                (depthBuffer[1][i] >= depth - margin && depthBuffer[1][i] <= depth + margin);
+        }
+        else {
+            bool topQuadOutlineEdge = polygon->size == 4 && polygon->alpha == 63 &&
+                (disp3DCnt & BIT(5)) && shallowXMajorEdge &&
+                line == polygonTop[polygonIndex] + 1 && x >= (int)x3;
+            bool sameIdOutlineEdge = topQuadOutlineEdge && (attribBuffer[0][i] & BIT(14)) &&
+                ((attribBuffer[0][i] & 0x3F) == polygon->id);
+            uint32_t pixelDepth24 = (uint32_t)depth & 0x00FFFFFF;
+            bool wrappedDepthPass = (((uint32_t)depthBuffer[0][i] & 0x00FFFFFF) > pixelDepth24);
+            depthPass[0] = (depthBuffer[0][i] > depth) || (sameIdOutlineEdge && wrappedDepthPass);
+            depthPass[1] = (disp3DCnt & BIT(4)) && (attribBuffer[0][i] & BIT(14)) &&
+                (depthBuffer[1][i] > depth);
+        }
+
+        if (polygon->mode == 3) {
+            if (polygon->id == 0) {
+                if (!depthPass[0]) stencilBuffer[i] |= BIT(0);
+                if (!depthPass[1]) stencilBuffer[i] |= BIT(1);
+                continue;
+            }
+            else if (!depthPass[0] || !(stencilBuffer[i] & BIT(0)) || (attribBuffer[0][i] & 0x3F) == polygon->id) {
+                if (!depthPass[1] || !(stencilBuffer[i] & BIT(1)) || (attribBuffer[1][i] & 0x3F) == polygon->id)
+                    continue;
+                layer = 1;
+            }
+        }
+        else if (!depthPass[0]) {
+            if (!depthPass[1])
+                continue;
+            layer = 1;
+        }
+
+        uint32_t rv, gv, bv;
+        if (factor == -1) {
+            rv = interpolateLinear(re[0], re[1], x1, x, x4) >> 3;
+            gv = interpolateLinear(ge[0], ge[1], x1, x, x4) >> 3;
+            bv = interpolateLinear(be[0], be[1], x1, x, x4) >> 3;
+        }
+        else {
+            rv = interpolateFactor(factor, 8, re[0], re[1]) >> 3;
+            gv = interpolateFactor(factor, 8, ge[0], ge[1]) >> 3;
+            bv = interpolateFactor(factor, 8, be[0], be[1]) >> 3;
+        }
+        uint32_t color = ((polygon->alpha ? polygon->alpha : 0x3F) << 18) | (bv << 12) | (gv << 6) | rv;
+
+        if (polygon->textureFmt != 0) {
+            int s, t;
+            if (factor == -1) {
+                s = (int)(interpolateLinear(se[0] + 0xFFFF, se[1] + 0xFFFF, x1, x, x4) - 0xFFFF) >> 4;
+                t = (int)(interpolateLinear(te[0] + 0xFFFF, te[1] + 0xFFFF, x1, x, x4) - 0xFFFF) >> 4;
+            }
+            else {
+                s = (int)(interpolateFactor(factor, 8, se[0] + 0xFFFF, se[1] + 0xFFFF) - 0xFFFF) >> 4;
+                t = (int)(interpolateFactor(factor, 8, te[0] + 0xFFFF, te[1] + 0xFFFF) - 0xFFFF) >> 4;
+            }
+
+            if (s != lastS || t != lastT) {
+                lastS = s; lastT = t;
+                texel = readTextureCached(polygonIndex, polygon, s, t);
+            }
+
+            switch (polygon->mode) {
+            case 0: {
+                uint8_t r = ((((texel >> 0) & 0x3F) + 1) * (((color >> 0) & 0x3F) + 1) - 1) / 64;
+                uint8_t g = ((((texel >> 6) & 0x3F) + 1) * (((color >> 6) & 0x3F) + 1) - 1) / 64;
+                uint8_t b = ((((texel >> 12) & 0x3F) + 1) * (((color >> 12) & 0x3F) + 1) - 1) / 64;
+                uint8_t a = ((((texel >> 18) & 0x3F) + 1) * (((color >> 18) & 0x3F) + 1) - 1) / 64;
+                color = (a << 18) | (b << 12) | (g << 6) | r;
+                break;
+            }
+
+            case 1:
+            case 3: {
+                uint8_t at = ((texel >> 18) & 0x3F);
+                uint8_t r = (((texel >> 0) & 0x3F) * at + ((color >> 0) & 0x3F) * (63 - at)) / 64;
+                uint8_t g = (((texel >> 6) & 0x3F) * at + ((color >> 6) & 0x3F) * (63 - at)) / 64;
+                uint8_t b = (((texel >> 12) & 0x3F) * at + ((color >> 12) & 0x3F) * (63 - at)) / 64;
+                uint8_t a = ((color >> 18) & 0x3F);
+                color = (a << 18) | (b << 12) | (g << 6) | r;
+                break;
+            }
+
+            case 2: {
+                uint32_t toon = rgba5ToRgba6(toonTable[(color & 0x3F) / 2]);
+                uint8_t r, g, b;
+
+                if (disp3DCnt & BIT(1)) {
+                    r = ((((texel >> 0) & 0x3F) + 1) * (((color >> 0) & 0x3F) + 1) - 1) / 64;
+                    g = ((((texel >> 6) & 0x3F) + 1) * (((color >> 6) & 0x3F) + 1) - 1) / 64;
+                    b = ((((texel >> 12) & 0x3F) + 1) * (((color >> 12) & 0x3F) + 1) - 1) / 64;
+                    r += ((toon >> 0) & 0x3F); if (r > 63) r = 63;
+                    g += ((toon >> 6) & 0x3F); if (g > 63) g = 63;
+                    b += ((toon >> 12) & 0x3F); if (b > 63) b = 63;
+                }
+                else {
+                    r = ((((texel >> 0) & 0x3F) + 1) * (((toon >> 0) & 0x3F) + 1) - 1) / 64;
+                    g = ((((texel >> 6) & 0x3F) + 1) * (((toon >> 6) & 0x3F) + 1) - 1) / 64;
+                    b = ((((texel >> 12) & 0x3F) + 1) * (((toon >> 12) & 0x3F) + 1) - 1) / 64;
+                }
+
+                uint8_t a = ((((texel >> 18) & 0x3F) + 1) * (((color >> 18) & 0x3F) + 1) - 1) / 64;
+                color = (a << 18) | (b << 12) | (g << 6) | r;
+                break;
+            }}
+        }
+        else if (polygon->mode == 2) {
+            uint32_t toon = rgba5ToRgba6(toonTable[(color & 0x3F) / 2]);
+            uint8_t r, g, b;
+
+            if (disp3DCnt & BIT(1)) {
+                r = ((color >> 0) & 0x3F) + ((toon >> 0) & 0x3F); if (r > 63) r = 63;
+                g = ((color >> 6) & 0x3F) + ((toon >> 6) & 0x3F); if (g > 63) g = 63;
+                b = ((color >> 12) & 0x3F) + ((toon >> 12) & 0x3F); if (b > 63) b = 63;
+            }
+            else {
+                r = ((toon >> 0) & 0x3F);
+                g = ((toon >> 6) & 0x3F);
+                b = ((toon >> 12) & 0x3F);
+            }
+
+            color = (color & 0xFC0000) | (b << 12) | (g << 6) | r;
+        }
+
+        if (!(color & 0xFC0000) || ((x < x1e || x >= x4e) && ((color >> 18) == 0x3F || !(disp3DCnt & BIT(3)))))
+            continue;
+
+        if ((color >> 18) == 0x3F) {
+            uint8_t edgeAlpha = 0x3F;
+            bool edge = (x <= x2 || x >= x3 || horizontal);
+
+            if ((disp3DCnt & BIT(4)) && layer == 0 && edge) {
+                framebuffer[1][i] = framebuffer[0][i];
+                depthBuffer[1][i] = depthBuffer[0][i];
+                attribBuffer[1][i] = attribBuffer[0][i];
+
+                if (x <= x2 && x >= x3) {
+                    uint8_t leftAlpha = interpolateLinear(x1a, x2a, x1, x, x2);
+                    uint8_t rightAlpha = interpolateLinear(x3a, x4a, x3, x, x4);
+                    edgeAlpha = (leftAlpha > rightAlpha) ? leftAlpha : rightAlpha;
+                }
+                else if (x <= x2)
+                    edgeAlpha = interpolateLinear(x1a, x2a, x1, x, x2);
+                else if (x >= x3)
+                    edgeAlpha = interpolateLinear(x3a, x4a, x3, x, x4);
+
+                // DS edge coverage uses a truncated 18-bit reciprocal. A few
+                // X-major endpoint samples therefore have exactly zero coverage
+                // even when the linear edge-alpha interpolation rounds above zero.
+                if (aaRightXMajor && !swappedEdges && x > x2 && x >= x3 &&
+                    polygon->alpha == 63 && polygon->size > 4) {
+                    int edgeDx = abs(aaRightX1 - aaRightX0);
+                    int edgeDy = aaRightY1 - aaRightY0;
+                    if (edgeDx > 0 && edgeDy > 0) {
+                        int increment = edgeDx * ((1 << 18) / edgeDy);
+                        if (increment > 0x40000) {
+                            bool negative = aaRightX1 < aaRightX0;
+                            int dx = negative ? 0x60000 : (increment - 0x20000);
+                            dx += (line - aaRightY0) * increment;
+                            int dxWhole = dx >> 18;
+                            int length = (negative ? ((dx + increment) >> 18) - dxWhole :
+                                dxWhole - ((dx - increment) >> 18));
+                            int startX = negative ? edgeDx - dxWhole : dxWhole;
+                            startX = startX - length + 1;
+                            int xMin = (aaRightX0 < aaRightX1) ? aaRightX0 : aaRightX1;
+                            int xMax = ((aaRightX0 > aaRightX1) ? aaRightX0 : aaRightX1) - 1;
+                            int edgeEnd = negative ? aaRightX0 - dxWhole : aaRightX0 + dxWhole;
+                            if (edgeEnd < xMin) edgeEnd = xMin;
+                            if (edgeEnd > xMax) edgeEnd = xMax;
+                            int edgeStart = xMin + startX;
+                            if ((int)x >= edgeStart && (int)x <= edgeEnd) {
+                                int startCov = (((startX << 10) + 0x1FF) * edgeDy) / edgeDx;
+                                int xCov = (startCov & 0x3FF) + ((int)x - edgeStart) * ((edgeDy << 10) / edgeDx);
+                                int coverage = 31 - (xCov >> 5);
+                                if (coverage <= 0) edgeAlpha = 0;
+                            }
+                        }
+                    }
+                }
+            }
+
+            framebuffer[layer][i] = BIT(26) | color;
+            depthBuffer[layer][i] = depth;
+            attribBuffer[layer][i] = (attribBuffer[layer][i] & 0x0FC0) | (edgeAlpha << 15) |
+                (edge << 14) | (polygon->fog << 13) | polygon->id;
+        }
+        else if (!(attribBuffer[layer][i] & BIT(12)) || ((attribBuffer[layer][i] >> 6) & 0x3F) != polygon->id) {
+            framebuffer[layer][i] = BIT(26) | (((disp3DCnt & BIT(3)) && (framebuffer[layer][i] & 0xFC0000)) ?
+                interpolateColor(framebuffer[layer][i], color, 0, color >> 18, 63) : color);
+            if (polygon->transNewDepth) depthBuffer[layer][i] = depth;
+            attribBuffer[layer][i] = (attribBuffer[layer][i] & (0x1FC03F | (polygon->fog << 13))) | BIT(12) | (polygon->id << 6);
+
+            if ((disp3DCnt & BIT(4)) && layer == 0 && (attribBuffer[0][i] & BIT(14))) {
+                framebuffer[1][i] = BIT(26) | (((disp3DCnt & BIT(3)) && (framebuffer[1][i] & 0xFC0000)) ?
+                    interpolateColor(framebuffer[1][i], color, 0, color >> 18, 63) : color);
+                if (polygon->transNewDepth) depthBuffer[1][i] = depth;
+                attribBuffer[1][i] = (attribBuffer[1][i] & (0x1FC03F | (polygon->fog << 13))) | BIT(12) | (polygon->id << 6);
+            }
+        }
+    }
     }
 }
 

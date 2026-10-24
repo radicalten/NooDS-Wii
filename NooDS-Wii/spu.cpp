@@ -255,6 +255,12 @@ bool Spu::getSamples(uint32_t *dst, int count) {
 // applies back-pressure only if the ring exceeds SPU_TARGET_LATENCY (~62 ms).
 // ---------------------------------------------------------------------------
 void Spu::pushSample(int16_t sampleLeft, int16_t sampleRight) {
+    // v1.76: when audio emulation is off, do not enqueue or throttle — previously
+    // the ring filled (audio thread never drains) and fpsLimiter==1 caused
+    // 30 ms stalls per sample, dropping displayed FPS to 0 after ~62 ms.
+    if (!Settings::emulateAudio)
+        return;
+
     const uint32_t packed =
         ((uint32_t)(uint16_t)sampleRight << 16) |
         ((uint32_t)(uint16_t)sampleLeft  & 0xFFFF);

@@ -171,6 +171,7 @@ static int  settingsMenuIndex     = 0;
 static int  settingsDisplayOffset = 0;
 
 static int s_quitGameSentinel = 0;
+static int s_quitToHomeSentinel = 0;
 static int s_hideTopMenu      = 0;
 
 struct SettingsEntry {
@@ -200,6 +201,7 @@ static const char* const s_filterNames[] = {
 
 static const SettingsEntry s_settingsTable[] = {
     { "Quit Game",       &s_quitGameSentinel,     1,  nullptr,       0 },
+    { "Quit to Wii Menu",&s_quitToHomeSentinel,   1,  nullptr,       0 },
     { "Hide Top Menu",   &s_hideTopMenu,          2,  s_toggleNames, 2 },
     { "ARM JIT",         &Settings::armJit,       2,  s_toggleNames, 2 },
     { "Audio Emulation", &Settings::emulateAudio, 2,  s_toggleNames, 2 },
@@ -208,6 +210,7 @@ static const SettingsEntry s_settingsTable[] = {
     { "Screen 1 Size",   &Settings::screen1Size,  10, s_sizeNames,   10 },
     { "Screen 2 Size",   &Settings::screen2Size,  10, s_sizeNames,   10 },
     { "Swap Screens",    &Settings::screenSwap,   2,  s_toggleNames, 2 },
+    { "Stylus Edge Clamp",&Settings::stylusEdgeClamp, 2, s_toggleNames, 2 },
     { "Screen Gap",      &Settings::wiiScreenGap, 5,  s_gapNames,    5 },
     { "Screen Filter",   &Settings::screenFilter, 2,  s_filterNames, 2 },
     { "Direct Boot",     &Settings::directBoot,   2,  s_toggleNames, 2 },
@@ -225,6 +228,8 @@ static std::string SettingsEntryValue(const SettingsEntry& e) {
     if (!e.value) return "";
     if (e.value == &s_quitGameSentinel)
         return romLoaded ? "[Browse]" : "[In Menu]";
+    if (e.value == &s_quitToHomeSentinel)
+        return romLoaded ? "[Exit Wii]" : "[Exit Wii]";
     if (e.value == &Settings::frameskip) {
         int idx = Settings::frameskipToIndex(*e.value);
         return s_frameskipNames[idx];
@@ -263,7 +268,7 @@ static void OpenSettingsMenu() {
 
 static void StepSettingsEntry(int idx, int dir) {
     const SettingsEntry& e = s_settingsTable[idx];
-    if (!e.value || e.value == &s_quitGameSentinel) return;
+    if (!e.value || e.value == &s_quitGameSentinel || e.value == &s_quitToHomeSentinel) return;
     if (e.value == &s_hideTopMenu) {
         s_hideTopMenu = (s_hideTopMenu == 0) ? 1 : 0;
         if (s_hideTopMenu != 0) {
@@ -1384,6 +1389,17 @@ static void ReturnToFileBrowserFromGame() {
     FocusBrowserOnLastGame();
 }
 
+static void QuitToWiiMenuSafely() {
+    // Safe quit to Wii Menu / Homebrew Channel — mirrors HOME button path
+    Settings::save();
+    runEmulatorThread = false;
+    PPCCompilerBarrier();
+    KThreadJoin(&emulatorThread);
+    ShutdownAudio();
+    StopAndDeleteCore();
+    exit(0);
+}
+
 static uint16_t MapInputsToNDS(const ControllerState& cs, bool gbaMode) {
     const u32 held = cs.wpadHeld;
     const u32 gcHeld = cs.gcHeld;
@@ -1555,10 +1571,14 @@ static void HandleSettingsInput(const ControllerState& cs)
     bool confirmAction = (pressed & (WPAD_BUTTON_A | WPAD_BUTTON_2 | WPAD_CLASSIC_BUTTON_A))
                        || (gcPressed & PAD_BUTTON_A);
 
-    // Special action row: Quit Game -> save & return cleanly to ROM Browser!
-    if (s_settingsTable[settingsMenuIndex].value == &s_quitGameSentinel) {
+    // Special action rows: Quit Game -> file browser, Quit to Wii Menu -> HOME exit
+    if (s_settingsTable[settingsMenuIndex].value == &s_quitGameSentinel ||
+        s_settingsTable[settingsMenuIndex].value == &s_quitToHomeSentinel) {
         if (confirmAction) {
-            ReturnToFileBrowserFromGame();
+            if (s_settingsTable[settingsMenuIndex].value == &s_quitGameSentinel)
+                ReturnToFileBrowserFromGame();
+            else
+                QuitToWiiMenuSafely();
             return;
         }
     } else {
@@ -1895,13 +1915,32 @@ static void ScanWiiInputs() {
         int16_t touchY = 0;
 
         if (g_cursorShow) {
-            if (touchVis &&
-                g_cursorX >= dsLeft  && g_cursorX <= dsRight &&
-                g_cursorY >= dsTop   && g_cursorY <= dsBottom) {
-                touchX = (int16_t)(((g_cursorX - dsLeft) /
-                                    (dsRight  - dsLeft)) * 256.0f);
-                touchY = (int16_t)(((g_cursorY - dsTop)  /
-                                    (dsBottom - dsTop))  * 192.0f);
+            if (touchVis) {
+                bool inside = (g_cursorX >= dsLeft  && g_cursorX <= dsRight &&
+                               g_cursorY >= dsTop   && g_cursorY <= dsBottom);
+                if (inside) {
+                    touchX = (int16_t)(((g_cursorX - dsLeft) /
+                                        (dsRight  - dsLeft)) * 256.0f);
+                    touchY = (int16_t)(((g_cursorY - dsTop)  /
+                                        (dsBottom - dsTop))  * 192.0f);
+                } else if (isTouching && Settings::stylusEdgeClamp) {
+                    // Clamp off-screen press to nearest edge (cyan square outside → touch at boundary)
+                    float cx = g_cursorX;
+                    if (cx < dsLeft)  cx = dsLeft;
+                    else if (cx > dsRight) cx = dsRight;
+                    float cy = g_cursorY;
+                    if (cy < dsTop)    cy = dsTop;
+                    else if (cy > dsBottom) cy = dsBottom;
+                    float fx = (cx - dsLeft) / (dsRight  - dsLeft) * 256.0f;
+                    float fy = (cy - dsTop)  / (dsBottom - dsTop)  * 192.0f;
+                    if (fx < 0.0f) fx = 0.0f; else if (fx > 255.0f) fx = 255.0f;
+                    if (fy < 0.0f) fy = 0.0f; else if (fy > 191.0f) fy = 191.0f;
+                    touchX = (int16_t)fx;
+                    touchY = (int16_t)fy;
+                    // keep isTouching = true (clamped touch)
+                } else {
+                    isTouching = false;
+                }
             } else {
                 isTouching = false;
             }

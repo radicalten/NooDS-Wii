@@ -109,8 +109,31 @@ private:
 
     static uint32_t rgb5ToRgb6(uint32_t color);
 
-    void drawBgPixel(int bg, int line, int x, uint32_t pixel);
-    void drawObjPixel(int line, int x, uint32_t pixel, int8_t priority);
+    // v1.72: inline hot pixel helpers and precomputed window/brightness caches
+    FORCE_INLINE void drawBgPixel(int bg, int line, int x, uint32_t pixel);
+    FORCE_INLINE void drawObjPixel(int line, int x, uint32_t pixel, int8_t priority);
+    FORCE_INLINE uint16_t fastRead16(uint32_t addr);
+    FORCE_INLINE uint32_t fastRead32(uint32_t addr);
+    FORCE_INLINE uint8_t  fastRead8 (uint32_t addr);
+    template<bool GBA> FORCE_INLINE uint16_t fastRead16T(uint32_t addr);
+    template<bool GBA> FORCE_INLINE uint32_t fastRead32T(uint32_t addr);
+    template<bool GBA> FORCE_INLINE uint8_t  fastRead8T (uint32_t addr);
+    // precomputed per-scanline window mask (valid after updateWindows)
+    uint8_t winMaskCache[256] = {};
+    bool winMaskValid = false;
+    void buildWindowMask(int line);
+    static uint8_t s_brightIncTable[64][17];
+    static uint8_t s_brightDecTable[64][17];
+    static bool s_brightTablesReady;
+    static void ensureBrightTables();
+    // v1.74: GBA 5-bit brightness LUTs (reuse same ensure)
+    static uint8_t s_brightIncTable5[32][17];
+    static uint8_t s_brightDecTable5[32][17];
+    // v1.73: alpha-blend LUT for common eva+evb==16 case (17*4096)
+    static uint8_t s_alphaLUT[17][4096];
+    static bool s_alphaLUTReady;
+    static void ensureAlphaLUT();
+    FORCE_INLINE static uint8_t alphaBlend6(uint8_t src, uint8_t dst, uint8_t eva);
 
     template <bool gbaMode> void drawText(int bg, int line);
     template <bool gbaMode> void drawAffine(int bg, int line);

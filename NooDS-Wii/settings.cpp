@@ -44,6 +44,7 @@ int Settings::wiiScreenGap = 1;
 int Settings::armJit       = 1;
 int Settings::arm7Hle      = 0;
 int Settings::dsiMode      = 0;
+int Settings::stylusEdgeClamp = 1; // default On — off-screen press snaps to nearest edge
 
 const int Settings::FRAMESKIP_VALUES[Settings::FRAMESKIP_COUNT] = {
     0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 15, 20, 30
@@ -101,6 +102,7 @@ std::vector<Setting> Settings::settings = {
     Setting("armJit",       &armJit,       false),
     Setting("arm7Hle",      &arm7Hle,      false),
     Setting("dsiMode",      &dsiMode,      false),
+    Setting("stylusEdgeClamp", &stylusEdgeClamp, false),
     Setting("bios9Path",    &bios9Path,    true),
     Setting("bios7Path",    &bios7Path,    true),
     Setting("firmwarePath", &firmwarePath, true),
@@ -169,6 +171,7 @@ bool Settings::load(std::string path) {
     if (wiiScreenGap < 0 || wiiScreenGap > 4) wiiScreenGap = 1;
     if (screenFilter < 0 || screenFilter > 2) screenFilter = 0;
     armJit = (armJit != 0) ? 1 : 0;
+    stylusEdgeClamp = (stylusEdgeClamp != 0) ? 1 : 0;
     return true;
 }
 

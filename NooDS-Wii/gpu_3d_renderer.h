@@ -67,6 +67,16 @@ private:
     int polygonTop[2048] = {};
     int polygonBot[2048] = {};
     bool polygonSharesSameIdOpaqueEdge[2048] = {};
+    // v1.72: per-polygon cached texture/palette bases for fast pixel fetch
+    uint8_t *cachedTexSlot0[2048] = {};
+    uint8_t *cachedTexSlot1[2048] = {};
+    uint8_t *cachedPalSlot[2048] = {};
+    uint8_t *cachedTexPalBase[2048] = {}; // for fmt5
+    bool cachedUseFastTex[2048] = {};
+    // v1.73: per-scanline active polygon lists (built once per frame, safe for dynamic)
+    int linePolyCount[384] = {};
+    int linePolyIndices[384][256] = {}; // cap 256 per line, overflow falls back to scan
+    bool linePolyOverflow[384] = {};
 
     // Tuxedo Thread Structures
     uint8_t activeThreads = 0;
@@ -101,5 +111,6 @@ private:
     static uint32_t interpolateColor(uint32_t c1, uint32_t c2, uint32_t x1, uint32_t x, uint32_t x2);
 
     uint32_t readTexture(_Polygon *polygon, int s, int t);
+    uint32_t readTextureCached(int polyIdx, _Polygon *polygon, int s, int t);
     void drawPolygon(int line, int polygonIndex);
 };
