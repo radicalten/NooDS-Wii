@@ -1,3 +1,4 @@
+
 /*
     Copyright (C) 2019-2025 Hydr8gon
     Copyright (C) 2026 radicalten
@@ -18,6 +19,9 @@
     along with NooDS-Wii. If not, see <https://www.gnu.org/licenses/>.
 */
 
+#ifndef NOODS_VRAM_MAP_FAST
+#define NOODS_VRAM_MAP_FAST 1
+#endif
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
@@ -35,6 +39,9 @@
 #endif
 
 Memory::Memory(Core *core, bool gbaOnly): core(core) {
+    gbaBusFast = &core->gbaBus;
+    gbaCyclesFast = core->interpreter[1].cyclesPtr();
+    gbaGlobalFast = &core->globalCycles;
     if (Settings::dsiMode)
         ramAllocBytes = 0x1000000u;
     else if (gbaOnly && !NOODS_FULL_RAM_DUMP)
@@ -191,6 +198,7 @@ void Memory::loadState(FILE *file) {
     fread(vramH, 1, sizeof(vramH), file);
     fread(vramI, 1, sizeof(vramI), file);
     fread(oam, 1, sizeof(oam), file);
+    oamGen++;
     fread(&gbaBiosAddr, sizeof(gbaBiosAddr), 1, file);
     fread(&gbaBiosOpenBus, sizeof(gbaBiosOpenBus), 1, file);
     fread(&gbaDmaOpenBus, sizeof(gbaDmaOpenBus), 1, file);
@@ -349,6 +357,55 @@ void Memory::updateMap9(uint32_t start, uint32_t end, bool tcm) {
 #endif
 }
 
+// v1.121: the page tables for 0x06000000-0x06FFFFFF after a VRAMCNT write. updateMap9 and
+// updateMap7 go through their whole address decoder for each of the 4,096 pages (twice on the
+// ARM9, once per table set); a game that rebanks VRAM several times a frame (Animal Crossing:
+// Wild World does about six) spent 5 % of the frame there. VRAM is mapped in 16 KB units on
+// the ARM9 and 128 KB units on the ARM7, so the tables are filled directly from the bank
+// lists. Same contents as the general functions, which still handle the rare layouts (a TCM
+// placed over the VRAM range, GBA mode).
+void Memory::updateVramMaps() {
+    const uint64_t dtcmLo = core->cp15.dtcmAddr, dtcmHi = dtcmLo + core->cp15.dtcmSize;
+    const bool tcmClear = core->cp15.itcmSize <= 0x6000000u && (dtcmHi <= 0x6000000u || dtcmLo >= 0x7000000u);
+    if (!NOODS_VRAM_MAP_FAST || !readMap9B || !writeMap9B || !tcmClear || core->gbaMode) {
+        updateMap9(0x6000000, 0x7000000);
+        updateMap7(0x6000000, 0x7000000);
+        return;
+    }
+    for (uint32_t address = 0x6000000; address < 0x7000000; address += 0x4000) {
+        VramMapping *mapping;
+        switch (address & 0xFFE00000) {
+            case 0x6000000: mapping = &engABg[(address & 0x7FFFF) >> 14]; break;
+            case 0x6200000: mapping = &engBBg[(address & 0x1FFFF) >> 14]; break;
+            case 0x6400000: mapping = &engAObj[(address & 0x3FFFF) >> 14]; break;
+            case 0x6600000: mapping = &engBObj[(address & 0x1FFFF) >> 14]; break;
+            default: mapping = &lcdc[(address & 0xFFFFF) >> 14]; break;
+        }
+        uint8_t *const base = (mapping->count == 1) ? mapping->mappings[0] : nullptr;
+        const uint32_t page = address >> 12;
+        for (uint32_t k = 0; k < 4; k++) {
+            uint8_t *const ptr = base ? base + (k << 12) : nullptr;
+            readMap9A[page + k] = ptr;
+            writeMap9A[page + k] = ptr;
+            readMap9B[page + k] = ptr;
+            writeMap9B[page + k] = ptr;
+        }
+    }
+    for (uint32_t address = 0x6000000; address < 0x7000000; address += 0x1000) {
+        VramMapping *mapping = &vram7[(address & 0x3FFFF) >> 17];
+        uint8_t *const ptr = (mapping->count == 1) ? &mapping->mappings[0][address & 0x1FFFF] : nullptr;
+        readMap7[address >> 12] = ptr;
+        writeMap7[address >> 12] = ptr;
+    }
+    // as updateMap9 / updateMap7 do: refresh the opcode pointers, drop blocks compiled from here
+    core->interpreter[0].getOpcode16();
+    core->interpreter[1].getOpcode16();
+#if NOODS_JIT
+    ArmPpcJit::invalidateMapRange(false, 0x6000000, 0x7000000);
+    ArmPpcJit::invalidateMapRange(true, 0x6000000, 0x7000000);
+#endif
+}
+
 void Memory::updateMap7(uint32_t start, uint32_t end) {
     // Update the ARM7 read and write memory maps in the given range
     for (uint64_t address = start; address < end; address += 0x1000) {
@@ -370,6 +427,12 @@ void Memory::updateMap7(uint32_t start, uint32_t end) {
 
             case 0x6000000: // VRAM
                 read = write = &vramC[address & ((address & 0x10000) ? 0x17FFF : 0xFFFF)];
+                // v1.107/v1p171: with relaxed GBA timing, JIT blocks store through this
+                // table directly; GBA VRAM byte writes have special rules, so every VRAM
+                // write is sent through writeFallback. Setting is fixed at boot, before
+                // any map is built, so a plain branch is safe here.
+                if (Settings::gbaFastTiming)
+                    write = nullptr;
                 break;
 
             case 0x8000000: case 0x9000000: case 0xA000000:
@@ -436,7 +499,10 @@ void Memory::updateMap7(uint32_t start, uint32_t end) {
 #endif
 }
 
+uint32_t g_vramGen = 1; // v1.111: bumped whenever texture memory may have changed
+
 void Memory::updateVram() {
+    g_vramGen++;
     // Clear the previous VRAM mappings
     memset(engABg, 0, sizeof(engABg));
     memset(engBBg, 0, sizeof(engBBg));
@@ -704,8 +770,8 @@ void Memory::updateVram() {
     }
 
     // Update the memory maps at the VRAM locations
-    updateMap9(0x6000000, 0x7000000);
-    updateMap7(0x6000000, 0x7000000);
+    g_evCnt[3]++;
+    updateVramMaps();
     core->gpu.invalidate3D();
 }
 
@@ -720,7 +786,7 @@ void Memory::onGbaCpuDataAccess(uint32_t address, uint32_t sizeBytes, bool isLoa
 }
 
 bool Memory::handleMpuDataAbort(uint32_t address, bool isWrite) {
-    if (!core->cp15.checkAccess(address, isWrite, true, core->interpreter[0].isPrivileged())) {
+    if (!core->cp15.checkAccessPage(address, isWrite, true, core->interpreter[0].isPrivileged())) {
         core->interpreter[0].dataAbort = true;
         return true;
     }
@@ -889,6 +955,14 @@ template <typename T> T Memory::readFallback(bool arm7, uint32_t address) {
 
     // Handle special memory reads such as I/O registers, overlapping VRAM, or areas smaller than 4KB
     if (!arm7) { // ARM9
+        // v1.122: the three registers a game polls while it loads from the card (transfer
+        // status, card data) or feeds the geometry engine (GXSTAT), read as whole words.
+        // Same values as the ioRead9 cases, without the walk through its switch.
+        if (sizeof(T) == 4) {
+            if (address == 0x040001A4u) return (T)core->cartridgeNds.readRomCtrl(0);
+            if (address == 0x04100010u) return (T)core->cartridgeNds.readRomDataIn(0);
+            if (address == 0x04000600u) return (T)core->gpu3D.readGxStat();
+        }
         // Fast path for halfword polls of DISPSTAT: same value as ioRead9 (single aligned halfword, base 0)
         if (sizeof(T) == 2 && address == 0x04000004u) return core->gpu.readDispStat(0);
         switch (address & 0xFF000000) {
@@ -1021,6 +1095,19 @@ template <typename T> void Memory::writeFallback(bool arm7, uint32_t address, T 
     if (!arm7) { // ARM9
         switch (address & 0xFF000000) {
         case 0x4000000: // I/O registers
+            // v1.117: geometry command ports are tested here, before the call into the
+            // register switch (a very large function that saves every register on entry).
+            if (sizeof(T) == 4) {
+                const uint32_t off = address - 0x4000440;
+                if (off < 0x18C) {
+                    const uint32_t cmd = (off >> 2) + 0x10;
+                    static const uint32_t valid[4] = { 0x1FFF0000u, 0x001F0FFFu, 0x00010003u, 0x00070001u };
+                    if (valid[cmd >> 5] & (1u << (cmd & 31))) {
+                        core->gpu3D.writeCommandPort(cmd, (uint32_t)value);
+                        return;
+                    }
+                }
+            }
             ioWrite9<T>(address, value);
             return;
 
@@ -1047,6 +1134,7 @@ template <typename T> void Memory::writeFallback(bool arm7, uint32_t address, T 
 
         case 0x7000000: // OAM
             data = &oam[address & 0x7FF];
+            oamGen++; // v1.123
             break;
 
         case 0xA000000: // GBA SRAM
@@ -1079,12 +1167,17 @@ template <typename T> void Memory::writeFallback(bool arm7, uint32_t address, T 
                 }
                 return;
             }
+            if (Settings::gbaFastTiming)
+                data = &vramC[address & ((address & 0x10000) ? 0x17FFF : 0xFFFF)]; // not in write table
             break;
 
         case 0x7000000: // OAM (ignores 8-bit writes)
             if constexpr (sizeof(T) == 1)
                 return;
             data = &oam[address & 0x3FF];
+#if NOODS_GBA_OBJ_MASK
+            if (GbaObjMask::changesMembership(oam,address,value,sizeof(T))) ++oamGen;
+#endif
             break;
 
         case 0x8000000: // GPIO
@@ -1581,6 +1674,20 @@ template <typename T> T Memory::ioReadGba(uint32_t address) {
 
 template <typename T> void Memory::ioWrite9(uint32_t address, T value) {
     // Write a value to one or more ARM9 I/O registers
+    // v1.115: the geometry command ports (0x4000440-0x40005C8, command = offset / 4) are by
+    // far the most written registers in a 3D game; send a whole-word write straight to the
+    // command FIFO instead of through the register switch below.
+    if (sizeof(T) == 4) {
+        const uint32_t off = address - 0x4000440;
+        if (off < 0x18C && !(off & 3)) {
+            const uint32_t cmd = (off >> 2) + 0x10;
+            static const uint32_t valid[4] = { 0x1FFF0000u, 0x001F0FFFu, 0x00010003u, 0x00070001u };
+            if (valid[cmd >> 5] & (1u << (cmd & 31))) {
+                core->gpu3D.writeCommandPort(cmd, (uint32_t)value);
+                return;
+            }
+        }
+    }
     for (uint32_t i = 0; i < sizeof(T);) {
         // Store data to a register
         uint32_t base, size, data = value >> (i * 8);
@@ -2318,6 +2425,7 @@ void Memory::writeVramCnt(int index, uint8_t value) {
 void Memory::writeWramCnt(uint8_t value) {
     // Write to the WRAMCNT register and update WRAM mappings
     wramCnt = value & 0x3;
+    g_evCnt[2]++;
     updateMap9(0x3000000, 0x4000000);
     updateMap7(0x3000000, 0x4000000);
 }

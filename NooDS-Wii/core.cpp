@@ -20,6 +20,10 @@
 
 #include <algorithm>
 #include <cstring>
+#if NOODS_TEST_MEM_DIAG
+#include <gccore.h>
+#include <malloc.h>
+#endif
 
 extern "C" {
     #include <tuxedo/thread.h>
@@ -152,6 +156,24 @@ Core::Core(std::string ndsRom, std::string gbaRom, int id,
     tasks[GBA_SIO_TRANSFER] = SchedCallback(shim_gbaSioTransfer, &memory);
 
 #if NOODS_JIT
+#ifdef GEKKO
+    // This is the only active core: the previous core and its JIT entries must
+    // already be destroyed before sharing this arena with either code or ROM.
+    extern void *Wii_ConfigureJitArena(bool standaloneGba, size_t *bytes);
+    size_t jitBytes = 0;
+    const bool jitGbaOnly = (gbaRom != "" || gbaRomFd != -1) && ndsRom == "" && ndsRomFd == -1;
+    void *jitMemory = Wii_ConfigureJitArena(jitGbaOnly, &jitBytes);
+#if NOODS_TEST_MEM_DIAG
+    struct mallinfo mi = mallinfo();
+    SYS_Report("[NOODS] TEST_ARENA pool=%p bytes=%u heap=%u free=%u used=%u\n", jitMemory, (unsigned)jitBytes, (unsigned)mi.arena, (unsigned)mi.fordblks, (unsigned)mi.uordblks);
+#endif
+#if NOODS_TEST_RESERVE_MIB
+    static void *reserved = nullptr;
+    if (!jitGbaOnly && !reserved) reserved = Noods_MEM2_Alloc(NOODS_TEST_RESERVE_MIB * 1024u * 1024u);
+    SYS_Report("[NOODS] TEST_RESERVE ptr=%p bytes=%u\n", reserved, (unsigned)(NOODS_TEST_RESERVE_MIB * 1024u * 1024u));
+#endif
+    ArmPpcJit::configureCodePool(jitMemory, jitBytes);
+#endif
     ArmPpcJit::reset();
 #endif
 
@@ -201,9 +223,15 @@ Core::Core(std::string ndsRom, std::string gbaRom, int id,
     // NDS ROM
     // ------------------------------------------------------------------
     if (ndsRom != "" || ndsRomFd != -1) {
+#if NOODS_TEST_MEM_DIAG
+        SYS_Report("[NOODS] TEST_ROM_START inram=%d\n", Settings::romInRam);
+#endif
         if (!cartridgeNds.setRom(ndsRom, ndsRomFd, ndsSaveFd, ndsStateFd, ndsCheatFd))
             throw ERROR_ROM;
 
+#if NOODS_TEST_MEM_DIAG
+        SYS_Report("[NOODS] TEST_ROM_LOADED\n");
+#endif
         actionReplay.loadCheats();
 
         if (Settings::directBoot) {
@@ -227,7 +255,13 @@ Core::Core(std::string ndsRom, std::string gbaRom, int id,
             memory.write<uint32_t>(0,  0x27FFC04, 0x00001FC2);
             memory.write<uint16_t>(0,  0x27FFC10, 0x5835);
             memory.write<uint16_t>(0,  0x27FFC40, 0x0001);
+#if NOODS_TEST_MEM_DIAG
+            SYS_Report("[NOODS] TEST_DIRECT_BOOT_START\n");
+#endif
             cartridgeNds.directBoot();
+#if NOODS_TEST_MEM_DIAG
+            SYS_Report("[NOODS] TEST_DIRECT_BOOT_DONE\n");
+#endif
             interpreter[0].directBoot();
             interpreter[1].directBoot();
             spi.directBoot();
@@ -292,7 +326,10 @@ void Core::loadState(FILE* file) {
 // ---------------------------------------------------------------------------
 // updateRun — select the tightest interpreter loop for the current state
 // ---------------------------------------------------------------------------
+uint32_t g_evCnt[12];
+
 void Core::updateRun() {
+    g_evCnt[7]++;
     if (interpreter[0].halted && interpreter[1].halted)
         runFunc = &Interpreter::runCoreNone;
     else if (gbaMode)
@@ -305,6 +342,9 @@ void Core::updateRun() {
         runFunc = &Interpreter::runCoreSingle<true, 1>;
     else
         runFunc = &Interpreter::runCoreSingle<false, 0>;
+#if NOODS_JIT
+    ArmPpcJit::setSolo(runFunc == &Interpreter::runCoreSingle<false, 0>);
+#endif
 
     PPCIrqState st = PPCIrqLockByMsr();
     running = 0;
@@ -384,6 +424,7 @@ void Core::enterGbaMode() {
 void Core::endFrame() {
     PPCIrqState st = PPCIrqLockByMsr();
     running = 0;
+    frameEnded = true;
     PPCIrqUnlockByMsr(st);
 
     fpsCount++;

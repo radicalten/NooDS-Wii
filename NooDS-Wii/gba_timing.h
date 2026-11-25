@@ -1,6 +1,21 @@
 /*
     Copyright (C) 2026 radicalten
 
+    This file is part of NooDS-Wii.
+
+    NooDS-Wii is free software: you can redistribute it and/or modify it
+    under the terms of the GNU General Public License as published by
+    the Free Software Foundation, either version 3 of the License, or
+    (at your option) any later version.
+
+    NooDS-Wii is distributed in the hope that it will be useful, but
+    WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+    General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with NooDS-Wii. If not, see <https://www.gnu.org/licenses/>.
+    
     Cycle-accurate GBA Memory Controller, Waitstate Decoder, and 8-Halfword
     GamePak Prefetch Buffer model for NooDS-Wii.
 */
@@ -203,6 +218,38 @@ struct GbaBus {
         advancePrefetchOnly(cyc, waitCnt);
         nextSeq = true;
         return cyc;
+    }
+
+    // Fast path for the dominant case: sequential THUMB fetch from GamePak ROM
+    // served by the prefetch buffer. Returns the cycle count, or -1 to tell the
+    // caller to use fetchOpcode(). State changes are identical to the slow path.
+    inline int fetchThumbRomSeq(uint32_t addr, uint16_t waitCnt) {
+        if (__builtin_expect(!((waitCnt & (1u << 14)) && active && count != 0), 0))
+            return -1;
+        const uint32_t aligned = addr & ~1u;
+        if (aligned != headAddr)
+            return -1;
+        const uint32_t region = (addr >> 24) & 0xFFu;
+        if (region < 0x08u || region >= 0x0Eu)
+            return -1;
+        count--;                       // slow path decrements before computing target
+        const int req = prefetcherTargetCycles(waitCnt);
+        const int rem = req - duty;
+        if (rem <= 0) {                // waitstate changes can require multiple refills
+            count++;
+            return -1;                 // no state changes on fallback
+        }
+        lastFetchUsedDuty = false;
+        headAddr = aligned + 2u;
+        if (1 >= rem) {
+            duty = 0;
+            count++;
+            tailAddr += 2;
+        } else {
+            duty += 1;
+        }
+        nextSeq = true;                // assigned last: the call above reads the old value
+        return 1;
     }
 
     inline int branchRefill(uint32_t targetPc, bool isArm, uint16_t waitCnt) {

@@ -19,6 +19,10 @@
 */
 
 #include <cstring>
+#if NOODS_TEST_MOVE_GHOST
+#include <cstdlib>
+#include <gccore.h>
+#endif
 #include "core.h"
 
 Gpu::Gpu(Core *core): core(core) {
@@ -112,6 +116,78 @@ uint16_t Gpu::rgb6ToRgb5(uint32_t color) {
     return s_colorLuts.rgb6LoTo5[color & 0xFFFu] | (((color >> 13) & 0x1Fu) << 10);
 }
 
+// v1.112: one pass from the 18-bit DS image to a GX RGB565 texture. This replaces the
+// conversion to 32-bit colour through lookup tables on the emulator thread plus the
+// re-tiling of that image into an RGBA8 texture on the display thread.
+// v1.118: two 18-bit pixels to one word of two RGB565 pixels with six rotate-and-insert
+// instructions (the compiler's version of the same shifts and masks took about twice that).
+static inline __attribute__((always_inline)) uint32_t pack565(uint32_t a, uint32_t b) {
+#if defined(__PPC__) || defined(__powerpc__)
+    uint32_t t;
+    __asm__("rlwinm %0,%1,26,0,4\n\t"
+            "rlwimi %0,%1,15,5,10\n\t"
+            "rlwimi %0,%1,3,11,15\n\t"
+            "rlwimi %0,%2,10,16,20\n\t"
+            "rlwimi %0,%2,31,21,26\n\t"
+            "rlwimi %0,%2,19,27,31"
+            : "=&r"(t) : "r"(a), "r"(b));
+    return t;
+#else
+    #define C565(v) ((((v) & 0x3Eu) << 10) | (((v) & 0xFC0u) >> 1) | (((v) >> 13) & 0x1Fu))
+    return (C565(a) << 16) | C565(b);
+    #undef C565
+#endif
+}
+
+static void tile565(const uint32_t *__restrict__ src, uint8_t *__restrict__ dst8) {
+    uint32_t *dst = (uint32_t*)dst8;
+    for (int ty = 0; ty < 192; ty += 4) {
+        const uint32_t *r0 = src + ty * 256, *r1 = r0 + 256, *r2 = r1 + 256, *r3 = r2 + 256;
+        for (int tx = 0; tx < 256; tx += 4, dst += 8) {
+            dst[0] = pack565(r0[tx], r0[tx + 1]);
+            dst[1] = pack565(r0[tx + 2], r0[tx + 3]);
+            dst[2] = pack565(r1[tx], r1[tx + 1]);
+            dst[3] = pack565(r1[tx + 2], r1[tx + 3]);
+            dst[4] = pack565(r2[tx], r2[tx + 1]);
+            dst[5] = pack565(r2[tx + 2], r2[tx + 3]);
+            dst[6] = pack565(r3[tx], r3[tx + 1]);
+            dst[7] = pack565(r3[tx + 2], r3[tx + 3]);
+        }
+    }
+}
+
+bool Gpu::getFrameTex565(uint8_t *top, uint8_t *bottom) {
+    if (!ready)
+        return false;
+    Buffers &buffers = framebuffers.front();
+    if (buffers.direct) {
+        tile565(core->gpu2D[buffers.topIsA ? 0 : 1].getFramebuffer(), top);
+        tile565(core->gpu2D[buffers.topIsA ? 1 : 0].getFramebuffer(), bottom);
+    }
+    else {
+        tile565(&buffers.framebuffer[0], top);
+        tile565(&buffers.framebuffer[256 * 192], bottom);
+    }
+    delete[] buffers.hiRes3D;
+    PPCIrqState st = PPCIrqLockByMsr();
+    framebuffers.pop();
+    ready = !framebuffers.empty();
+    PPCIrqUnlockByMsr(st);
+    return true;
+}
+
+void Gpu::peekFrame(uint32_t *out) {
+    if (!(powCnt1 & BIT(0))) {
+        for (int i = 0; i < 256 * 192 * 2; i++) out[i] = rgb6ToRgb8(0);
+        return;
+    }
+    const bool topIsA = (powCnt1 & BIT(15)) != 0;
+    const uint32_t *top = core->gpu2D[topIsA ? 0 : 1].getFramebuffer();
+    const uint32_t *bot = core->gpu2D[topIsA ? 1 : 0].getFramebuffer();
+    for (int i = 0; i < 256 * 192; i++) out[i] = rgb6ToRgb8(top[i]);
+    for (int i = 0; i < 256 * 192; i++) out[256 * 192 + i] = rgb6ToRgb8(bot[i]);
+}
+
 bool Gpu::getFrame(uint32_t *out, bool gbaCrop) {
     if (!ready)
         return false;
@@ -192,6 +268,14 @@ bool Gpu::getFrame(uint32_t *out, bool gbaCrop) {
                 }
             }
         }
+        else if (buffers.direct) {
+            const uint32_t *top = core->gpu2D[buffers.topIsA ? 0 : 1].getFramebuffer();
+            const uint32_t *bot = core->gpu2D[buffers.topIsA ? 1 : 0].getFramebuffer();
+            for (int i = 0; i < 256 * 192; i++)
+                out[i] = rgb6ToRgb8(top[i]);
+            for (int i = 0; i < 256 * 192; i++)
+                out[256 * 192 + i] = rgb6ToRgb8(bot[i]);
+        }
         else {
             for (int i = 0; i < 256 * 192 * 2; i++)
                 out[i] = rgb6ToRgb8(buffers.framebuffer[i]);
@@ -201,7 +285,19 @@ bool Gpu::getFrame(uint32_t *out, bool gbaCrop) {
     delete[] buffers.hiRes3D;
 
     if (Settings::screenGhost) {
+#if NOODS_TEST_MOVE_GHOST
+        // Test-only: lazy zero-filled history; must retain state across cores.
+        static uint32_t *prev = nullptr;
+        static bool attempted = false;
+        if (!attempted) {
+            attempted = true;
+            prev = static_cast<uint32_t *>(calloc(256u * 192u * 8u, sizeof(uint32_t)));
+            SYS_Report("[NOODS] TEST_GHOST_ALLOC ptr=%p bytes=%u\n", prev, 256u * 192u * 8u * 4u);
+        }
+        if (prev) {
+#else
         static uint32_t prev[256 * 192 * 8];
+#endif
         uint32_t width = (gbaCrop ? 240 : 256) << (Settings::highRes3D || Settings::screenFilter == 1);
         uint32_t height = (gbaCrop ? 160 : (192 * 2)) << (Settings::highRes3D || Settings::screenFilter == 1);
         uint32_t size = width * height;
@@ -213,6 +309,9 @@ bool Gpu::getFrame(uint32_t *out, bool gbaCrop) {
             prev[i] = out[i];
             out[i] = 0xFF000000 | (b << 16) | (g << 8) | r;
         }
+#if NOODS_TEST_MOVE_GHOST
+        } // A failed test allocation skips ghosting; never a release candidate as-is.
+#endif
     }
 
     PPCIrqState st = PPCIrqLockByMsr();
@@ -413,12 +512,16 @@ void Gpu::scanline256() {
             }}
 
             if (vCount + 1 == height) {
+                { extern uint32_t g_vramGen; g_vramGen++; } // captured image may be used as a texture
                 displayCapture = false;
                 dispCapCnt &= ~BIT(31);
             }
         }
     }
 
+#ifdef GX3D_ALWAYS
+    dirty3D |= BIT(0); // test builds: redraw 3D every frame, like a 60 fps game
+#endif
     if (frames == 0 && dirty3D && (core->gpu2D[0].readDispCnt() & BIT(3)) && ((vCount + 48) % 263) < 192) {
         if (vCount == 215) dirty3D = BIT(1);
         core->gpu3DRenderer.drawScanline((vCount + 48) % 263);
@@ -445,6 +548,11 @@ void Gpu::scanline355() {
             gpuThreadStack = nullptr;
         }
 
+        // All visible lines are snapshotted; flush before vblank DMA or any
+        // framebuffer publication. No eligible line supplied capture feedback.
+        core->gpu2D[0].finishGx2D();
+        core->gpu2D[1].finishGx2D();
+
         for (int i = 0; i < 2; i++) {
             dispStat[i] |= BIT(0);
 
@@ -461,7 +569,14 @@ void Gpu::scanline355() {
             Buffers buffers;
             buffers.framebuffer = framePool[framePoolIdx];
             framePoolIdx = (framePoolIdx + 1) & 3;
-            if (powCnt1 & BIT(0)) {
+            // v1.111: when the frame is collected before emulation continues (always the case
+            // without the 2D thread), the two screens are converted straight from the 2D
+            // engines' buffers in getFrame() instead of being copied here first.
+            buffers.direct = !Settings::threaded2D && !Settings::highRes3D && Settings::screenFilter != 1 && framebuffers.empty() && (powCnt1 & BIT(0));
+            buffers.topIsA = (powCnt1 & BIT(15)) != 0;
+            if (buffers.direct) {
+            }
+            else if (powCnt1 & BIT(0)) {
                 if (powCnt1 & BIT(15)) {
                     memcpy(&buffers.framebuffer[0], core->gpu2D[0].getFramebuffer(), 256 * 192 * sizeof(uint32_t));
                     memcpy(&buffers.framebuffer[256 * 192], core->gpu2D[1].getFramebuffer(), 256 * 192 * sizeof(uint32_t));

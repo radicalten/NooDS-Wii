@@ -40,6 +40,7 @@ public:
     static int frameskip;
     static int threaded2D;
     static int threaded3D;
+    static int gx3D;            // v1.108: 1 = DS 3D drawn by the Wii GPU, 0 = software rasteriser
     static int highRes3D;
     static int screenGhost;
     static int emulateAudio;
@@ -55,6 +56,11 @@ public:
     static int screenSwap;      // 0=Off, 1=On
     static int wiiScreenGap;    // 0=0px, 1=2px, 2=8px, 3=16px, 4=32px
     static int armJit;          // 0=Off (Interpreter), 1=On (PPC JIT Recompiler)
+    // v1p171: 0 = cycle-exact GBA bus model (default, matches v1p170).
+    //         1 = relaxed GBA timing: skips the cartridge prefetch/waitstate
+    //         model for roughly 3x speed, but changes cycle counts and fails
+    //         the mGBA accuracy suite. Off unless the user asks for it.
+    static int gbaFastTiming;
     static int arm7Hle;
     static int dsiMode;
     static int stylusEdgeClamp; // 0=Off (release outside), 1=On (clamp to nearest edge)

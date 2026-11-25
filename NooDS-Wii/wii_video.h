@@ -24,6 +24,7 @@
 #include <ogc/gx.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <stdio.h>
 
 #define NDS_SCREEN_WIDTH  256
 #define NDS_SCREEN_HEIGHT 192
@@ -56,6 +57,15 @@ void Wii_VideoRender(const uint32_t* srcTop, const uint32_t* srcBottom,
 bool Wii_GetTouchScreenRect(float* outLeft, float* outTop,
                             float* outRight, float* outBottom);
 void Wii_VideoFlushAsync();
+// v1.112: the next Wii_VideoRender source pointers are ready-made RGB565 textures
+void Wii_VideoSetPreTiled(bool on);
+// v1.108: GX is shared between the display loop and the emulator thread (hardware 3D)
+uint32_t Wii_VideoRetraceCount();
+void Wii_VideoDumpTiming(FILE *f);
+void Wii_GxLock();
+void Wii_GxUnlock();
+void Wii_GxCopyFilter(bool display);
+void Wii_GxRestoreDisplayState();
 void Wii_DrawCursor(float x, float y);
 void Wii_DebugOverlayInit();
 void Wii_DebugOverlayPrint(int line, const char* fmt, ...);

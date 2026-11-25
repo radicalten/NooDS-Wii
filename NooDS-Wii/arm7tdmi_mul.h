@@ -5,7 +5,8 @@
     (https://github.com/zaydlang/multiplication-algorithm), used under the
     zlib license:
 
-    Copyright (c) 2024 zaydlang
+    Copyright (C) 2024 zaydlang
+    Copyright (C) 2026 radicalten
 
     This software is provided 'as-is', without any express or implied warranty.
     In no event will the authors be held liable for any damages arising from the

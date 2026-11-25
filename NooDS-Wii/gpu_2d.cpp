@@ -18,8 +18,54 @@
     along with NooDS-Wii. If not, see <https://www.gnu.org/licenses/>.
 */
 
+#ifndef NOODS_GBA_AFFINE_WINDOW
+#define NOODS_GBA_AFFINE_WINDOW 0
+#endif
+#ifndef NOODS_GBA_AFFINE_VERIFY
+#define NOODS_GBA_AFFINE_VERIFY 0
+#endif
+#ifndef NOODS_GBA_OBJ_MASK
+#define NOODS_GBA_OBJ_MASK 0
+#endif
+
+#ifndef NOODS_OBJ_WORD_READS
+#define NOODS_OBJ_WORD_READS 0
+#endif
+#ifndef NOODS_DS_OBJ_FAST
+#define NOODS_DS_OBJ_FAST 0
+#endif
+#ifndef NOODS_DS_OBJ_VERIFY
+#define NOODS_DS_OBJ_VERIFY 0
+#endif
+#ifndef NOODS_SOLO_TEXT
+#define NOODS_SOLO_TEXT 0
+#endif
+#ifndef NOODS_SOLO_TEXT_VERIFY
+#define NOODS_SOLO_TEXT_VERIFY 0
+#endif
+#ifndef NOODS_SOLID_FADE
+#define NOODS_SOLID_FADE 1
+#endif
+#ifndef NOODS_OBJ_MASK
+#define NOODS_OBJ_MASK 1
+#endif
+#ifndef NOODS_AFFINE_FAST
+#define NOODS_AFFINE_FAST 1
+#endif
 #include <cstring>
 #include "core.h"
+
+
+
+
+#include "profile.h"
+
+uint32_t g_gbaAffineStats[3]; // verified lines, mismatched lines, bypassed window checks in lines
+#if NOODS_GBA_AFFINE_VERIFY
+static bool s_affineReference = false;
+#endif
+uint32_t g_dsObjStats[8]; // 4bpp, 8bpp, affine, window, dual passes, wrong fields, extended, reserved
+uint32_t g_soloTextStats[6]; // calls, 4bpp, 8bpp, raw, pixel mismatches, raw mismatches
 
 Gpu2D::Gpu2D(Core *core, bool engine): core(core), engine(engine) {
     // Set up 2D GPU engine A or B
@@ -58,6 +104,9 @@ void Gpu2D::saveState(FILE *file) {
 }
 
 void Gpu2D::loadState(FILE *file) {
+#if NOODS_GX_2D
+    gx2dDiscard(engine,0); // queued snapshots do not survive a state restore
+#endif
     // Read state data from the file
     fread(winHFlip, sizeof(bool), sizeof(winHFlip) / sizeof(bool), file);
     fread(winVFlag, sizeof(bool), sizeof(winVFlag) / sizeof(bool), file);
@@ -98,6 +147,14 @@ struct Gpu2DLuts {
 };
 static const Gpu2DLuts s_gpu2DLuts;
 } // namespace
+
+// v1.80: shared object dimension table for the per-scanline active list.
+static const uint8_t s_objectSizes[32] = {
+    8, 8, 16, 16, 32, 32, 64, 64, // Square
+    16, 8, 32, 8, 32, 16, 64, 32, // Horizontal
+    8, 16, 8, 32, 16, 32, 32, 64, // Vertical
+    0, 0, 0, 0, 0, 0, 0, 0       // Prohibited
+};
 
 uint32_t Gpu2D::rgb5ToRgb6(uint32_t color) {
     return (color & 0xFFFC0000u) | s_gpu2DLuts.rgb5To6[color & 0x7FFFu];
@@ -184,23 +241,43 @@ FORCE_INLINE uint8_t Gpu2D::fastRead8(uint32_t addr) {
     return core->memory.read<uint8_t>(0, addr);
 }
 void Gpu2D::buildWindowMask(int line) {
+    V180_PROFILE_SCOPE(19);
     if (!(dispCnt & 0xE000)) {
         // fast: all enabled (include blend bit 5)
         memset(winMaskCache, 0x3F, sizeof(winMaskCache));
         winMaskValid = true;
         return;
     }
-    for (int x=0;x<256;x++) {
-        uint16_t enabled;
-        if ((dispCnt & BIT(13)) && winVFlag[0] && (x >= winX1[0] && x < winX2[0]) != winHFlip[0])
-            enabled = winIn & 0x3F;
-        else if ((dispCnt & BIT(14)) && winVFlag[1] && (x >= winX1[1] && x < winX2[1]) != winHFlip[1])
-            enabled = (winIn >> 8) & 0x3F;
-        else if ((dispCnt & BIT(15)) && (framebuffer[line * 256 + x] & BIT(24)))
-            enabled = (winOut >> 8) & 0x3F;
-        else
-            enabled = winOut & 0x3F;
-        winMaskCache[x] = enabled & 0x3F;
+    // v1.106: same classification (window 0, then window 1, then object window, then outside)
+    // filled by ranges instead of evaluated per pixel.
+    {
+        const uint32_t dc = dispCnt;
+        const uint8_t out = winOut & 0x3F;
+        if (dc & BIT(15)) {
+            const uint8_t outObj = (winOut >> 8) & 0x3F;
+            const uint32_t *const fb = &framebuffer[line * 256];
+            for (int x = 0; x < 256; x++)
+                winMaskCache[x] = (fb[x] & BIT(24)) ? outObj : out;
+        } else {
+            memset(winMaskCache, out, 256);
+        }
+        for (int w = 1; w >= 0; w--) {
+            if (!(dc & BIT(13 + w)) || !winVFlag[w]) continue;
+            const uint8_t in = (w ? (winIn >> 8) : winIn) & 0x3F;
+            // inside when (x >= x1 && x < x2) != flip
+            int x1 = winX1[w], x2 = winX2[w];
+            if (x1 < 0) x1 = 0;
+            if (x2 > 256) x2 = 256;
+            const bool empty = (x1 >= x2);
+            if (!winHFlip[w]) {
+                if (!empty) memset(&winMaskCache[x1], in, (size_t)(x2 - x1));
+            } else if (empty) {
+                memset(winMaskCache, in, 256);
+            } else {
+                if (x1 > 0) memset(winMaskCache, in, (size_t)x1);
+                if (x2 < 256) memset(&winMaskCache[x2], in, (size_t)(256 - x2));
+            }
+        }
     }
     winMaskValid = true;
 }
@@ -223,10 +300,140 @@ void Gpu2D::updateWindows(int line) {
     }
 }
 
+int Gpu2D::buildObjectLine(int line) {
+    V180_PROFILE_SCOPE(20);
+    // v1.80: parse and cull OAM once per scanline. The renderer no longer
+    // walks 128 entries twice or recomputes geometry for both object passes.
+    int count = 0;
+    for (int i = 0; i < 128; i++) {
+        uint8_t byte = oam[i * 8 + 1];
+        uint8_t type = (byte >> 2) & 0x3;
+        if ((byte & 0x3) == 2)
+            continue;
+
+        const uint16_t object[3] = {
+            U8TO16(oam, i * 8 + 0), U8TO16(oam, i * 8 + 2), U8TO16(oam, i * 8 + 4)
+        };
+        const uint8_t *size = &s_objectSizes[((object[0] >> 11) & 0x18) | ((object[1] >> 13) & 0x6)];
+        const uint8_t width = size[0];
+        const uint8_t height = size[1];
+        const bool shift = ((object[0] & 0x300) == 0x300);
+        const uint8_t width2 = width << shift;
+        const uint8_t height2 = height << shift;
+
+        int y = object[0] & 0xFF;
+        if (y >= 192) y -= 256;
+        const int spriteY = ((object[0] & BIT(12)) ?
+            (line - (line % (((mosaic >> 12) & 0xF) + 1))) : line) - y;
+        if (spriteY < 0 || spriteY >= height2)
+            continue;
+
+        int x = object[1] & 0x1FF;
+        if (x >= 256) x -= 512;
+
+        ObjectLine &dst = objectLine[count++];
+        dst.object[0] = object[0];
+        dst.object[1] = object[1];
+        dst.object[2] = object[2];
+        dst.x = (int16_t)x;
+        dst.spriteY = (int16_t)spriteY;
+        dst.width = width;
+        dst.height = height;
+        dst.width2 = width2;
+        dst.height2 = height2;
+        dst.priority = (int8_t)(((object[2] >> 10) & 0x3) - 1);
+        dst.type = type;
+    }
+    return count;
+}
+
+// v1.123: a DS frame scans OAM for every line of both screens: 128 entries, 384 times. Games
+// write OAM once a frame, so the answer to "which entries can touch this line" is kept as a
+// bit mask per line and rebuilt only after OAM was written (Memory::oamGen; OAM is smaller
+// than a page, so every write to it goes through Memory's fallback path). The mask is a
+// superset: each selected entry still goes through the same tests as before, in OAM order.
+void Gpu2D::buildObjectMask() {
+    memset(objMask, 0, sizeof(objMask));
+    for (int i = 0; i < 128; i++) {
+        const uint8_t byte = oam[i * 8 + 1];
+        if ((byte & 0x3) == 2)
+            continue;
+        const uint16_t obj0 = U8TO16(oam, i * 8 + 0), obj1 = U8TO16(oam, i * 8 + 2);
+        int from = 0, to = 192;
+        if (!(obj0 & BIT(12))) { // a mosaic sprite's row depends on the MOSAIC register: every line
+            const uint8_t *size = &s_objectSizes[((obj0 >> 11) & 0x18) | ((obj1 >> 13) & 0x6)];
+            const int height2 = size[1] << ((obj0 & 0x300) == 0x300);
+            int y = obj0 & 0xFF;
+            if (y >= 192) y -= 256;
+            from = (y < 0) ? 0 : y;
+            to = (y + height2 > 192) ? 192 : y + height2;
+        }
+        const uint32_t bit = 1u << (i & 31);
+        for (int l = from; l < to; l++) objMask[l][i >> 5] |= bit;
+    }
+}
+
+int Gpu2D::buildObjectLineDs(int line) {
+    if (!NOODS_OBJ_MASK || (unsigned)line >= 192u) return buildObjectLine(line);
+    if (objMaskGen != core->memory.oamGen) {
+        objMaskGen = core->memory.oamGen;
+        buildObjectMask();
+    }
+    int count = 0;
+    for (int w = 0; w < 4; w++) {
+      for (uint32_t m = objMask[line][w]; m; m &= m - 1) {
+        const int i = w * 32 + __builtin_ctz(m);
+        uint8_t byte = oam[i * 8 + 1];
+        uint8_t type = (byte >> 2) & 0x3;
+        if ((byte & 0x3) == 2)
+            continue;
+
+        const uint16_t object[3] = {
+            U8TO16(oam, i * 8 + 0), U8TO16(oam, i * 8 + 2), U8TO16(oam, i * 8 + 4)
+        };
+        const uint8_t *size = &s_objectSizes[((object[0] >> 11) & 0x18) | ((object[1] >> 13) & 0x6)];
+        const uint8_t width = size[0];
+        const uint8_t height = size[1];
+        const bool shift = ((object[0] & 0x300) == 0x300);
+        const uint8_t width2 = width << shift;
+        const uint8_t height2 = height << shift;
+
+        int y = object[0] & 0xFF;
+        if (y >= 192) y -= 256;
+        const int spriteY = ((object[0] & BIT(12)) ?
+            (line - (line % (((mosaic >> 12) & 0xF) + 1))) : line) - y;
+        if (spriteY < 0 || spriteY >= height2)
+            continue;
+
+        int x = object[1] & 0x1FF;
+        if (x >= 256) x -= 512;
+
+        ObjectLine &dst = objectLine[count++];
+        dst.object[0] = object[0];
+        dst.object[1] = object[1];
+        dst.object[2] = object[2];
+        dst.x = (int16_t)x;
+        dst.spriteY = (int16_t)spriteY;
+        dst.width = width;
+        dst.height = height;
+        dst.width2 = width2;
+        dst.height2 = height2;
+        dst.priority = (int8_t)(((object[2] >> 10) & 0x3) - 1);
+        dst.type = type;
+      }
+    }
+    return count;
+}
+
 void Gpu2D::drawGbaScanline(int line) {
+    l1Needed = true;
+    V180_PROFILE_SCOPE(1);
+    V180_PROFILE_INC(13);
     // Clear layers with the backdrop (first palette index)
     uint32_t backdrop = U8TO16(palette, 0) & ~BIT(15);
-    const uint8_t bldMode = (bldCnt >> 6) & 0x3;
+    // v1.114: brightness effect with BLDY = 0 is a no-op (see drawScanline)
+    const uint8_t rawBldMode = (bldCnt >> 6) & 0x3;
+    const uint8_t bldMode = (rawBldMode >= 2 && bldY == 0) ? 0 : rawBldMode;
 
     // Fast path when no BG or OBJ layers are enabled on this scanline
     if ((dispCnt & 0x1F00) == 0 && bldMode == 0) {
@@ -243,10 +450,18 @@ void Gpu2D::drawGbaScanline(int line) {
         memset(blendBits, 5, sizeof(blendBits));
     }
 
-    // Draw the objects, object window first if enabled
+    // v1.80: build the active-object list once, then classify windows once
+    // after the object-window pass (so OBJ-window bits are current).
+    winMaskValid = false;
     if (dispCnt & BIT(12)) {
+        objectLineCount = NOODS_GBA_OBJ_MASK ? buildObjectLineDs(line) : buildObjectLine(line);
         if (dispCnt & BIT(15)) drawObjects<1>(line, true);
+        if (dispCnt & 0xE000) buildWindowMask(line);
         drawObjects<1>(line, false);
+    }
+    else {
+        objectLineCount = 0;
+        if (dispCnt & 0xE000) buildWindowMask(line);
     }
 
     // Draw the background layers depending on the BG mode
@@ -293,59 +508,70 @@ void Gpu2D::drawGbaScanline(int line) {
         }
     }
 
-    if (dispCnt & 0xE000) buildWindowMask(line); else winMaskValid=false;
+    // v1.80: winMaskCache was built once for this line before BG rendering.
+    // Rebuilding it here would repeat 256 window classifications per line.
     // Blend the layers to form the final image
-    for (int mode = (bldCnt >> 6) & 0x3, i = 0; i < 240; i++) {
-        // Check if blending can/should be performed
-        if (layers[0][i] & BIT(25)) { // Semi-transparent pixel
-            // Force alpha blending if possible, otherwise allow brightness blending or do nothing
-            if (bldCnt & BIT(8 + blendBits[1][i])) // Below pixel is blendable
-                goto alpha;
-            else if (mode < 2 || !(bldCnt & BIT(blendBits[0][i])))
+    // v1.106: same decisions per pixel as before, with the registers read once per line and the
+    // alpha blend done on two packed channel groups (red+blue, green) instead of three
+    // separate channels. Each channel sum is at most 31 * 16 + 31 * 16 = 992 < 1024, so the
+    // groups cannot carry into each other and the results are identical.
+    {
+        V180_PROFILE_SCOPE(22);
+        const uint32_t bc = bldCnt;
+        const int mode = (bc >> 6) & 0x3;
+        const bool winOn = (dispCnt & 0xE000) != 0;
+        const uint32_t eva = std::min((bldAlpha >> 0) & 0x1F, 16);
+        const uint32_t evb = std::min((bldAlpha >> 8) & 0x1F, 16);
+        const uint32_t by = bldY;
+        if (mode >= 2 && by) ensureBrightTables();
+        uint32_t *const l0 = layers[0];
+        const uint32_t *const l1 = layers[1];
+        const int8_t *const bb0 = blendBits[0], *const bb1 = blendBits[1];
+        for (int i = 0; i < 240; i++) {
+            const uint32_t top = l0[i];
+            bool alpha = false;
+            if (top & BIT(25)) { // Semi-transparent pixel
+                // Force alpha blending if possible, otherwise allow brightness blending or do nothing
+                if (bc & BIT(8 + bb1[i])) // Below pixel is blendable
+                    alpha = true;
+                else if (mode < 2 || !(bc & BIT(bb0[i])))
+                    continue;
+            }
+            else if (mode == 0 || !(bc & BIT(bb0[i])) || (mode == 1 && !(bc & BIT(8 + bb1[i])))) {
+                // Do nothing if blending is disabled or not possible
                 continue;
-        }
-        else if (mode == 0 || !(bldCnt & BIT(blendBits[0][i])) || (mode == 1 && !(bldCnt & BIT(8 + blendBits[1][i])))) {
-            // Do nothing if blending is disabled or not possible
-            continue;
-        }
-
-        // Skip blending if the pixel is in the bounds of a window that has it disabled — v1.74 LUT
-        if (dispCnt & 0xE000) {
-            if (!(winMaskCache[i] & BIT(5))) continue;
-        }
-
-        // Apply blending, using 15-bit colors in GBA mode — v1.74 LUT
-        switch (mode) {
-        case 1: // Alpha blending
-        alpha: {
-            uint8_t eva = std::min((bldAlpha >> 0) & 0x1F, 16);
-            uint8_t evb = std::min((bldAlpha >> 8) & 0x1F, 16);
-            uint8_t r = std::min((((layers[0][i] >> 0) & 0x1F) * eva + ((layers[1][i] >> 0) & 0x1F) * evb) / 16, 31U);
-            uint8_t g = std::min((((layers[0][i] >> 5) & 0x1F) * eva + ((layers[1][i] >> 5) & 0x1F) * evb) / 16, 31U);
-            uint8_t b = std::min((((layers[0][i] >> 10) & 0x1F) * eva + ((layers[1][i] >> 10) & 0x1F) * evb) / 16, 31U);
-            layers[0][i] = (b << 10) | (g << 5) | r;
-            continue;
-        }
-
-        case 2: // Brightness increase — v1.74 LUT
-            if (bldY) {
-                ensureBrightTables();
-                uint8_t r = s_brightIncTable5[(layers[0][i]>>0)&0x1F][bldY];
-                uint8_t g = s_brightIncTable5[(layers[0][i]>>5)&0x1F][bldY];
-                uint8_t b = s_brightIncTable5[(layers[0][i]>>10)&0x1F][bldY];
-                layers[0][i] = (b<<10)|(g<<5)|r;
             }
-            continue;
 
-        case 3: // Brightness decrease — v1.74 LUT
-            if (bldY) {
-                ensureBrightTables();
-                uint8_t r = s_brightDecTable5[(layers[0][i]>>0)&0x1F][bldY];
-                uint8_t g = s_brightDecTable5[(layers[0][i]>>5)&0x1F][bldY];
-                uint8_t b = s_brightDecTable5[(layers[0][i]>>10)&0x1F][bldY];
-                layers[0][i] = (b<<10)|(g<<5)|r;
+            if (!alpha) {
+                // Skip blending if the pixel is in the bounds of a window that has it disabled
+                if (winOn && !(winMaskCache[i] & BIT(5))) continue;
+                alpha = (mode == 1);
             }
-            continue;
+
+            if (alpha) {
+                const uint32_t below = l1[i];
+                uint32_t rb = ((top & 0x7C1Fu) * eva + (below & 0x7C1Fu) * evb) >> 4;
+                uint32_t g = ((top & 0x03E0u) * eva + (below & 0x03E0u) * evb) >> 4;
+                uint32_t r = rb & 0x3Fu, b = (rb >> 10) & 0x3Fu;
+                g = (g >> 5) & 0x3Fu;
+                if (r > 31u) r = 31u;
+                if (g > 31u) g = 31u;
+                if (b > 31u) b = 31u;
+                l0[i] = (b << 10) | (g << 5) | r;
+            }
+            else if (by) {
+                if (mode == 2) { // Brightness increase
+                    uint8_t r = s_brightIncTable5[(top>>0)&0x1F][by];
+                    uint8_t g = s_brightIncTable5[(top>>5)&0x1F][by];
+                    uint8_t b = s_brightIncTable5[(top>>10)&0x1F][by];
+                    l0[i] = (b<<10)|(g<<5)|r;
+                } else {         // Brightness decrease
+                    uint8_t r = s_brightDecTable5[(top>>0)&0x1F][by];
+                    uint8_t g = s_brightDecTable5[(top>>5)&0x1F][by];
+                    uint8_t b = s_brightDecTable5[(top>>10)&0x1F][by];
+                    l0[i] = (b<<10)|(g<<5)|r;
+                }
+            }
         }
     }
 
@@ -353,9 +579,201 @@ void Gpu2D::drawGbaScanline(int line) {
     memcpy(&framebuffer[line * 256], layers[0], 240 * sizeof(uint32_t));
 }
 
+// DS BG mode 0, one text layer, no objects/windows/effective blending.
+// Compose straight into the visible line; transparency selects the backdrop.
+bool Gpu2D::soloTextLine(int bg, int line, uint32_t backdrop, bool raw) {
+    const uint16_t cnt = bgCnt[bg];
+    if ((cnt & BIT(6)) && (mosaic & 15)) return false;
+    const int hofs = bgHOfs[bg];
+    const int y = (((cnt & BIT(6)) ? line - line % (((mosaic >> 4) & 15) + 1) : line) + bgVOfs[bg]) & 511;
+    uint32_t map = bgVramAddr + ((dispCnt >> 11) & 0x70000) + ((cnt << 3) & 0x0F800) + ((y & 0xF8) << 3);
+    if (y >= 256 && (cnt & BIT(15))) map += (cnt & BIT(14)) ? 0x1000 : 0x800;
+    const uint32_t data = bgVramAddr + ((dispCnt >> 8) & 0x70000) + ((cnt << 12) & 0x3C000);
+    const bool eight = (cnt & BIT(7)) != 0;
+    uint8_t *const ext = (eight && (dispCnt & BIT(30))) ?
+        extPalettes[bg + ((bg < 2 && (cnt & BIT(13))) ? 2 : 0)] : nullptr;
+    const uint32_t back = rgb5ToRgb6(backdrop);
+    uint32_t *const out = &framebuffer[line * 256];
+    const int width = 256 + (hofs & 7);
+    for (int i = 0; i < width; i += 8) {
+        const int xo = (i + hofs) & 511;
+        const uint16_t tile = fastRead16(map + ((xo & 0xF8) >> 2) + ((xo >= 256 && (cnt & BIT(14))) ? 0x800 : 0));
+        const int row = (tile & BIT(11)) ? 7 - (y & 7) : (y & 7);
+        uint8_t *const pal = eight ? (ext ? ext + ((tile >> 3) & 0x1E00) : palette) : palette + ((tile & 0xF000) >> 7);
+        const uint32_t address = data + (tile & 0x3FF) * (eight ? 64 : 32) + row * (eight ? 8 : 4);
+        const uint32_t low = fastRead32(address);
+        const uint32_t high = eight ? fastRead32(address + 4) : 0;
+        const int origin = i - (xo & 7);
+        const int first = origin < 0 ? -origin : 0;
+        const int last = origin + 8 > 256 ? 256 - origin : 8;
+        for (int j = first; j < last; ++j) {
+            const int lane = (tile & BIT(10)) ? 7 - j : j;
+            const uint32_t index = eight ? (((lane < 4 ? low : high) >> ((lane & 3) * 8)) & 255) : ((low >> (lane * 4)) & 15);
+            out[origin + j] = index ? rgb5ToRgb6(U8TO16(pal, index * 2)) : back;
+        }
+    }
+    if (raw) memcpy(layers[0], out, 256 * sizeof(uint32_t));
+    ++g_soloTextStats[0]; ++g_soloTextStats[eight ? 2 : 1];
+    if (raw) ++g_soloTextStats[3];
+    return true;
+}
+
+void Gpu2D::finishGx2D() {
+#if NOODS_GX_2D
+    V180_PROFILE_SCOPE(0); // include GX submission, wait and readback in renderer cost
+    gx2dFinish(engine, framebuffer);
+#endif
+}
+
+bool Gpu2D::queueGxBitmapLine(int line) {
+#if NOODS_GX_2D_BITMAP
+    if (!NoodsGx2D::eligibleBitmap(engine,dispCnt,bgCnt[3],bldCnt,bldY,masterBright)) return false;
+    GX2D_PROFILE_QUEUE();
+    Gx2DLine *r=gx2dBegin(engine,line);
+    if (!r) return false;
+    r->bitmap=true;r->enabled=0;r->backdrop=U8TO16(palette,0)&0x7FFF;
+    const uint16_t cnt=bgCnt[3];
+    static const unsigned sizes[4][2]={{128,128},{256,256},{512,256},{512,512}};
+    const unsigned width=sizes[cnt>>14][0],height=sizes[cnt>>14][1];
+    const uint32_t base=bgVramAddr+((cnt<<6)&0x7C000u);
+    const bool wrap=cnt&BIT(13);
+    const int pa=bgPA[1],pc=bgPC[1];
+    int xx=internalX[1],yy=internalY[1];
+    bool packed=false;
+    const int sx0=xx>>8,sy0=yy>>8;
+    if (pa==256 && pc==0 && sx0>=0 && (unsigned)sx0+256<=width &&
+        sy0>=0 && (unsigned)sy0<height && !(sx0&1)) {
+        uint32_t addr=base+(sy0*width+sx0)*2;
+        uint8_t **map=core->memory.readMap9A;
+        if (map[addr>>12] && map[(addr+511)>>12]) {
+            uint8_t *dst=r->indices[0];
+            unsigned remaining=512;
+            while (remaining) {
+                const unsigned bytes=std::min(4096u-(addr&4095u),remaining);
+                const uint8_t *src=map[addr>>12]+(addr&4095u);
+                for (unsigned i=0;i<bytes;i+=4) {
+                    uint32_t raw;memcpy(&raw,src+i,4);
+#ifdef ENDIAN_BIG
+                    raw=__builtin_bswap32(raw);
+#endif
+                    NoodsGx2D::storeBe32(dst+i,NoodsGx2D::bitmapPair(raw));
+                }
+                addr+=bytes;dst+=bytes;remaining-=bytes;
+            }
+            packed=true;
+        }
+    }
+    if (!packed) for (unsigned x=0;x<256;++x,xx+=pa,yy+=pc) {
+        int sx=xx>>8,sy=yy>>8;
+        if (wrap) {sx&=width-1;sy&=height-1;}
+        uint16_t pixel=0;
+        if ((unsigned)sx<width && (unsigned)sy<height)
+            pixel=NoodsGx2D::bitmapPixel(fastRead16(base+(sy*width+sx)*2));
+        r->indices[0][x*2]=pixel>>8;r->indices[0][x*2+1]=pixel;
+    }
+    ++g_gxBitmapStats[0];
+    return true;
+#else
+    (void)line;return false;
+#endif
+}
+
+bool Gpu2D::queueGxTextLine(int line) {
+#if NOODS_GX_2D
+    // Snapshot a strictly ordinary text-composition line before guest execution
+    // can change VRAM, palettes or scroll registers. Engine A never defers,
+    // avoiding capture enable changes between drawing and the capture phase.
+    if (!NoodsGx2D::eligible(engine,dispCnt,bldCnt,masterBright)) return false;
+    for (int bg=0;bg<4;++bg)
+        if ((dispCnt & BIT(8+bg)) && (bgCnt[bg] & BIT(6))) return false;
+    GX2D_PROFILE_QUEUE();
+    Gx2DLine *r=gx2dBegin(engine,line);
+    if (!r) return false;
+    r->enabled=(dispCnt>>8)&15;
+    r->backdrop=U8TO16(palette,0)&0x7FFF;
+    for (int bg=0;bg<4;++bg) if (r->enabled & BIT(bg)) {
+        ++g_gx2dStats[1];
+        const bool eight=bgCnt[bg]&BIT(7);
+        ++g_gx2dStats[eight ? 6 : 5];
+        r->priority[bg]=bgCnt[bg]&3;
+#if NOODS_GX_2D_IO >= 4
+        if (!gx2dSetPalette(r,engine,bg,palette,eight)) {
+            NoodsGx::packPalette(palette,r->palettes[bg],256,true);
+            if (!eight) for (unsigned bank=1;bank<16;++bank)
+                r->palettes[bg][bank*32]=r->palettes[bg][bank*32+1]=0;
+        }
+#elif NOODS_GX_2D_PAL_CACHE
+        static NoodsGx2D::PaletteCache paletteCache[2];
+        memcpy(r->palettes[bg],paletteCache[engine].get(palette,eight),512);
+#else
+        NoodsGx::packPalette(palette,r->palettes[bg],256,true);
+        if (!eight) for (int bank=1;bank<16;++bank)
+            r->palettes[bg][bank*32]=r->palettes[bg][bank*32+1]=0;
+#endif
+        const int hofs=bgHOfs[bg];
+#if NOODS_GX_2D_IO >= 5
+        // Decode scrolled tiles with aligned word stores; clip once afterward.
+        // All 33 source tiles remain snapshots of this emulated scanline.
+        alignas(4) uint8_t linear[264];
+        const unsigned shift=hofs&7;
+#endif
+        const int yy=(line+bgVOfs[bg])&511;
+        uint32_t map=bgVramAddr+((dispCnt>>11)&0x70000)+((bgCnt[bg]<<3)&0xF800)+((yy&0xF8)<<3);
+        const uint32_t base=bgVramAddr+((dispCnt>>8)&0x70000)+((bgCnt[bg]<<12)&0x3C000);
+        if (yy>=256 && (bgCnt[bg]&BIT(15))) map+=(bgCnt[bg]&BIT(14))?0x1000:0x800;
+        for (int left=-(hofs&7);left<256;left+=8) {
+            const int xx=(left+hofs)&511;
+            const uint16_t tile=fastRead16(map+((xx&0xF8)>>2)+((xx>=256 && (bgCnt[bg]&BIT(14)))?0x800:0));
+            const int y=(tile&BIT(11))?7-(yy&7):(yy&7);
+            const uint32_t addr=base+(tile&1023)*(eight?64:32)+y*(eight?8:4);
+            const uint32_t lo=fastRead32(addr),hi=eight?fastRead32(addr+4):0;
+#if NOODS_GX_2D_IO >= 5
+            if (shift) NoodsGx2D::linearTileRow(linear+left+shift,tile,lo,hi,eight);
+            else
+#endif
+            NoodsGx2D::tileRow(r->indices[bg],left,tile,lo,hi,eight);
+        }
+#if NOODS_GX_2D_IO >= 5
+        if (shift) for (unsigned x=0;x<256;x+=8)
+            memcpy(r->indices[bg]+x*4,linear+x+shift,8);
+#endif
+    }
+    return true;
+#else
+    (void)line;
+    return false;
+#endif
+}
+
 void Gpu2D::drawScanline(int line) {
+    V180_PROFILE_SCOPE(0);
+    V180_PROFILE_INC(12);
+#if NOODS_GX_2D
+    gx2dDiscard(engine,line);
+#if NOODS_GX_2D_BITMAP
+    if (queueGxBitmapLine(line)) {
+#if !NOODS_GX_2D_VERIFY
+        winMaskValid=false;objectLineCount=0;l1Needed=false;
+        internalX[1]+=bgPB[1];internalY[1]+=bgPD[1];
+        return;
+#endif
+    }
+#endif
+    if (queueGxTextLine(line)) {
+#if !NOODS_GX_2D_VERIFY
+        return; // vblank publishes completed GX readback before frame consumers
+#endif
+    }
+#endif
+#if NOODS_SOLO_TEXT_VERIFY
+    bool verifySolo = false;
+    uint32_t expectedSolo[256];
+#endif
     const uint8_t dispMode = (dispCnt >> 16) & 0x3;
     const uint8_t bgMode = dispCnt & 0x7;
+    // v1.118: the raw composed line (layers[0]) is only ever read back by display capture,
+    // and only from engine A. The one-pass paths below skip that second store otherwise.
+    const bool rawNeeded = engine == 0 && core->gpu.captureMayRead();
 
     // Fast early bypass when display mode is not 2D layer composition (mode 0 = off, mode 2 = direct VRAM)
     // and display capture is not sampling Engine A's raw 2D composition output (layers[0]).
@@ -390,10 +808,63 @@ void Gpu2D::drawScanline(int line) {
         goto apply_master_bright;
     }
 
+    // v1.80: fused 3D-only composite path.
+    //
+    // When BG0 alone carries 3D with no other backgrounds, sprites, windows,
+    // blending or high-res 3D, the general path performs per-pixel window and
+    // priority arbitration across six arrays and then re-reads them in a blend
+    // loop that can never blend. The visible result is exactly "3D pixel if
+    // lit, backdrop otherwise", so compose it in one pass that writes both the
+    // raw layer (used by display capture) and the framebuffer.
+    if (engine == 0 && dispMode == 1 && bgMode == 0 && !Settings::highRes3D &&
+        (dispCnt & (BIT(3) | BIT(8))) == (BIT(3) | BIT(8)) &&
+        (dispCnt & (0x0F00 | BIT(12) | 0xE000)) == BIT(8) &&
+        ((bldCnt & 0xC0) == 0 || ((bldCnt & 0x80) && bldY == 0))) {
+        // v1.115: also taken with a brightness effect of strength 0 (a no-op that games leave
+        // on). The only blend left is a translucent 3D pixel over the backdrop, when the
+        // backdrop is a second target.
+        uint32_t backdrop = U8TO16(palette, 0) & ~BIT(15);
+        uint32_t backdrop6 = rgb5ToRgb6(backdrop);
+        uint32_t *line3D = core->gpu3DRenderer.getLine(line);
+        uint32_t *dst = &framebuffer[line * 256];
+        if (bldCnt & BIT(13)) {
+            const uint32_t br = backdrop6 & 0x3F, bg = (backdrop6 >> 6) & 0x3F, bb = (backdrop6 >> 12) & 0x3F;
+            for (int i = 0; i < 256; i++) {
+                uint32_t pixel = line3D[i];
+                if (!(pixel & 0xFC0000)) {
+                    pixel = backdrop6;
+                } else {
+                    const uint32_t eva = ((pixel >> 18) & 0x3F) + 1;
+                    if (eva != 64) {
+                        const uint32_t evb = 64 - eva;
+                        const uint32_t r = std::min((((pixel >> 0) & 0x3F) * eva + br * evb) / 64, 63U);
+                        const uint32_t g = std::min((((pixel >> 6) & 0x3F) * eva + bg * evb) / 64, 63U);
+                        const uint32_t b = std::min((((pixel >> 12) & 0x3F) * eva + bb * evb) / 64, 63U);
+                        pixel = (b << 12) | (g << 6) | r;
+                    }
+                }
+                dst[i] = pixel;
+            }
+        } else {
+            for (int i = 0; i < 256; i++) {
+                const uint32_t p3 = line3D[i];
+                dst[i] = (p3 & 0xFC0000) ? p3 : backdrop6;
+            }
+        }
+        if (rawNeeded) memcpy(layers[0], dst, 256 * sizeof(uint32_t));
+        goto apply_master_bright;
+    }
+
     {
     // Clear layers with the backdrop (first palette index)
     uint32_t backdrop = U8TO16(palette, 0) & ~BIT(15);
-    const uint8_t bldMode = (bldCnt >> 6) & 0x3;
+    // v1.114: a brightness effect with BLDY = 0 changes nothing (games leave it switched on
+    // between fades), so the line is composed as if blending were off.
+    const uint8_t rawBldMode = (bldCnt >> 6) & 0x3;
+    // v1.115: alpha blending always needs a second target; with none selected, an alpha
+    // effect, a semi-transparent sprite pixel and a 3D pixel all leave the line unchanged.
+    const bool noTargets2 = (bldCnt & 0x3F00) == 0;
+    const uint8_t bldMode = ((rawBldMode >= 2 && bldY == 0) || (rawBldMode == 1 && noTargets2)) ? 0 : rawBldMode;
     const bool needBlendLayers = (bldMode != 0) || ((dispCnt & BIT(12)) != 0) || ((dispCnt & BIT(3)) && (dispCnt & BIT(8)));
 
     if ((dispCnt & 0x1F00) == 0 && bldMode == 0) {
@@ -402,17 +873,93 @@ void Gpu2D::drawScanline(int line) {
         goto copy_display_mode;
     }
 
-    for (int i = 0; i < 256; i++) layers[0][i] = backdrop;
-    memset(priorities, 4, sizeof(priorities));
-    if (needBlendLayers) {
-        memcpy(layers[1], layers[0], sizeof(layers[0]));
-        memset(blendBits, 5, sizeof(blendBits));
+    // v1.122: a brightness effect at full strength (BLDY = 16) that covers every layer and
+    // the backdrop, with no window to exempt pixels and no second target (which would let a
+    // 3D or semi-transparent sprite pixel take the alpha path instead), turns every pixel of
+    // the line black or white whatever is drawn. Games hold exactly this state while they
+    // load behind a faded-out screen. The line is filled directly; the layers and sprites
+    // are not drawn. Only the per-line step of the affine backgrounds is kept.
+    if (NOODS_SOLID_FADE && rawBldMode >= 2 && bldY == 16 && (bldCnt & 0x3F3F) == 0x003F && (dispCnt & 0xE000) == 0) {
+        const uint32_t col = (rawBldMode == 2) ? 0x3FFFFu : 0u;
+        for (int i = 0; i < 256; i++) layers[0][i] = col;
+        winMaskValid = false;
+        objectLineCount = 0;
+        l1Needed = false;
+        const uint8_t m = bgMode;
+        if ((dispCnt & BIT(11)) && m >= 1 && m <= 5) { internalX[1] += bgPB[1]; internalY[1] += bgPD[1]; }
+        if ((dispCnt & BIT(10)) && (m == 2 || m >= 4) && m <= 6) { internalX[0] += bgPB[0]; internalY[0] += bgPD[0]; }
+        goto copy_display_mode;
     }
 
-    // Draw the objects, object window first if enabled
+#if NOODS_SOLO_TEXT
+    {
+    const uint32_t only = dispCnt & 0x0F00;
+    if (dispMode == 1 && bgMode == 0 && bldMode == 0 && only && !(only & (only - 1u)) &&
+        !(dispCnt & (BIT(12) | 0xE000)) && !((only == BIT(8)) && (dispCnt & BIT(3)))) {
+        const int bg = __builtin_ctz(only) - 8;
+        if (soloTextLine(bg, line, backdrop, rawNeeded)) {
+#if NOODS_SOLO_TEXT_VERIFY
+            memcpy(expectedSolo, &framebuffer[line * 256], sizeof(expectedSolo));
+            verifySolo = true; // also run the unchanged reference path below
+#else
+            winMaskValid = false;
+            objectLineCount = 0;
+            l1Needed = false;
+            goto apply_master_bright;
+#endif
+        }
+    }
+    }
+#endif
+
+    // v1.118: a lone full-screen bitmap on BG3 with nothing that could blend or cover it is
+    // converted and written to the frame in one pass, without clearing or filling the layer
+    // buffers first (v1.115 did this from inside drawExtended, after the clears).
+    if (dispMode == 1 && bldMode == 0 && bgMode >= 3 && bgMode <= 5 &&
+        (dispCnt & (0x1F00 | 0xE000)) == 0x0800 && soloBitmapLine(3, line, backdrop, rawNeeded)) {
+        winMaskValid = false;
+        objectLineCount = 0;
+        l1Needed = false;
+        internalX[1] += bgPB[1];
+        internalY[1] += bgPD[1];
+        goto apply_master_bright;
+    }
+
+    for (int i = 0; i < 256; i++) layers[0][i] = backdrop;
+    memset(priorities, 4, sizeof(priorities));
+    if (needBlendLayers)
+        memset(blendBits[0], 5, sizeof(blendBits[0]));
+
+    // v1.80: one active-object list and one current-line window mask.
+    winMaskValid = false;
     if (dispCnt & BIT(12)) {
+        objectLineCount = buildObjectLineDs(line);
         if (dispCnt & BIT(15)) drawObjects<0>(line, true);
+        if (dispCnt & 0xE000) buildWindowMask(line);
         drawObjects<0>(line, false);
+    }
+    else {
+        objectLineCount = 0;
+        if (dispCnt & 0xE000) buildWindowMask(line);
+    }
+
+    // v1.114: the second layer (the pixel underneath) is only ever read for alpha blending:
+    // by a blend effect, under a 3D pixel, or under a semi-transparent object pixel. Objects
+    // are drawn first and only into the top layer, so it is known here whether any of that
+    // can happen on this line. If not, the backgrounds keep just the top layer: two stores
+    // per pixel instead of six.
+    {
+        bool need = (bldMode != 0) || (!noTargets2 && (dispCnt & BIT(3)) && (dispCnt & BIT(8)));
+        if (!need && !noTargets2 && (dispCnt & BIT(12))) {
+            uint32_t orBits = 0;
+            for (int i = 0; i < 256; i++) orBits |= layers[0][i];
+            need = (orBits & BIT(25)) != 0;
+        }
+        l1Needed = need;
+        if (need) {
+            for (int i = 0; i < 256; i++) layers[1][i] = backdrop;
+            memset(blendBits[1], 5, sizeof(blendBits[1]));
+        }
     }
 
     // Draw the background layers depending on the BG mode
@@ -468,19 +1015,89 @@ void Gpu2D::drawScanline(int line) {
         break;
     }
 
-    if (!needBlendLayers) {
+    if (!l1Needed) {
+        if ((dispCnt & BIT(3)) && (dispCnt & BIT(8))) {
+            // v1.115: 3D pixels are 18-bit already and are kept as they are
+            uint32_t *dst = (dispMode == 1) ? &framebuffer[line * 256] : layers[1];
+            if (dispMode == 1 && !rawNeeded) {
+                for (int i = 0; i < 256; i++) {
+                    const uint32_t px = layers[0][i];
+                    dst[i] = (px & BIT(26)) ? px : rgb5ToRgb6(px);
+                }
+                goto apply_master_bright;
+            }
+            for (int i = 0; i < 256; i++) {
+                const uint32_t px = layers[0][i];
+                const uint32_t color = (px & BIT(26)) ? px : rgb5ToRgb6(px);
+                layers[0][i] = color;
+                dst[i] = color;
+            }
+            if (dispMode == 1) goto apply_master_bright;
+            goto copy_display_mode;
+        }
+        if (dispMode == 1) {
+            // v1.80: raw line and visible framebuffer are identical here.
+            // Convert once and write both destinations, avoiding a 1 KB copy.
+            uint32_t *dst = &framebuffer[line * 256];
+            if (!rawNeeded) {
+                for (int i = 0; i < 256; i++) dst[i] = rgb5ToRgb6(layers[0][i]);
+                goto apply_master_bright;
+            }
+            for (int i = 0; i < 256; i++) {
+                uint32_t color = rgb5ToRgb6(layers[0][i]);
+                layers[0][i] = color;
+                dst[i] = color;
+            }
+            goto apply_master_bright;
+        }
         for (int i = 0; i < 256; i++)
             layers[0][i] = rgb5ToRgb6(layers[0][i]);
         goto copy_display_mode;
     }
 
-    // v1.74: prebuild window mask for blend stage (framebuffer OBJ window now valid)
-    if (dispCnt & 0xE000) buildWindowMask(line); else winMaskValid = false;
+    // v1.80: when blending is off and no pixel needs the forced alpha paths,
+    // convert the raw line and emit the framebuffer in one pass. This removes
+    // both the per-pixel blend dispatch and the later 1 KB memcpy.
+    if (bldMode == 0) {
+        uint32_t orBits = 0;
+        for (int i = 0; i < 256; i++)
+            orBits |= layers[0][i];
+        if (!(orBits & (BIT(25) | BIT(26)))) {
+            if (dispMode == 1) {
+                uint32_t *dst = &framebuffer[line * 256];
+                if (!rawNeeded) {
+                    for (int i = 0; i < 256; i++) dst[i] = rgb5ToRgb6(layers[0][i]);
+                    goto apply_master_bright;
+                }
+                for (int i = 0; i < 256; i++) {
+                    uint32_t color = rgb5ToRgb6(layers[0][i]);
+                    layers[0][i] = color;
+                    dst[i] = color;
+                }
+                goto apply_master_bright;
+            }
+            for (int i = 0; i < 256; i++)
+                layers[0][i] = rgb5ToRgb6(layers[0][i]);
+            goto copy_display_mode;
+        }
+    }
+
+    // v1.80: winMaskCache is already current for this line (built immediately
+    // after the object-window pass and before BG/object rasterization).
     // Blend the layers to form the final image
-    for (int mode = (bldCnt >> 6) & 0x3, i = 0; i < 256; i++) {
+    // v1.112: the visible line is written as each pixel is finished, instead of a separate
+    // 1 KB copy afterwards ("continue" below leaves the inner do-while, not the for loop).
+    {
+    uint32_t *const lineOut = &framebuffer[line * 256];
+    // registers held in locals: the per-pixel stores could alias them, so the compiler
+    // otherwise reloads each one for every pixel
+    const int bc = bldCnt, ba = bldAlpha, by = bldY;
+    const uint32_t dc = dispCnt;
+    for (int mode = (bc >> 6) & 0x3, i = 0; i < 256; i++) {
+      do {
         // Check if blending can/should be performed
         if (layers[0][i] & BIT(26)) { // 3D pixel
-            if (bldCnt & BIT(8 + blendBits[1][i])) { // Below pixel is blendable
+            if (bc & BIT(8 + blendBits[1][i])) { // Below pixel is blendable
                 // Override the default blending rules and apply special alpha blending
                 // If 3D alpha is max, skip blending; high-res 3D is transposed on these pixels
                 uint8_t eva = ((layers[0][i] >> 18) & 0x3F) + 1;
@@ -493,7 +1110,7 @@ void Gpu2D::drawScanline(int line) {
                 layers[0][i] = (b << 12) | (g << 6) | r;
                 continue;
             }
-            else if (mode < 2 || !(bldCnt & BIT(blendBits[0][i]))) {
+            else if (mode < 2 || !(bc & BIT(blendBits[0][i]))) {
                 // Do nothing unless brightness blending is possible as a fallback
                 continue;
             }
@@ -504,19 +1121,19 @@ void Gpu2D::drawScanline(int line) {
 
             if (layers[0][i] & BIT(25)) { // Semi-transparent pixel
                 // Force alpha blending if possible, otherwise allow brightness blending or do nothing
-                if (bldCnt & BIT(8 + blendBits[1][i])) // Below pixel is blendable
+                if (bc & BIT(8 + blendBits[1][i])) // Below pixel is blendable
                     goto alpha;
-                else if (mode < 2 || !(bldCnt & BIT(blendBits[0][i])))
+                else if (mode < 2 || !(bc & BIT(blendBits[0][i])))
                     continue;
             }
-            else if (mode == 0 || !(bldCnt & BIT(blendBits[0][i])) || (mode == 1 && !(bldCnt & BIT(8 + blendBits[1][i])))) {
+            else if (mode == 0 || !(bc & BIT(blendBits[0][i])) || (mode == 1 && !(bc & BIT(8 + blendBits[1][i])))) {
                 // Do nothing if blending is disabled or not possible
                 continue;
             }
         }
 
         // Skip blending if the pixel is in the bounds of a window that has it disabled — v1.74 via prebuilt mask
-        if (dispCnt & 0xE000) {
+        if (dc & 0xE000) {
             if (!(winMaskCache[i] & BIT(5))) continue;
         }
 
@@ -525,15 +1142,17 @@ void Gpu2D::drawScanline(int line) {
         case 1: // Alpha blending
         alpha: {
             uint32_t blend = (layers[1][i] & BIT(26)) ? layers[1][i] : rgb5ToRgb6(layers[1][i]);
-            uint8_t eva = std::min((bldAlpha >> 0) & 0x1F, 16);
-            uint8_t evb = std::min((bldAlpha >> 8) & 0x1F, 16);
+            uint8_t eva = std::min((ba >> 0) & 0x1F, 16);
+            uint8_t evb = std::min((ba >> 8) & 0x1F, 16);
             // Fast LUT when eva+evb==16 (common), otherwise fallback
-            if (eva + evb == 16) {
-                ensureAlphaLUT();
-                uint8_t r = alphaBlend6((layers[0][i]>>0)&0x3F, (blend>>0)&0x3F, eva);
-                uint8_t g = alphaBlend6((layers[0][i]>>6)&0x3F, (blend>>6)&0x3F, eva);
-                uint8_t b = alphaBlend6((layers[0][i]>>12)&0x3F, (blend>>12)&0x3F, eva);
-                layers[0][i] = (b<<12)|(g<<6)|r;
+            if (eva + evb <= 16) {
+                // v1.112 (v1.114: also for eva+evb == 16, replacing a 70 KB table that missed the cache):
+                // no channel can exceed 63 here, so red+blue and green are blended as
+                // packed fields with two multiplies each and no clamping.
+                const uint32_t a = layers[0][i];
+                const uint32_t rb = ((a & 0x3F03Fu) * eva + (blend & 0x3F03Fu) * evb) >> 4;
+                const uint32_t g = ((a & 0xFC0u) * eva + (blend & 0xFC0u) * evb) >> 4;
+                layers[0][i] = (rb & 0x3F03Fu) | (g & 0xFC0u);
             } else {
                 uint8_t r = std::min((((layers[0][i] >> 0) & 0x3F) * eva + ((blend >> 0) & 0x3F) * evb) / 16, 63U);
                 uint8_t g = std::min((((layers[0][i] >> 6) & 0x3F) * eva + ((blend >> 6) & 0x3F) * evb) / 16, 63U);
@@ -544,26 +1163,26 @@ void Gpu2D::drawScanline(int line) {
         }
 
         case 2: // Brightness increase — v1.74 LUT (no div)
-            if (bldY) {
-                ensureBrightTables();
-                uint8_t r = s_brightIncTable[(layers[0][i]>>0)&0x3F][bldY];
-                uint8_t g = s_brightIncTable[(layers[0][i]>>6)&0x3F][bldY];
-                uint8_t b = s_brightIncTable[(layers[0][i]>>12)&0x3F][bldY];
-                layers[0][i] = (b<<12)|(g<<6)|r;
+            if (by) {
+                const uint32_t a = layers[0][i], rb = a & 0x3F03Fu, g = a & 0xFC0u;
+                layers[0][i] = (rb + ((((0x3F03Fu - rb) * by) >> 4) & 0x3F03Fu)) |
+                               (g + ((((0xFC0u - g) * by) >> 4) & 0xFC0u));
             }
             continue;
 
         case 3: // Brightness decrease — v1.74 LUT
-            if (bldY) {
-                ensureBrightTables();
-                uint8_t r = s_brightDecTable[(layers[0][i]>>0)&0x3F][bldY];
-                uint8_t g = s_brightDecTable[(layers[0][i]>>6)&0x3F][bldY];
-                uint8_t b = s_brightDecTable[(layers[0][i]>>12)&0x3F][bldY];
-                layers[0][i] = (b<<12)|(g<<6)|r;
+            if (by) {
+                const uint32_t a = layers[0][i], rb = a & 0x3F03Fu, g = a & 0xFC0u;
+                layers[0][i] = (rb - (((rb * by) >> 4) & 0x3F03Fu)) | (g - (((g * by) >> 4) & 0xFC0u));
             }
             continue;
         }
+      } while (0);
+      lineOut[i] = layers[0][i];
     }
+    }
+    if (dispMode == 1)
+        goto apply_master_bright;
 
 copy_display_mode:
     // Copy the final image to the framebuffer
@@ -588,32 +1207,39 @@ copy_display_mode:
     }
 
 apply_master_bright:
-    // Apply master brightness (DS-only, 18-bit) — v1.72 LUT accelerated
+#if NOODS_SOLO_TEXT_VERIFY
+    if (verifySolo) {
+        for (int x = 0; x < 256; ++x) {
+            g_soloTextStats[4] += expectedSolo[x] != framebuffer[line * 256 + x];
+            if (rawNeeded) g_soloTextStats[5] += expectedSolo[x] != layers[0][x];
+        }
+    }
+#endif
+    // Apply master brightness (DS-only, 18-bit).
+    // v1.114: red+blue and green are scaled as packed fields (c + (63-c)*f/16 and c - c*f/16
+    // per channel, the same rounding as the tables used before), two multiplies per pixel
+    // instead of three table loads.
     switch ((masterBright >> 14) & 0x3) {
     case 1: {
-        uint8_t factor = std::min<uint8_t>(masterBright & 0x1F, 16);
+        const uint32_t factor = std::min<uint8_t>(masterBright & 0x1F, 16);
         if (factor) {
-            ensureBrightTables();
-            for (int i=0;i<256;i++) {
-                uint32_t *pixel = &framebuffer[line*256+i];
-                uint8_t r = s_brightIncTable[(*pixel>>0)&0x3F][factor];
-                uint8_t g = s_brightIncTable[(*pixel>>6)&0x3F][factor];
-                uint8_t b = s_brightIncTable[(*pixel>>12)&0x3F][factor];
-                *pixel = (b<<12)|(g<<6)|r;
+            uint32_t *px = &framebuffer[line * 256];
+            for (int i = 0; i < 256; i++) {
+                const uint32_t rb = px[i] & 0x3F03Fu, g = px[i] & 0xFC0u;
+                px[i] = (rb + ((((0x3F03Fu - rb) * factor) >> 4) & 0x3F03Fu)) |
+                        (g + ((((0xFC0u - g) * factor) >> 4) & 0xFC0u));
             }
         }
         break;
     }
     case 2: {
-        uint8_t factor = std::min<uint8_t>(masterBright & 0x1F, 16);
+        const uint32_t factor = std::min<uint8_t>(masterBright & 0x1F, 16);
         if (factor) {
-            ensureBrightTables();
-            for (int i=0;i<256;i++) {
-                uint32_t *pixel = &framebuffer[line*256+i];
-                uint8_t r = s_brightDecTable[(*pixel>>0)&0x3F][factor];
-                uint8_t g = s_brightDecTable[(*pixel>>6)&0x3F][factor];
-                uint8_t b = s_brightDecTable[(*pixel>>12)&0x3F][factor];
-                *pixel = (b<<12)|(g<<6)|r;
+            uint32_t *px = &framebuffer[line * 256];
+            for (int i = 0; i < 256; i++) {
+                const uint32_t rb = px[i] & 0x3F03Fu, g = px[i] & 0xFC0u;
+                px[i] = (rb - (((rb * factor) >> 4) & 0x3F03Fu)) |
+                        (g - (((g * factor) >> 4) & 0xFC0u));
             }
         }
         break;
@@ -640,6 +1266,13 @@ FORCE_INLINE void Gpu2D::drawBgPixel(int bg, int line, int x, uint32_t pixel) {
         }
     }
     int prio = bgCnt[bg] & 0x3;
+    if (__builtin_expect(!l1Needed, 0)) {
+        if (prio <= priorities[0][x]) {
+            layers[0][x] = pixel;
+            priorities[0][x] = prio;
+        }
+        return;
+    }
     if (__builtin_expect(prio <= priorities[0][x], 1)) {
         layers[1][x] = layers[0][x];
         priorities[1][x] = priorities[0][x];
@@ -678,6 +1311,7 @@ FORCE_INLINE void Gpu2D::drawObjPixel(int line, int x, uint32_t pixel, int8_t pr
 }
 
 template <bool gbaMode> void Gpu2D::drawText(int bg, int line) {
+    V180_PROFILE_SCOPE_IF(18, gbaMode);
     // If 3D is enabled, override BG0 in text mode
     if (!gbaMode && bg == 0 && (dispCnt & BIT(3))) {
         // In high-res 3D mode, skip every other pixel
@@ -756,18 +1390,53 @@ template <bool gbaMode> void Gpu2D::drawText(int bg, int line) {
         return;
     }
 
+    // v1.116: the registers and layer pointers are read once per line, and the pixel write is
+    // done here with them held in locals. (The stores into the layer arrays may alias the
+    // registers, so the compiler otherwise reloads each one for every tile and pixel.)
+    const int hofs = bgHOfs[bg];
+    const bool wide = (bgCnt[bg] & BIT(14)) != 0;
+    const bool winOn = (dispCnt & 0xE000) != 0;
+    const bool slowPut = winOn && !winMaskValid;
+    const uint8_t bgBit = BIT(bg);
+    const int prio = bgCnt[bg] & 0x3;
+    const bool l1n = gbaMode || l1Needed;
+    const uint8_t *const wm = winMaskCache;
+    uint32_t *const l0 = layers[0], *const l1 = layers[1];
+    int8_t *const p0 = priorities[0], *const p1 = priorities[1];
+    int8_t *const b0 = blendBits[0], *const b1 = blendBits[1];
+    auto put = [&](int x, uint32_t pixel) __attribute__((always_inline)) {
+        if (__builtin_expect(slowPut, 0)) { drawBgPixel(bg, line, x, pixel); return; }
+        if (winOn && !(wm[x] & bgBit)) return;
+        if (!l1n) {
+            if (prio <= p0[x]) { l0[x] = pixel; p0[x] = prio; }
+            return;
+        }
+        if (__builtin_expect(prio <= p0[x], 1)) {
+            l1[x] = l0[x];
+            p1[x] = p0[x];
+            b1[x] = b0[x];
+            l0[x] = pixel;
+            p0[x] = prio;
+            b0[x] = bg;
+        } else if (prio <= p1[x]) {
+            l1[x] = pixel;
+            p1[x] = prio;
+            b1[x] = bg;
+        }
+    };
+
     // Draw a line
-    int width = (gbaMode ? 240 : 256) + (bgHOfs[bg] & 0x7);
+    int width = (gbaMode ? 240 : 256) + (hofs & 0x7);
     if (bgCnt[bg] & BIT(7)) { // 8-bit
         // Set the extended palette slot if enabled; BG 0/1 can optionally use slot 2/3
         uint8_t *extPal = (dispCnt & BIT(30)) ? extPalettes[bg + (bg < 2 && (bgCnt[bg] & BIT(13))) * 2] : nullptr;
         for (int i = 0; i < width; i += 8) {
             // Move the tile address to the current tile
-            int xOffset = (i + bgHOfs[bg]) & 0x1FF;
+            int xOffset = (i + hofs) & 0x1FF;
             uint32_t tileAddr = tileBase + ((xOffset & 0xF8) >> 2);
 
             // If the X-offset exceeds 256 and the background is 512 pixels wide, move to the next 256x256 section
-            if (xOffset >= 256 && (bgCnt[bg] & BIT(14)))
+            if (xOffset >= 256 && wide)
                 tileAddr += 0x800;
 
             // Get the current tile and its palette
@@ -783,18 +1452,18 @@ template <bool gbaMode> void Gpu2D::drawText(int bg, int line) {
             for (int x = i - (xOffset & 7) + ((tile & BIT(10)) ? 7 : 0); indices != 0; ((tile & BIT(10)) ? x-- : x++), indices >>= 8) {
                 // Draw a pixel if it's visible
                 if (x >= 0 && x < (gbaMode ? 240 : 256) && (indices & 0xFF))
-                    drawBgPixel(bg, line, x, U8TO16(pal, (indices & 0xFF) * 2) | BIT(15));
+                    put(x, U8TO16(pal, (indices & 0xFF) * 2) | BIT(15));
             }
         }
     }
     else { // 4-bit
         for (int i = 0; i < width; i += 8) {
             // Move the tile address to the current tile
-            int xOffset = (i + bgHOfs[bg]) & 0x1FF;
+            int xOffset = (i + hofs) & 0x1FF;
             uint32_t tileAddr = tileBase + ((xOffset & 0xF8) >> 2);
 
             // If the X-offset exceeds 256 and the background is 512 pixels wide, move to the next 256x256 section
-            if (xOffset >= 256 && (bgCnt[bg] & BIT(14)))
+            if (xOffset >= 256 && wide)
                 tileAddr += 0x800;
 
             // Get the current tile
@@ -812,13 +1481,37 @@ template <bool gbaMode> void Gpu2D::drawText(int bg, int line) {
             for (int x = i - (xOffset & 7) + ((tile & BIT(10)) ? 7 : 0); indices != 0; ((tile & BIT(10)) ? x-- : x++), indices >>= 4) {
                 // Draw a pixel if it's visible
                 if (x >= 0 && x < (gbaMode ? 240 : 256) && (indices & 0xF))
-                    drawBgPixel(bg, line, x, U8TO16(pal, (indices & 0xF) * 2) | BIT(15));
+                    put(x, U8TO16(pal, (indices & 0xF) * 2) | BIT(15));
             }
         }
     }
 }
 
 template <bool gbaMode> void Gpu2D::drawAffine(int bg, int line) {
+#if NOODS_GBA_AFFINE_WINDOW && NOODS_GBA_AFFINE_VERIFY
+    if constexpr (gbaMode) {
+        // Verify the production fast path against the original ordering on the
+        // same input state. Restore candidate state after comparing every layer.
+        struct State { uint32_t layers[2][256]; int8_t priorities[2][256], blendBits[2][256]; int x[2], y[2]; } before, candidate;
+        auto save = [&](State &s) { memcpy(s.layers, layers, sizeof(layers)); memcpy(s.priorities, priorities, sizeof(priorities)); memcpy(s.blendBits, blendBits, sizeof(blendBits)); memcpy(s.x, internalX, sizeof(internalX)); memcpy(s.y, internalY, sizeof(internalY)); };
+        auto restore = [&](const State &s) { memcpy(layers, s.layers, sizeof(layers)); memcpy(priorities, s.priorities, sizeof(priorities)); memcpy(blendBits, s.blendBits, sizeof(blendBits)); memcpy(internalX, s.x, sizeof(internalX)); memcpy(internalY, s.y, sizeof(internalY)); };
+        save(before);
+        drawAffineImpl<gbaMode>(bg, line);
+        save(candidate);
+        restore(before); s_affineReference = true;
+        drawAffineImpl<gbaMode>(bg, line);
+        s_affineReference = false;
+        bool mismatch = memcmp(candidate.layers, layers, sizeof(layers)) || memcmp(candidate.priorities, priorities, sizeof(priorities)) || memcmp(candidate.blendBits, blendBits, sizeof(blendBits)) || memcmp(candidate.x, internalX, sizeof(internalX)) || memcmp(candidate.y, internalY, sizeof(internalY));
+        ++g_gbaAffineStats[0]; if (mismatch) ++g_gbaAffineStats[1];
+        restore(candidate);
+        return;
+    }
+#endif
+    drawAffineImpl<gbaMode>(bg, line);
+}
+
+template <bool gbaMode> void Gpu2D::drawAffineImpl(int bg, int line) {
+    V180_PROFILE_SCOPE_IF(16, gbaMode);
     // Calculate the base data addresses
     uint32_t tileBase = bgVramAddr + ((bgCnt[bg] << 3) & 0x0F800) + ((dispCnt >> 11) & 0x70000);
     uint32_t indexBase = bgVramAddr + ((bgCnt[bg] << 12) & 0x3C000) + ((dispCnt >> 8) & 0x70000);
@@ -829,6 +1522,142 @@ template <bool gbaMode> void Gpu2D::drawAffine(int bg, int line) {
 
     // Get the background size
     int size = 128 << ((bgCnt[bg] & 0xC000) >> 14);
+
+    // v1.101: GBA fast path. Same per-pixel work as the loop below with every loop-invariant
+    // (affine deltas, size, wrap flag, priority, window mode, page table) held in locals; the
+    // generic loop reloads them each pixel because the layer stores may alias the object.
+    // Taken only when a VRAM read is a plain page-table read (no CPU bus accounting active)
+    // and the window test is either off or served by the precomputed per-line mask.
+    if (gbaMode && !core->memory.gbaCpuExecActive && (!(dispCnt & 0xE000) || winMaskValid)) {
+        const int pa = bgPA[bg - 2], pc = bgPC[bg - 2];
+        const bool wrap = (bg < 2 || (bgCnt[bg] & BIT(13)));
+        const int sizeMask = size - 1;
+        const uint32_t rowShift = 4 + ((bgCnt[bg] & 0xC000) >> 14); // log2(size / 8)
+        const uint8_t bgBit = BIT(bg);
+        const bool winOn = (dispCnt & 0xE000) != 0;
+        bool useWin = winOn;
+#if NOODS_GBA_AFFINE_WINDOW
+        // The prebuilt window mask picks exactly one of these four control
+        // bytes. If all permit this BG, every pixel passes without a lookup.
+        if (gbaAffineAllWindowsAllow(winIn, winOut, bgBit)
+#if NOODS_GBA_AFFINE_VERIFY
+            && !s_affineReference
+#endif
+        ) useWin = false;
+#if NOODS_GBA_AFFINE_VERIFY
+        if (winOn && !useWin) ++g_gbaAffineStats[2];
+#endif
+#endif
+        const int prio = bgCnt[bg] & 0x3;
+        const uint8_t *const pal = palette;
+        uint8_t **const map = core->memory.readMap7;
+        uint32_t *const l0 = layers[0], *const l1 = layers[1];
+        int8_t *const p0 = priorities[0], *const p1 = priorities[1];
+        const bool l1n = gbaMode || l1Needed;
+        int8_t *const b0 = blendBits[0], *const b1 = blendBits[1];
+        uint32_t lastTileAddr = 0xFFFFFFFFu, lastTile = 0;
+        for (int i = 0; i < 240; i++) {
+            int x = (rotscaleX += pa) >> 8;
+            int y = (rotscaleY += pc) >> 8;
+            if (wrap) {
+                x &= sizeMask;
+                y &= sizeMask;
+            }
+            else if ((uint32_t)x >= (uint32_t)size || (uint32_t)y >= (uint32_t)size) {
+                continue;
+            }
+            const uint32_t tileAddr = tileBase + ((uint32_t)(y >> 3) << rowShift) + (x >> 3);
+            // v1.106: neighbouring pixels usually fall in the same map cell; reuse its tile number
+            if (tileAddr != lastTileAddr) {
+                const uint8_t *tp = map[tileAddr >> 12];
+                lastTile = tp ? tp[tileAddr & 0xFFF] : core->memory.read<uint8_t>(true, tileAddr);
+                lastTileAddr = tileAddr;
+            }
+            const uint32_t indexAddr = indexBase + lastTile * 64 + (y & 7) * 8 + (x & 7);
+            const uint8_t *ip = map[indexAddr >> 12];
+            const uint8_t index = ip ? ip[indexAddr & 0xFFF] : core->memory.read<uint8_t>(true, indexAddr);
+            if (!index) continue;
+            if (useWin && !(winMaskCache[i] & bgBit)) continue;
+            const uint32_t pixel = U8TO16(pal, index * 2) | BIT(15);
+            if (!l1n) {
+                if (prio <= p0[i]) { l0[i] = pixel; p0[i] = prio; }
+                continue;
+            }
+            if (__builtin_expect(prio <= p0[i], 1)) {
+                l1[i] = l0[i];
+                p1[i] = p0[i];
+                b1[i] = b0[i];
+                l0[i] = pixel;
+                p0[i] = prio;
+                b0[i] = bg;
+            } else if (prio <= p1[i]) {
+                l1[i] = pixel;
+                p1[i] = prio;
+                b1[i] = bg;
+            }
+        }
+        internalX[bg - 2] += bgPB[bg - 2];
+        internalY[bg - 2] += bgPD[bg - 2];
+        return;
+    }
+
+    // v1.122: the same loop for a DS screen. Everything that does not change along the line
+    // is held in locals, a map cell's tile number is reused while the pixels stay inside
+    // it, and the layer stores are written out for the two cases (top layer only, or both).
+    if (NOODS_AFFINE_FAST && !gbaMode && (!(dispCnt & 0xE000) || winMaskValid)) {
+        const int pa = bgPA[bg - 2], pc = bgPC[bg - 2];
+        const bool wrap = (bg < 2 || (bgCnt[bg] & BIT(13)));
+        const int sizeMask = size - 1;
+        const uint32_t rowShift = 4 + ((bgCnt[bg] & 0xC000) >> 14); // log2(size / 8)
+        const bool useWin = (dispCnt & 0xE000) != 0;
+        const uint8_t bgBit = BIT(bg);
+        const int prio = bgCnt[bg] & 0x3;
+        const uint8_t *const pal = palette;
+        uint32_t *const l0 = layers[0], *const l1 = layers[1];
+        int8_t *const p0 = priorities[0], *const p1 = priorities[1];
+        const bool l1n = l1Needed;
+        int8_t *const b0 = blendBits[0], *const b1 = blendBits[1];
+        uint32_t lastTileAddr = 0xFFFFFFFFu, lastTile = 0;
+        for (int i = 0; i < 256; i++) {
+            int x = (rotscaleX += pa) >> 8;
+            int y = (rotscaleY += pc) >> 8;
+            if (wrap) {
+                x &= sizeMask;
+                y &= sizeMask;
+            }
+            else if ((uint32_t)x >= (uint32_t)size || (uint32_t)y >= (uint32_t)size) {
+                continue;
+            }
+            const uint32_t tileAddr = tileBase + ((uint32_t)(y >> 3) << rowShift) + (x >> 3);
+            if (tileAddr != lastTileAddr) {
+                lastTile = fastRead8T<false>(tileAddr);
+                lastTileAddr = tileAddr;
+            }
+            const uint8_t index = fastRead8T<false>(indexBase + lastTile * 64 + (y & 7) * 8 + (x & 7));
+            if (!index) continue;
+            if (useWin && !(winMaskCache[i] & bgBit)) continue;
+            const uint32_t pixel = U8TO16(pal, index * 2) | BIT(15);
+            if (!l1n) {
+                if (prio <= p0[i]) { l0[i] = pixel; p0[i] = prio; }
+                continue;
+            }
+            if (__builtin_expect(prio <= p0[i], 1)) {
+                l1[i] = l0[i];
+                p1[i] = p0[i];
+                b1[i] = b0[i];
+                l0[i] = pixel;
+                p0[i] = prio;
+                b0[i] = bg;
+            } else if (prio <= p1[i]) {
+                l1[i] = pixel;
+                p1[i] = prio;
+                b1[i] = bg;
+            }
+        }
+        internalX[bg - 2] += bgPB[bg - 2];
+        internalY[bg - 2] += bgPD[bg - 2];
+        return;
+    }
 
     // Draw a line
     for (int i = 0; i < (gbaMode ? 240 : 256); i++) {
@@ -863,6 +1692,51 @@ template <bool gbaMode> void Gpu2D::drawAffine(int bg, int line) {
     internalY[bg - 2] += bgPD[bg - 2];
 }
 
+// v1.118: one line of an unscaled, unrotated bitmap background that is the only thing on
+// its screen: read, convert to 18-bit and write to the frame in one pass. Returns false
+// (having drawn nothing) when the line is not that simple.
+bool Gpu2D::soloBitmapLine(int bg, int line, uint32_t backdrop, bool raw) {
+    if (!(bgCnt[bg] & BIT(7)) || bgPA[bg - 2] != 0x100 || bgPC[bg - 2] != 0) return false;
+    static const uint16_t sizes[] = { 128, 128, 256, 256, 512, 256, 512, 512 };
+    const uint16_t *size = &sizes[((bgCnt[bg] >> 13) & 0x6)];
+    const int sizeX = size[0], sizeY = size[1];
+    const int x0 = internalX[bg - 2] >> 8, y = internalY[bg - 2] >> 8;
+    if (x0 < 0 || x0 + 256 > sizeX || y < 0 || y >= sizeY) return false;
+    const bool direct = (bgCnt[bg] & BIT(2)) != 0;
+    const uint32_t bpp = direct ? 2 : 1;
+    const uint32_t xShift = (uint32_t)__builtin_ctz((unsigned)sizeX);
+    uint32_t addr = bgVramAddr + ((bgCnt[bg] << 6) & 0x7C000) + ((((uint32_t)y << xShift) + x0) * bpp);
+    uint8_t **const map = core->memory.readMap9A;
+    for (uint32_t a = addr >> 12; a <= (addr + 256 * bpp - 1) >> 12; a++)
+        if (!map[a]) return false;
+
+    uint32_t *out = &framebuffer[line * 256];
+    const uint32_t back6 = rgb5ToRgb6(backdrop);
+    const uint8_t *const pal = palette;
+    // The row is walked one 4 KB page at a time (a row crosses at most one page boundary)
+    int left = 256;
+    while (left > 0) {
+        const uint8_t *p = map[addr >> 12] + (addr & 0xFFF);
+        int n = (int)((0x1000 - (addr & 0xFFF)) / bpp);
+        if (n > left) n = left;
+        if (n == 0) n = 1; // a 16-bit pixel never straddles a page (addresses are even)
+        if (direct) {
+            for (int i = 0; i < n; i++) {
+                const uint16_t v = U8TO16(p, i * 2);
+                out[i] = (v & BIT(15)) ? rgb5ToRgb6(v) : back6;
+            }
+        } else {
+            for (int i = 0; i < n; i++) {
+                const uint8_t index = p[i];
+                out[i] = index ? rgb5ToRgb6(U8TO16(pal, index * 2) | BIT(15)) : back6;
+            }
+        }
+        out += n; addr += n * bpp; left -= n;
+    }
+    if (raw) memcpy(layers[0], &framebuffer[line * 256], 256 * sizeof(uint32_t));
+    return true;
+}
+
 void Gpu2D::drawExtended(int bg, int line) {
     // Set the initial rotscale coordinates
     int rotscaleX = internalX[bg - 2] - bgPA[bg - 2];
@@ -878,7 +1752,116 @@ void Gpu2D::drawExtended(int bg, int line) {
         const uint16_t sizeX = size[0];
         const uint16_t sizeY = size[1];
 
-        if (bgCnt[bg] & BIT(2)) { // Direct color bitmap
+        // v1.102: bitmap fast path. Same per-pixel work as the loops below with the
+        // loop-invariants (affine deltas, size, wrap flag, priority, window mode, page table)
+        // held in locals; the generic loops reload them every pixel because the layer stores
+        // may alias the object. Used when the window test is off or served by the per-line mask.
+        if (!(dispCnt & 0xE000) || winMaskValid) {
+            const int pa = bgPA[bg - 2], pc = bgPC[bg - 2];
+            const bool wrap = (bgCnt[bg] & BIT(13)) != 0;
+            const bool direct = (bgCnt[bg] & BIT(2)) != 0;
+            const uint32_t xShift = (uint32_t)__builtin_ctz((unsigned)sizeX); // sizeX is 128/256/512
+            const bool useWin = (dispCnt & 0xE000) != 0;
+            const uint8_t bgBit = BIT(bg);
+            const int prio = bgCnt[bg] & 0x3;
+            const uint8_t *const pal = palette;
+            uint8_t **const map = core->memory.readMap9A;
+            uint32_t *const l0 = layers[0], *const l1 = layers[1];
+            int8_t *const p0 = priorities[0], *const p1 = priorities[1];
+            const bool l1n = l1Needed;
+            int8_t *const b0 = blendBits[0], *const b1 = blendBits[1];
+            // v1.112: unscaled, unrotated bitmap whose 256 pixels lie inside the image (the
+            // usual full-screen picture): walk the source row with a pointer, looking up the
+            // page table once per 4 KB page instead of once per pixel.
+            bool rowDone = false;
+            if (pa == 0x100 && pc == 0) {
+                const int x0 = (rotscaleX + 0x100) >> 8, y = rotscaleY >> 8;
+                if (x0 >= 0 && x0 + 256 <= sizeX && y >= 0 && y < sizeY) {
+                    const uint32_t bpp = direct ? 2 : 1;
+                    uint32_t addr = dataBase + ((((uint32_t)y << xShift) + x0) * bpp);
+                    bool ok = true;
+                    for (uint32_t a = addr >> 12; a <= (addr + 256 * bpp - 1) >> 12; a++)
+                        if (!map[a]) ok = false;
+                    if (ok) {
+                        for (int i = 0; i < 256; i++, addr += bpp) {
+                            const uint8_t *p = map[addr >> 12] + (addr & 0xFFF);
+                            uint32_t pixel;
+                            if (direct) {
+                                const uint16_t v = U8TO16(p, 0);
+                                if (!(v & BIT(15))) continue;
+                                pixel = v;
+                            } else {
+                                const uint8_t index = *p;
+                                if (!index) continue;
+                                pixel = U8TO16(pal, index * 2) | BIT(15);
+                            }
+                            if (useWin && !(winMaskCache[i] & bgBit)) continue;
+                            if (!l1n) {
+                                if (prio <= p0[i]) { l0[i] = pixel; p0[i] = prio; }
+                                continue;
+                            }
+                            if (__builtin_expect(prio <= p0[i], 1)) {
+                                l1[i] = l0[i];
+                                p1[i] = p0[i];
+                                b1[i] = b0[i];
+                                l0[i] = pixel;
+                                p0[i] = prio;
+                                b0[i] = bg;
+                            } else if (prio <= p1[i]) {
+                                l1[i] = pixel;
+                                p1[i] = prio;
+                                b1[i] = bg;
+                            }
+                        }
+                        rowDone = true;
+                    }
+                }
+            }
+            if (!rowDone)
+            for (int i = 0; i < 256; i++) {
+                int x = (rotscaleX += pa) >> 8;
+                int y = (rotscaleY += pc) >> 8;
+                if (wrap) {
+                    x &= sizeX - 1;
+                    y &= sizeY - 1;
+                }
+                else if ((uint32_t)x >= (uint32_t)sizeX || (uint32_t)y >= (uint32_t)sizeY) {
+                    continue;
+                }
+                uint32_t pixel;
+                if (direct) {
+                    const uint32_t addr = dataBase + ((((uint32_t)y << xShift) + x) << 1);
+                    const uint8_t *p = map[addr >> 12];
+                    const uint16_t v = p ? U8TO16(p, addr & 0xFFF) : core->memory.read<uint16_t>(0, addr);
+                    if (!(v & BIT(15))) continue;
+                    pixel = v;
+                } else {
+                    const uint32_t addr = dataBase + ((uint32_t)y << xShift) + x;
+                    const uint8_t *p = map[addr >> 12];
+                    const uint8_t index = p ? p[addr & 0xFFF] : core->memory.read<uint8_t>(0, addr);
+                    if (!index) continue;
+                    pixel = U8TO16(pal, index * 2) | BIT(15);
+                }
+                if (useWin && !(winMaskCache[i] & bgBit)) continue;
+                if (!l1n) {
+                    if (prio <= p0[i]) { l0[i] = pixel; p0[i] = prio; }
+                    continue;
+                }
+                if (__builtin_expect(prio <= p0[i], 1)) {
+                    l1[i] = l0[i];
+                    p1[i] = p0[i];
+                    b1[i] = b0[i];
+                    l0[i] = pixel;
+                    p0[i] = prio;
+                    b0[i] = bg;
+                } else if (prio <= p1[i]) {
+                    l1[i] = pixel;
+                    p1[i] = prio;
+                    b1[i] = bg;
+                }
+            }
+        }
+        else if (bgCnt[bg] & BIT(2)) { // Direct color bitmap
             // Draw a line
             for (int i = 0; i < 256; i++) {
                 // Increment the rotscaled coordinates and remove the fraction
@@ -926,13 +1909,109 @@ void Gpu2D::drawExtended(int bg, int line) {
         }
     }
     else { // Extended affine
-        // Calculate the base data addresses
         uint32_t tileBase = bgVramAddr + ((bgCnt[bg] << 3) & 0x0F800) + ((dispCnt >> 11) & 0x70000);
         uint32_t indexBase = bgVramAddr + ((bgCnt[bg] << 12) & 0x3C000) + ((dispCnt >> 8) & 0x70000);
-
-        // Get the bitmap size
         size_t size = 128 << ((bgCnt[bg] >> 14) & 0x3);
 
+        // In the non-threaded renderer, CPU and DMA cannot change the tile
+        // map during this function. Cache the last *mapped* tile and hold
+        // scanline invariants in locals. The reference path remains for
+        // threaded rendering or a window without a precomputed mask.
+        if (!Settings::threaded2D && !core->gpu.has2DWorker() && (!(dispCnt & 0xE000) || winMaskValid)) {
+            const int pa = bgPA[bg - 2], pc = bgPC[bg - 2];
+            const bool wrap = (bgCnt[bg] & BIT(13)) != 0;
+            const bool useWin = (dispCnt & 0xE000) != 0;
+            const bool extEnabled = (dispCnt & BIT(30)) != 0;
+            const uint8_t *const ext = extPalettes[bg];
+            const uint8_t *const standardPal = palette;
+            uint8_t **const map = core->memory.readMap9A;
+            const uint8_t bgBit = BIT(bg);
+            const int prio = bgCnt[bg] & 3;
+            const bool l1n = l1Needed;
+            uint32_t *const l0 = layers[0], *const l1 = layers[1];
+            int8_t *const p0 = priorities[0], *const p1 = priorities[1];
+            int8_t *const b0 = blendBits[0], *const b1 = blendBits[1];
+            // Common extended-palette, unwrapped, no-window composition.
+            // All derived tile addresses are stable for this single scanline:
+            // the worker is absent and the guest cannot write VRAM here.
+            if (!wrap && extEnabled && !useWin && l1n) {
+                if (ext) {
+                    uint32_t cachedAddr = 0xFFFFFFFFu;
+                    uint32_t indexBaseCached = 0;
+                    const uint8_t *tilePixels = nullptr, *tilePalette = nullptr;
+                    int xFlip = 0, yFlip = 0;
+                    for (int i = 0; i < 256; i++) {
+                        int x = (rotscaleX += pa) >> 8;
+                        int y = (rotscaleY += pc) >> 8;
+                        if ((uint32_t)x >= size || (uint32_t)y >= size) continue;
+                        uint32_t tileKey = (((uint32_t)y & ~7u) << 4) | ((uint32_t)x >> 3);
+                        if (tileKey != cachedAddr) {
+                            uint32_t tileAddr = tileBase + (((uint32_t)(y >> 3) * (size >> 3) + (x >> 3)) << 1);
+                            const uint8_t *tilePage = map[tileAddr >> 12];
+                            uint16_t tile = tilePage ? U8TO16(tilePage, tileAddr & 0xFFF) : fastRead16(tileAddr);
+                            cachedAddr = tilePage ? tileKey : 0xFFFFFFFFu;
+                            indexBaseCached = indexBase + ((tile & 0x3FF) << 6);
+                            const uint8_t *indexPage = map[indexBaseCached >> 12];
+                            tilePixels = indexPage ? indexPage + (indexBaseCached & 0xFFF) : nullptr;
+                            tilePalette = ext + ((tile >> 3) & 0x1E00);
+                            xFlip = (tile & BIT(10)) ? 7 : 0;
+                            yFlip = (tile & BIT(11)) ? 7 : 0;
+                        }
+                        unsigned off = (((y ^ yFlip) & 7) << 3) | ((x ^ xFlip) & 7);
+                        uint8_t index = tilePixels ? tilePixels[off] : fastRead8(indexBaseCached + off);
+                        if (!index) continue;
+                        uint32_t pixel = U8TO16(tilePalette, index * 2) | BIT(15);
+                        if (prio <= p0[i]) {
+                            l1[i] = l0[i]; p1[i] = p0[i]; b1[i] = b0[i];
+                            l0[i] = pixel; p0[i] = prio; b0[i] = bg;
+                        } else if (prio <= p1[i]) {
+                            l1[i] = pixel; p1[i] = prio; b1[i] = bg;
+                        }
+                    }
+                }
+            } else {
+            uint32_t cachedAddr = 0xFFFFFFFFu;
+            uint16_t cachedTile = 0;
+            for (int i = 0; i < 256; i++) {
+                int x = (rotscaleX += pa) >> 8;
+                int y = (rotscaleY += pc) >> 8;
+                if (wrap) { x &= size - 1; y &= size - 1; }
+                else if ((uint32_t)x >= size || (uint32_t)y >= size) continue;
+                uint32_t tileAddr = tileBase + (((uint32_t)(y >> 3) * (size >> 3) + (x >> 3)) << 1);
+                uint16_t tile;
+                if (tileAddr == cachedAddr) tile = cachedTile;
+                else {
+                    const uint8_t *tilePage = map[tileAddr >> 12];
+                    if (tilePage) {
+                        tile = U8TO16(tilePage, tileAddr & 0xFFF);
+                        cachedAddr = tileAddr;
+                        cachedTile = tile;
+                    } else {
+                        tile = fastRead16(tileAddr);
+                        cachedAddr = 0xFFFFFFFFu;
+                    }
+                }
+                if (extEnabled && !ext) continue;
+                const uint8_t *pal = extEnabled ? ext + ((tile >> 3) & 0x1E00) : standardPal;
+                uint32_t indexAddr = indexBase + (tile & 0x3FF) * 64 +
+                    (((tile & BIT(11)) ? (7 - y) : y) & 7) * 8 +
+                    (((tile & BIT(10)) ? (7 - x) : x) & 7);
+                const uint8_t *indexPage = map[indexAddr >> 12];
+                const uint8_t index = indexPage ? indexPage[indexAddr & 0xFFF] : fastRead8(indexAddr);
+                if (!index) continue;
+                uint32_t pixel = U8TO16(pal, index * 2) | BIT(15);
+                if (useWin && !(winMaskCache[i] & bgBit)) continue;
+                if (!l1n) {
+                    if (prio <= p0[i]) { l0[i] = pixel; p0[i] = prio; }
+                } else if (prio <= p0[i]) {
+                    l1[i] = l0[i]; p1[i] = p0[i]; b1[i] = b0[i];
+                    l0[i] = pixel; p0[i] = prio; b0[i] = bg;
+                } else if (prio <= p1[i]) {
+                    l1[i] = pixel; p1[i] = prio; b1[i] = bg;
+                }
+            }
+            }
+        } else {
         // Use the standard palette by default
         uint8_t *pal = palette;
 
@@ -973,12 +2052,15 @@ void Gpu2D::drawExtended(int bg, int line) {
         }
     }
 
+    }
+
     // Increment the internal registers at the end of the scanline
     internalX[bg - 2] += bgPB[bg - 2];
     internalY[bg - 2] += bgPD[bg - 2];
 }
 
 void Gpu2D::drawExtendedGba(int bg, int line) {
+    V180_PROFILE_SCOPE(21);
     // Calculate the base data address
     // Modes 4 and 5 have two bitmaps that can be selected with DISPCNT bit 4
     uint8_t mode = dispCnt & 0x7;
@@ -1074,48 +2156,166 @@ void Gpu2D::drawLarge(int bg, int line) {
 }
 
 template <bool gbaMode> void Gpu2D::drawObjects(int line, bool window) {
-    // Loop through and draw the 128 sprites in OAM
-    for (int i = 0; i < 128; i++) {
-        // Skip objects that are disabled or are/aren't window type
-        uint8_t byte = oam[i * 8 + 1];
-        uint8_t type = (byte >> 2) & 0x3;
-        if ((byte & 0x3) == 2 || (type == 2) != window)
+    V180_PROFILE_SCOPE_IF(17, gbaMode);
+#if NOODS_DS_OBJ_VERIFY
+    if (!gbaMode || NOODS_OBJ_WORD_READS) {
+        struct ObjState { uint32_t pixels[256], fb[256]; int8_t prio[256], bits[256]; };
+        ObjState before, expected;
+        auto save = [&](ObjState &s) { memcpy(s.pixels,layers[0],sizeof(s.pixels)); memcpy(s.fb,&framebuffer[line*256],sizeof(s.fb)); memcpy(s.prio,priorities[0],256); memcpy(s.bits,blendBits[0],256); };
+        auto load = [&](const ObjState &s) { memcpy(layers[0],s.pixels,sizeof(s.pixels)); memcpy(&framebuffer[line*256],s.fb,sizeof(s.fb)); memcpy(priorities[0],s.prio,256); memcpy(blendBits[0],s.bits,256); };
+        save(before);
+        objReference = false;
+        drawObjectsImpl<gbaMode>(line, window);
+        save(expected); load(before);
+        objReference = true;
+        drawObjectsImpl<gbaMode>(line, window);
+        objReference = false;
+        ++g_dsObjStats[4];
+        if (gbaMode) ++g_dsObjStats[7];
+        for (int x=0;x<256;++x) {
+            g_dsObjStats[5] += expected.pixels[x] != layers[0][x];
+            g_dsObjStats[5] += expected.fb[x] != framebuffer[line*256+x];
+            g_dsObjStats[5] += expected.prio[x] != priorities[0][x];
+            g_dsObjStats[5] += expected.bits[x] != blendBits[0][x];
+        }
+        return;
+    }
+#endif
+    drawObjectsImpl<gbaMode>(line, window);
+}
+
+template <bool gbaMode> void Gpu2D::drawObjectsImpl(int line, bool window) {
+    // v1.80: walk only sprites that passed this scanline's OAM cull.
+    for (int i = 0; i < objectLineCount; i++) {
+        const ObjectLine &entry = objectLine[i];
+        const uint8_t type = entry.type;
+        if ((type == 2) != window)
             continue;
 
-        // Get an object's 6 attribute bytes (the unused 2 bytes are for rotscale)
-        uint16_t object[3] = { U8TO16(oam, i * 8 + 0), U8TO16(oam, i * 8 + 2), U8TO16(oam, i * 8 + 4) };
+        const uint16_t *object = entry.object;
+        const uint8_t width = entry.width;
+        const uint8_t height = entry.height;
+        const uint8_t width2 = entry.width2;
+        const uint8_t height2 = entry.height2;
+        const int x = entry.x;
+        const int spriteY = entry.spriteY;
+        const int8_t priority = entry.priority;
 
-        // Get the object's dimensions based on its shape and size
-        static const uint8_t sizes[] = {
-            8, 8, 16, 16, 32, 32, 64, 64, // Square
-            16, 8, 32, 8, 32, 16, 64, 32, // Horizontal
-            8, 16, 8, 32, 16, 32, 32, 64, // Vertical
-            0, 0, 0, 0, 0, 0, 0, 0 // Prohibited
-        };
-        const uint8_t *size = &sizes[((object[0] >> 11) & 0x18) | ((object[1] >> 13) & 0x6)];
-        const uint8_t width = size[0];
-        const uint8_t height = size[1];
-
-        // Double the object bounds for rotscale objects with the double size bit set
-        bool shift = ((object[0] & 0x300) == 0x300);
-        uint8_t width2 = width << shift;
-        uint8_t height2 = height << shift;
-
-        // Get the Y coordinate and wrap it around if it exceeds the screen bounds
-        int y = object[0] & 0xFF;
-        if (y >= 192) y -= 256;
-
-        // Adjust the Y-coordinate within the sprite based on vertical mosaic
-        int spriteY = ((object[0] & BIT(12)) ? (line - (line % (((mosaic >> 12) & 0xF) + 1))) : line) - y;
-        if (spriteY < 0 || spriteY >= height2)
+        // v1.106: GBA fast path. Same per-pixel decisions as the loops below, with the loop
+        // invariants in locals, the rotscale products stepped by addition instead of two
+        // multiplies per pixel, and VRAM read through the page table directly. Used when a
+        // VRAM read is a plain page-table read and the window test is off or precomputed.
+        if (((gbaMode && !core->memory.gbaCpuExecActive && !(dispCnt & BIT(31))) ||
+             (!gbaMode && NOODS_DS_OBJ_FAST && !objReference && type != 3)) &&
+            (!(dispCnt & 0xE000) || winMaskValid)) {
+            if (!gbaMode) {
+                ++g_dsObjStats[(object[0] & BIT(13)) ? 1 : 0];
+                if (object[0] & BIT(8)) ++g_dsObjStats[2];
+                if (window) ++g_dsObjStats[3];
+            }
+            const int screenWidth = gbaMode ? 240 : 256;
+            const bool useWin = (dispCnt & 0xE000) != 0;
+            const bool map1D = (dispCnt & BIT(gbaMode ? 6 : 4)) != 0;
+            const bool is8 = (object[0] & BIT(13)) != 0;
+            const bool objWin = (type == 2);
+            const uint32_t semi = (uint32_t)(type == 1) << 25;
+            uint8_t **const map = gbaMode ? core->memory.readMap7 : core->memory.readMap9A;
+            uint32_t *const l0 = layers[0];
+            int8_t *const p0 = priorities[0];
+            int8_t *const b0 = blendBits[0];
+            uint32_t *const fbLine = &framebuffer[line * 256];
+            const uint8_t *pal = is8 ? &palette[0x200] : &palette[0x200 + ((object[2] & 0xF000) >> 12) * 32];
+            if (!gbaMode && is8 && (dispCnt & BIT(31))) {
+                if (!extPalettes[4]) continue;
+                pal = &extPalettes[4][(object[2] & 0xF000) >> 3];
+                ++g_dsObjStats[6];
+            }
+            const uint32_t boundary = gbaMode ? 32 : (map1D ? (32 << ((dispCnt >> 20) & 3)) : 32);
+            uint32_t tb = (gbaMode ? 0x6010000 : objVramAddr) + (object[2] & 0x3FF) * boundary;
+            auto rd8 = [&](const uint32_t addr) __attribute__((always_inline)) -> uint8_t {
+                const uint8_t *const p = map[addr >> 12];
+                return p ? p[addr & 0xFFF] : core->memory.read<uint8_t>(gbaMode, addr);
+            };
+            auto put = [&](const int offset, const uint32_t index) __attribute__((always_inline)) {
+                if (index && objWin) {
+                    fbLine[offset] |= BIT(24);
+                    return;
+                }
+                if (index && (!useWin || (winMaskCache[offset] & BIT(4)))) {
+                    if (__builtin_expect(!(l0[offset] & BIT(15)) || priority < p0[offset], 1)) {
+                        l0[offset] = semi | BIT(15) | U8TO16(pal, index * 2);
+                        p0[offset] = priority;
+                        b0[offset] = 4;
+                    }
+                }
+                // Update the priority even if the pixel is transparent (GBA quirk)
+                if (gbaMode && priority < p0[offset] && b0[offset] == 4)
+                    p0[offset] = priority;
+            };
+            if (object[0] & BIT(8)) { // Rotscale
+                const uint32_t pBase = ((object[1] >> 9) & 0x1F) * 0x20;
+                const int pa = (int16_t)U8TO16(oam, pBase + 0x06), pb = (int16_t)U8TO16(oam, pBase + 0x0E);
+                const int pc = (int16_t)U8TO16(oam, pBase + 0x16), pd = (int16_t)U8TO16(oam, pBase + 0x1E);
+                const int mapWidth = map1D ? width : (is8 ? 128 : 256);
+                const int j0 = (x < 0) ? -x : 0;
+                const int j1 = (x + width2 > screenWidth) ? (screenWidth - x) : width2;
+                int ax = pa * (j0 - width2 / 2) + pb * (spriteY - height2 / 2);
+                int ay = pc * (j0 - width2 / 2) + pd * (spriteY - height2 / 2);
+                const int halfW = width / 2, halfH = height / 2;
+                for (int j = j0; j < j1; j++, ax += pa, ay += pc) {
+                    const int rx = (ax >> 8) + halfW;
+                    if ((unsigned)rx >= (unsigned)width) continue;
+                    const int ry = (ay >> 8) + halfH;
+                    if ((unsigned)ry >= (unsigned)height) continue;
+                    uint32_t index;
+                    if (is8) {
+                        index = rd8(tb + ((ry >> 3) * mapWidth + (ry & 7)) * 8 + (rx >> 3) * 64 + (rx & 7));
+                    } else {
+                        index = rd8(tb + ((ry >> 3) * mapWidth + (ry & 7)) * 4 + (rx >> 3) * 32 + ((rx & 7) >> 1));
+                        index = (rx & 1) ? (index >> 4) : (index & 0x0F);
+                    }
+                    put(x + j, index);
+                }
+            } else {
+                const int mapWidth = map1D ? width : (is8 ? 128 : 256);
+                const bool hflip = (object[1] & BIT(12)) != 0;
+                const int unit = is8 ? 8 : 4;
+                if (object[1] & BIT(13)) // Vertical flip
+                    tb += (7 - (spriteY % 8) + ((height - 1 - spriteY) / 8) * mapWidth) * unit;
+                else
+                    tb += ((spriteY % 8) + (spriteY / 8) * mapWidth) * unit;
+                uint32_t lastWordAddr = 0xFFFFFFFFu, word = 0;
+                for (int j = 0; j < width; j++) {
+                    if (NOODS_OBJ_WORD_READS && !objReference) {
+                        const uint32_t step = is8 ? 4 : 8;
+                        if ((j & (step - 1)) == 0) {
+                            const uint32_t addr = tb + (j >> 3) * (is8 ? 64 : 32) + (is8 ? (j & 4) : 0);
+                            word = fastRead32T<gbaMode>(addr);
+                            lastWordAddr = addr;
+                            if (!gbaMode && !objWin && word == 0) {
+                                j += step - 1;
+                                continue;
+                            }
+                        }
+                    }
+                    const int offset = hflip ? (x + width - j - 1) : (x + j);
+                    if ((unsigned)offset >= (unsigned)screenWidth) continue;
+                    uint32_t index;
+                    if (NOODS_OBJ_WORD_READS && !objReference) {
+                        // Tile rows are aligned and never cross a 4KB map page.
+                        // Read each 32-bit word once, then extract 4 bytes/8 nibbles.
+                        index = (word >> (is8 ? ((j & 3) * 8) : ((j & 7) * 4))) & (is8 ? 255u : 15u);
+                    } else if (is8) {
+                        index = rd8(tb + (j >> 3) * 64 + (j & 7));
+                    } else {
+                        index = rd8(tb + (j >> 3) * 32 + ((j & 7) >> 1));
+                        index = (j & 1) ? (index >> 4) : (index & 0x0F);
+                    }
+                    put(offset, index);
+                }
+            }
             continue;
-
-        // Get the X coordinate and wrap it around if it exceeds the screen bounds
-        int x = object[1] & 0x1FF;
-        if (x >= 256) x -= 512;
-
-        // Objects are higher priority than background layers, so the priority is given a little boost
-        int8_t priority = ((object[2] >> 10) & 0x3) - 1;
+        }
 
         // Draw bitmap objects
         if (!gbaMode && type == 3) {

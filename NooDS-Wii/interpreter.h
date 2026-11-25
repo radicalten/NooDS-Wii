@@ -33,6 +33,7 @@ public:
     uint8_t halted = 0;
 
     Interpreter(Core *core, bool arm7);
+    uint32_t *cyclesPtr() { return &cycles; } // v1.106: inline GBA bus accounting
     void saveState(FILE *file);
     void loadState(FILE *file);
 
@@ -42,6 +43,10 @@ public:
 
     static void runCoreNone(Core &core);
     template <bool, int> static void runCoreSingle(Core &core);
+#if NOODS_JIT && NOODS_JIT_BLOCKS
+    // v1p171: opt-in relaxed GBA timing loop, out of line so the exact path is untouched.
+    static void runGbaFastTiming(Interpreter &arm, Core &core);
+#endif
     static void runCoreNds(Core &core);
     static void runCoreDsi(Core &core);
 #if NOODS_NDS_TASK_PROFILE
@@ -64,6 +69,10 @@ public:
     void advanceGbaCycles(int c);
     void stallGbaDmaCycles(uint32_t c);
     void runGbaOpcode();
+    bool runGbaArmBurst();
+    bool runGbaDedicated();
+    bool runGbaRomIsland();
+    bool runGbaThumbIsland();
 
     bool mpuDataCheck = false;
     bool dataAbort = false;

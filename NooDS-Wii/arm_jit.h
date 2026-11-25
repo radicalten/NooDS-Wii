@@ -17,7 +17,47 @@
     along with NooDS-Wii. If not, see <https://www.gnu.org/licenses/>.
 */
 
+// Restricted-MPU pure-instruction classifier shared by interpreter and JIT.
+#include <stdint.h>
+#ifndef NOODS_MPU_PURE_JIT
+#define NOODS_MPU_PURE_JIT 0
+#endif
+static inline bool mpuPureArm(uint32_t op) {
+    if ((op & 0x0E000000u) != 0x02000000u &&
+        (op & 0x0E000010u) != 0x00000000u) return false;
+    const unsigned alu = (op >> 21) & 15u;
+    if (alu >= 8 && alu <= 11 && !(op & (1u << 20))) return false;
+    return ((op >> 12) & 15u) != 15u;
+}
+static inline bool mpuPureThumb(uint16_t op) {
+    return (op < 0x4000u) || ((op & 0xFC00u) == 0x4000u);
+}
+
 #pragma once
+
+#ifndef NOODS_JIT_FORWARD
+#define NOODS_JIT_FORWARD 0
+#endif
+
+#ifndef NOODS_REJECT_DISPATCH
+#define NOODS_REJECT_DISPATCH 0
+#endif
+
+#ifndef NOODS_JIT_CONTEXT_CANDIDATES
+#define NOODS_JIT_CONTEXT_CANDIDATES 0
+#endif
+
+#ifndef NOODS_ARM_NOFIT_STEP
+#define NOODS_ARM_NOFIT_STEP 0
+#endif
+
+#ifndef NOODS_DIRECT_HANDLERS
+#define NOODS_DIRECT_HANDLERS 0
+#endif
+
+#ifndef NOODS_BUDGET_DISPATCH
+#define NOODS_BUDGET_DISPATCH 1
+#endif
 
 #include <cassert>
 #include <cstddef>
@@ -39,6 +79,39 @@ class Interpreter;
 #endif
 #ifndef NOODS_JIT_STATS
 #define NOODS_JIT_STATS 1
+#endif
+// High-frequency dispatcher diagnostics are opt-in: they do not affect guest state.
+// Counts only: no part of the MPU permission decisions depends on these.
+#ifndef NOODS_MPU_PATH_STATS
+#define NOODS_MPU_PATH_STATS 0
+#endif
+#if NOODS_MPU_PATH_STATS
+#define MPU_PATH_STAT(x) do { x; } while (0)
+#else
+#define MPU_PATH_STAT(x) do {} while (0)
+#endif
+#ifndef NOODS_JIT_DISPATCH_STATS
+#define NOODS_JIT_DISPATCH_STATS 0
+#endif
+#if NOODS_JIT_DISPATCH_STATS
+#define DISPATCH_STAT(x) do { x; } while (0)
+#else
+#define DISPATCH_STAT(x) do {} while (0)
+#endif
+#ifndef NOODS_STORE_WORD9
+#define NOODS_STORE_WORD9 1
+#endif
+#ifndef NOODS_STEP_BLOCK
+#define NOODS_STEP_BLOCK 1
+#endif
+#ifndef NOODS_STEP_ARM
+#ifndef NOODS_NOFIT_CHAIN
+#define NOODS_NOFIT_CHAIN 1
+#endif
+#define NOODS_STEP_ARM 1 // v1.121: step blocks for ARM-mode instructions (ARM9 and DS ARM7)
+#endif
+#ifndef NOODS_SKIP_FALSE
+#define NOODS_SKIP_FALSE 1 // v1.121: an ARM instruction whose condition is false is skipped in the dispatcher
 #endif
 extern "C" int jit_enter(void *code, Interpreter *cpu, uint32_t maxIters = 1);
 extern "C" void jit_exit(void);
@@ -159,12 +232,16 @@ constexpr inline uint32_t stwbrx(uint8_t rs, uint8_t ra, uint8_t rb) { return en
 
 // 32-39: Integer arithmetic (XO-form)
 constexpr inline uint32_t add(uint8_t rd, uint8_t ra, uint8_t rb, bool oe = false, bool rc = false)   { return encodeXO(rd, ra, rb, 266u, oe, rc); }
+constexpr inline uint32_t addo(uint8_t rd, uint8_t ra, uint8_t rb, bool rc = false)                  { return encodeXO(rd, ra, rb, 266u, true,  rc); }
 constexpr inline uint32_t addc(uint8_t rd, uint8_t ra, uint8_t rb, bool oe = false, bool rc = false)  { return encodeXO(rd, ra, rb, 10u,  oe, rc); }
 constexpr inline uint32_t adde(uint8_t rd, uint8_t ra, uint8_t rb, bool oe = false, bool rc = false)  { return encodeXO(rd, ra, rb, 138u, oe, rc); }
 constexpr inline uint32_t subf(uint8_t rd, uint8_t ra, uint8_t rb, bool oe = false, bool rc = false)  { return encodeXO(rd, ra, rb, 40u,  oe, rc); }
+constexpr inline uint32_t subfo(uint8_t rd, uint8_t ra, uint8_t rb, bool rc = false)                 { return encodeXO(rd, ra, rb, 40u,  true,  rc); }
 constexpr inline uint32_t subfc(uint8_t rd, uint8_t ra, uint8_t rb, bool oe = false, bool rc = false) { return encodeXO(rd, ra, rb, 8u,   oe, rc); }
 constexpr inline uint32_t subfe(uint8_t rd, uint8_t ra, uint8_t rb, bool oe = false, bool rc = false) { return encodeXO(rd, ra, rb, 136u, oe, rc); }
 constexpr inline uint32_t neg(uint8_t rd, uint8_t ra, bool oe = false, bool rc = false)               { return encodeXO(rd, ra, 0,  104u, oe, rc); }
+constexpr inline uint32_t mulhw(uint8_t rd, uint8_t ra, uint8_t rb)  { return encodeXO(rd, ra, rb, 75u, false, false); }
+constexpr inline uint32_t mulhwu(uint8_t rd, uint8_t ra, uint8_t rb) { return encodeXO(rd, ra, rb, 11u, false, false); }
 constexpr inline uint32_t mullw(uint8_t rd, uint8_t ra, uint8_t rb, bool oe = false, bool rc = false) { return encodeXO(rd, ra, rb, 235u, oe, rc); }
 
 // 40-50: Bitwise logical, shifts, sign-extend, count leading zeros (X-form)
@@ -250,6 +327,15 @@ constexpr inline uint32_t ble(int16_t offsetBytes, uint8_t cr = 0) { return bc(4
 constexpr inline uint32_t blr(bool lk = false)   { return (19u << 26) | (20u << 21) | (16u << 1) | (lk ? 1u : 0u); }
 constexpr inline uint32_t bctr(bool lk = false)  { return (19u << 26) | (20u << 21) | (528u << 1) | (lk ? 1u : 0u); }
 constexpr inline uint32_t bctrl()                { return bctr(true); }
+// CR-logical ops (v1.81 predication support). BT/BA/BB are absolute CR bit numbers (0..31).
+constexpr inline uint32_t crOp(uint32_t xo, uint8_t bt, uint8_t ba, uint8_t bb) {
+    return (19u << 26) | ((uint32_t)(bt & 0x1Fu) << 21) | ((uint32_t)(ba & 0x1Fu) << 16) |
+           ((uint32_t)(bb & 0x1Fu) << 11) | ((xo & 0x3FFu) << 1);
+}
+constexpr inline uint32_t crand(uint8_t bt, uint8_t ba, uint8_t bb) { return crOp(257u, bt, ba, bb); }
+constexpr inline uint32_t crnor(uint8_t bt, uint8_t ba, uint8_t bb) { return crOp(33u,  bt, ba, bb); }
+constexpr inline uint32_t crxor(uint8_t bt, uint8_t ba, uint8_t bb) { return crOp(193u, bt, ba, bb); }
+constexpr inline uint32_t creqv(uint8_t bt, uint8_t ba, uint8_t bb) { return crOp(289u, bt, ba, bb); }
 
 // 66-69: Cache / synchronization (Broadway Gekko / 750CL)
 constexpr inline uint32_t dcbst(uint8_t ra, uint8_t rb) { return encodeX(0, ra, rb, 54u,  false); }
@@ -263,9 +349,10 @@ class ArmPpcJit {
 public:
     static constexpr size_t STUB_TABLE_SIZE  = 32768; // Direct-mapped Phase 1/2 per-instruction cache per CPU
     static constexpr size_t BLOCK_TABLE_SIZE = 32768; // Direct-mapped Phase 2 multi-instruction block cache per CPU
+    static constexpr size_t BLOCK_ALT_XOR    = 0x4000; // v1.113: alternate slot of a block (index ^ this)
     static constexpr size_t PAGE_EPOCH_SIZE  = 32768; // Collision-free 4 KB page slots covering 0x00000000..0x07FFFFFF
     static constexpr size_t CODE_LINE_WORDS  = 65536; // 64-byte line bitmap covering 0x00000000..0x07FFFFFF (256 KiB)
-    static constexpr size_t DEFAULT_POOL_BYTES = 8 * 1024 * 1024; // 8 MiB code pool in MEM2
+    static constexpr size_t DEFAULT_POOL_BYTES = 6 * 1024 * 1024; // maximum shared-arena NDS pool
     static constexpr size_t DEFAULT_POOL_WORDS = DEFAULT_POOL_BYTES / sizeof(uint32_t);
     static constexpr size_t MAX_STUB_WORDS     = 224;
     static constexpr size_t MAX_BLOCK_WORDS    = 4096; // reserve for inline memory accesses and guarded MMIO paths
@@ -311,6 +398,7 @@ public:
         uint32_t blockInstrsExecuted[2];
         uint32_t cp15Exits[2];
         uint32_t smcInvalidations[2];
+        uint32_t condGuards[2]; // v1.82 diagnostic: predication guards emitted at compile time
         uint32_t mapInvalidations[2];
         uint32_t poolWraps;
         size_t   poolWordsUsed;
@@ -324,6 +412,7 @@ public:
         uint32_t firstBlockPc;
     };
 
+    static void configureCodePool(void *memory, size_t bytes);
     static void init();
     static void reset();
     static void setPoolLimitWords(size_t maxWords);
@@ -332,6 +421,11 @@ public:
     static int executeArm(Interpreter *cpu, uint32_t opcode, uint32_t remIndep = 1, uint32_t remShared = 1);
     static int executeThumb(Interpreter *cpu, uint32_t opcode, uint32_t remIndep = 1, uint32_t remShared = 1);
     static bool tryExecuteGbaFast(Interpreter *cpu, uint16_t waitCnt, uint32_t targetCycles);
+
+    // v1.101: inline block-hit path for the CPU run loops (arm_jit_fast.h). Returns the block's
+    // cycle count, or 0 with no guest state modified when the slow path must run instead.
+    template <typename RemFn>
+    static int fastDispatch(Interpreter *cpu, Core *core, const bool arm7, const uint32_t shift, RemFn &&remFn);
 
     static inline bool hasCodeAtAddr(uint32_t addr) {
         return (codeLineBits[(addr >> 11) & (CODE_LINE_WORDS - 1)] & (1u << ((addr >> 6) & 31u))) != 0;
@@ -352,12 +446,27 @@ public:
     static const uint32_t *getCodePool() { return codePool; }
     static void dumpStats(FILE *f);
 
+    // v1p190: can this MRS/MSR(CPSR) form be emitted with no run-time check at all?
+    static bool psrArmCompilable(Interpreter *cpu, uint32_t opcode);
+    static uint32_t psrWriteMask(Interpreter *cpu, uint32_t opcode);
+    static int dispatchArm(Interpreter *cpu, uint32_t opcode);
+    static int dispatchThumb(Interpreter *cpu, uint32_t opcode);
     static int fallbackArm(Interpreter *cpu, uint32_t opcode);
     static int fallbackThumb(Interpreter *cpu, uint32_t opcode);
+    static int tryBudgetStep(Interpreter *cpu, uint32_t opcode, bool thumb, bool lookupMiss = false);
+    static int stepThumb(Interpreter *cpu, uint32_t opcode);
+    static int stepArm(Interpreter *cpu, uint32_t opcode);
+    static bool makeStepBlock(Interpreter *cpu, uint32_t instrPC, uint32_t opcode, uint32_t opcode1, bool thumb);
+    static void stepCandArm(Interpreter *cpu, uint32_t opcode);
+    static int storeWord9(Interpreter *cpu, uint32_t addr, uint32_t value);
     static uintptr_t resolveArmHandler(uint32_t opcode);
     static uintptr_t resolveThumbHandler(uint16_t opcode);
     static int condBranchArm(Interpreter *cpu, uint32_t opcode);
     static int execBranchArm(Interpreter *cpu, uint32_t opcode, int32_t remDelta, int32_t totalDelta, int32_t prefixCycles);
+    static uint32_t spinFastForward(Interpreter *cpu, uint32_t maxIters, uint32_t rd, uint32_t k, uint32_t cond);
+    struct PollLoop;
+    static bool analysePollLoop(const uint32_t *ops, int count, uint32_t instrPC, PollLoop &d);
+    static uint32_t pollFastForward(Interpreter *cpu, const PollLoop *d);
     static int execBranchThumb(Interpreter *cpu, uint32_t opcode, int32_t remDelta, int32_t totalDelta, int32_t prefixCycles);
 
 private:
@@ -365,10 +474,22 @@ private:
     static size_t poolWordsUsed;
     static size_t poolLimitWords;
     static uint32_t currentEpoch;
+    // v1.104: 0x80000000 while exactly one NDS CPU is running (runCoreSingle), else 0.
+    // Blocks that continue past stores are tagged with it and only used in that mode.
+public:
+    static uint32_t soloBit;      // nonzero while the ARM9 runs alone (ARM7 halted)
+    static uint32_t linkMode;     // v1.120: run loop in charge (see emitLinkTry)
+    // v1.123: next address of a run of instructions being stepped up to an event (noFitEv)
+    static uint32_t noFitNext[2], noFitEv[2];
+    static uint32_t linkEvTarget;
+    static void setSolo(bool solo);
+private:
     static bool initialized;
 
     static StubEntry stubTable[2][STUB_TABLE_SIZE];
-    static BlockEntry blockTable[2][BLOCK_TABLE_SIZE];
+    // [0] ARM9, [1] ARM7, [2] ARM9 while it runs alone (v1.104, see NOODS_STORE_EXIT)
+    static BlockEntry blockTable[3][BLOCK_TABLE_SIZE];
+    static BlockEntry *arm9Table; // blockTable[0] or blockTable[2]
     static uint32_t pageEpoch[2][PAGE_EPOCH_SIZE];
     static uint32_t pageHasBlockBits[2][PAGE_EPOCH_SIZE / 32];
     static uint32_t codeLineBits[CODE_LINE_WORDS];
@@ -395,23 +516,37 @@ public:
     static void pollSnapshot(PollTrack &t, Interpreter *cpu, uint32_t S);
 private:
 
+    static void alignCodePool();
     static void ensureSpace(size_t wordsNeeded);
     static void wrapPool();
 
     static void *compileStub(Interpreter *cpu, uint32_t instrPC, uint32_t opcode, bool thumb);
     static bool emitNativeThumb(uint32_t *&p, Interpreter *cpu, uint16_t opcode, int &outCycles, bool emitFlags = true);
     static bool emitNativeArm(uint32_t *&p, Interpreter *cpu, uint32_t opcode, int &outCycles, bool emitFlags = true);
+    static bool emitNativeDspMulArm(uint32_t *&p, Interpreter *cpu, uint32_t opcode, int &outCycles);
+    // v1p190: MRS Rd,CPSR / MSR CPSR,Rm / MSR CPSR,#imm, guarded at run time.
+    static bool emitNativePsrArm(uint32_t *&p, Interpreter *cpu, uint32_t opcode, int &outCycles);
     static bool emitNativeLoadThumb(uint32_t *&p, Interpreter *cpu, uint16_t opcode, int &outCycles);
     static bool emitNativeStoreThumb(uint32_t *&p, Interpreter *cpu, uint16_t opcode, int &outCycles);
     static bool emitNativePushPop(uint32_t *&p, Interpreter *cpu, uint16_t regMask, bool isLoad, uint32_t rawOpcode, bool isThumb, int &outCycles);
     static bool emitNativeLoadArm(uint32_t *&p, Interpreter *cpu, uint32_t opcode, int &outCycles);
     static bool emitNativeStoreArm(uint32_t *&p, Interpreter *cpu, uint32_t opcode, int &outCycles);
+    static bool emitNativeMrcArm(uint32_t *&p, Interpreter *cpu, uint32_t opcode, int &outCycles);
     static void emitGuardedPollHalfLoad(uint32_t *&p, Interpreter *cpu, uint8_t rd,
                                         void (*storeFn)(uint32_t *&, uint8_t, uint8_t),
                                         uint32_t **outJumpSlots, int &jumpCount);
-    static void emitHelperR15Sync(uint32_t *&p, bool enter);
+    static void emitPollHalfBody(uint32_t *&p, Interpreter *cpu, uint8_t rd,
+        void (*storeFn)(uint32_t *&, uint8_t, uint8_t),
+        uint32_t **outJumpSlots, int &jumpCount);
+    static void ensureSlowTramp(Interpreter *cpu);
+    static int linkMpuPage(Interpreter *cpu, uint32_t page); // v1.119
+    static void emitLinkStub(Interpreter *cpu, bool thumb); // v1.121
+    static int linkKind(Interpreter *cpu);
+    static bool linkKindOn(Interpreter *cpu);
+    static void emitDynStub(Interpreter *cpu); static bool emitDynLink(uint32_t *&p); // v1.119
+    static void emitLinkTry(uint32_t *&p, Interpreter *cpu, uint32_t targetPC, bool thumb, int32_t baseCycles, bool helperInBlock); // v1.119
     static bool emitInlineBranchArm(uint32_t *&p, Interpreter *cpu, uint32_t opcode, uint32_t instrPC, int32_t totalDelta, int32_t prefixCycles, bool helperInBlock, uint32_t *loopTop = nullptr);
-    static bool emitInlineBranchThumb(uint32_t *&p, Interpreter *cpu, uint16_t opcode, uint32_t instrPC, int32_t totalDelta, int32_t prefixCycles, bool helperInBlock, uint32_t *loopTop = nullptr);
+    static bool emitInlineBranchThumb(uint32_t *&p, Interpreter *cpu, uint16_t opcode, uint32_t instrPC, int32_t totalDelta, int32_t prefixCycles, bool helperInBlock, uint32_t *loopTop = nullptr, bool fallThrough = false);
     static bool emitInlineBxArm(uint32_t *&p, Interpreter *cpu, uint32_t opcode, uint32_t instrPC, int32_t totalDelta, int32_t prefixCycles, bool helperInBlock);
     static bool emitInlineBxThumb(uint32_t *&p, Interpreter *cpu, uint16_t opcode, uint32_t instrPC, int32_t totalDelta, int32_t prefixCycles, bool helperInBlock);
     static bool emitPcDestLoadTerminatorArm(uint32_t *&p, Interpreter *cpu, uint32_t opcode, uint32_t instrPC, int32_t totalDelta, int32_t prefixCycles, bool helperInBlock);
@@ -425,3 +560,37 @@ private:
     template <bool Track = false> static int tryExecuteBlock(Interpreter *cpu, uint32_t instrPC, uint32_t opcode, bool thumb, bool &outIsNative0, bool *outPure = nullptr, uint32_t remIndep = 1, uint32_t remShared = 1);
     static bool compileBlock(Interpreter *cpu, uint32_t instrPC, uint32_t opcode0, bool thumb, BlockEntry &entry);
 };
+
+
+/*
+    Copyright (C) 2026 radicalten
+
+    This file is part of NooDS-Wii.
+
+    NooDS-Wii is free software: you can redistribute it and/or modify it
+    under the terms of the GNU General Public License as published by
+    the Free Software Foundation, either version 3 of the License, or
+    (at your option) any later version.
+
+    NooDS-Wii is distributed in the hope that it will be useful, but
+    WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+    General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with NooDS-Wii. If not, see <https://www.gnu.org/licenses/>.
+*/
+
+// v1.101: block fast dispatch.
+//
+// Profiling the CPU-bound workloads showed the generated code itself was a small part of
+// the CPU cost; most of it was the C++ path that leads to a block: Interpreter::runOpcode
+// (pipeline shift, prefetch, condition lookup) -> ArmPpcJit::executeArm (opcode class
+// filters) -> tryExecuteBlock (lookup, budget) -> jit_enter.
+//
+
+
+enum { FD_ENTER=0, FD_WRAP=1, FD_COND=2, FD_MISS=3, FD_STALE=4, FD_STEP=5,
+       FD_MPU=6, FD_BUDGET=7, FD_LOOP=8, FD_N=9 };
+extern uint32_t g_fdWhy[2][FD_N];
+

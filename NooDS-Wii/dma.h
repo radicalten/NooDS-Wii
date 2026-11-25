@@ -18,6 +18,7 @@
     along with NooDS-Wii. If not, see <https://www.gnu.org/licenses/>.
 */
 
+
 #pragma once
 
 #include <cstdint>

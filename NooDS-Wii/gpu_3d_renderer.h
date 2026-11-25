@@ -24,6 +24,13 @@
 #include <cstdio>
 #include <vector>
 
+#ifndef NOODS_V160_GX_DELTA
+#define NOODS_V160_GX_DELTA 1
+#endif
+#ifndef NOODS_V161_GX_OVERLAY
+#define NOODS_V161_GX_OVERLAY 0
+#endif
+
 extern "C" {
     #include <tuxedo/thread.h>
 }
@@ -42,6 +49,9 @@ public:
 
     void drawScanline(int line);
     uint32_t *getLine(int line);
+#if NOODS_V161_GX_OVERLAY
+    void prepareGxOverlay();
+#endif
 
     uint16_t readDisp3DCnt() { return disp3DCnt; }
 
@@ -73,6 +83,14 @@ private:
     uint8_t *cachedPalSlot[2048] = {};
     uint8_t *cachedTexPalBase[2048] = {}; // for fmt5
     bool cachedUseFastTex[2048] = {};
+    // v1.85: line-independent part of drawPolygon, computed once per polygon at line 0.
+    struct PolyInvariant {
+        bool skip;                       // zero-area triangle: nothing to draw
+        bool shallowXMajorEdge, duplicateAdjacent, thinTriangle, horizontalLine;
+        int start;
+    };
+    PolyInvariant polyInv[2048] = {};
+    PolyInvariant computePolyInvariant(_Polygon *polygon);
     // v1.73: per-scanline active polygon lists (built once per frame, safe for dynamic)
     int linePolyCount[384] = {};
     int linePolyIndices[384][256] = {}; // cap 256 per line, overflow falls back to scan
@@ -113,4 +131,30 @@ private:
     uint32_t readTexture(_Polygon *polygon, int s, int t);
     uint32_t readTextureCached(int polyIdx, _Polygon *polygon, int s, int t);
     void drawPolygon(int line, int polygonIndex);
+
+    // v1.108: hardware (GX) rendering, gx3d.cpp
+    bool hwFrame = false;
+    // Temporary output of reference coverage calculation for GX flat spans.
+    bool gxSpanCapture = false;
+    uint32_t gxSpanBegin = 0, gxSpanEnd = 0;
+    void drawFrameGx();
+#if NOODS_V160_GX_DELTA
+    void applyGxDelta();
+#endif
+    void gxDrawShadows();
+    float gxWMin = 1.0f;
+    int gxGetTexture(_Polygon *polygon);
+    uint32_t gxTextureHash(_Polygon *polygon);
+    // v1.101: out-of-line perspective span loop (see gpu_3d_renderer.cpp)
+    struct SpanCtx {
+        _Polygon *polygon; int polygonIndex; int line;
+        uint32_t x1, x2, x3, x4, x1e, x4e;
+        uint32_t x1a, x2a, x3a, x4a;
+        uint32_t w0, w1, z0, z1, r0, r1, g0, g1, b0, b1, sB0, sB1, tB0, tB1;
+        int aaRightX0, aaRightY0, aaRightX1, aaRightY1;
+        bool horizontal, aaRightXMajor, swappedEdges;
+    };
+    void drawSpanPersp(const SpanCtx &c);
+    void drawSpanFlat4(const SpanCtx &c);
+    uint32_t spanEdgeAlpha(const SpanCtx &c, uint32_t x);
 };

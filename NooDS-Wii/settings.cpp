@@ -27,6 +27,10 @@ int Settings::fpsLimiter  = 0;
 int Settings::frameskip   = 0;
 int Settings::threaded2D  = 1;
 int Settings::threaded3D  = 1;
+#ifndef NOODS_HW3D
+#define NOODS_HW3D 1
+#endif
+int Settings::gx3D        = NOODS_HW3D;
 int Settings::highRes3D   = 0;
 int Settings::screenGhost = 0;
 int Settings::emulateAudio = 1;
@@ -42,6 +46,11 @@ int Settings::screen2Size  = 0;
 int Settings::screenSwap   = 0;
 int Settings::wiiScreenGap = 1;
 int Settings::armJit       = 1;
+#ifdef NOODS_GBA_FAST
+int Settings::gbaFastTiming = NOODS_GBA_FAST; // keeps old GBA_FAST=1 builds working
+#else
+int Settings::gbaFastTiming = 0;              // cycle-exact by default
+#endif
 int Settings::arm7Hle      = 0;
 int Settings::dsiMode      = 0;
 int Settings::stylusEdgeClamp = 1; // default On — off-screen press snaps to nearest edge
@@ -85,6 +94,7 @@ std::vector<Setting> Settings::settings = {
     Setting("frameskip",    &frameskip,    false),
     Setting("threaded2D",   &threaded2D,   false),
     Setting("threaded3D",   &threaded3D,   false),
+    Setting("gx3D",         &gx3D,         false),
     Setting("highRes3D",    &highRes3D,    false),
     Setting("screenGhost",  &screenGhost,  false),
     Setting("emulateAudio", &emulateAudio, false),
@@ -100,6 +110,7 @@ std::vector<Setting> Settings::settings = {
     Setting("screenSwap",   &screenSwap,   false),
     Setting("wiiScreenGap", &wiiScreenGap, false),
     Setting("armJit",       &armJit,       false),
+    Setting("gbaFastTiming", &gbaFastTiming, false),
     Setting("arm7Hle",      &arm7Hle,      false),
     Setting("dsiMode",      &dsiMode,      false),
     Setting("stylusEdgeClamp", &stylusEdgeClamp, false),
@@ -171,6 +182,7 @@ bool Settings::load(std::string path) {
     if (wiiScreenGap < 0 || wiiScreenGap > 4) wiiScreenGap = 1;
     if (screenFilter < 0 || screenFilter > 2) screenFilter = 0;
     armJit = (armJit != 0) ? 1 : 0;
+    gbaFastTiming = (gbaFastTiming != 0) ? 1 : 0;
     stylusEdgeClamp = (stylusEdgeClamp != 0) ? 1 : 0;
     return true;
 }

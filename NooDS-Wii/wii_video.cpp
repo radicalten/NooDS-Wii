@@ -24,6 +24,7 @@
 #include <malloc.h>
 #include <stdio.h>
 #include <stdarg.h>
+#include <tuxedo/ppc/clock.h>
 
 extern "C" {
     #include <tuxedo/thread.h>
@@ -34,7 +35,7 @@ extern float g_cursorX;
 extern float g_cursorY;
 extern bool  g_cursorShow;
 
-#define FIFO_SIZE (256 * 1024)
+#define FIFO_SIZE (1024 * 1024) // v1.111: was 256 KB; a full DS scene with shadows did not fit
 
 static WiiVideoSystem  wiiVid;
 static WiiDebugOverlay wiiDbg;
@@ -219,8 +220,97 @@ static void TileImageRGBA8_fromABGR(const uint32_t* __restrict__ src,
     }
 }
 
+#include <tuxedo/sync.h>
+static KMutex s_gxMutex;
+// v1.111: when the graphics FIFO fills up, libogc pauses "the GX thread" until the GPU has
+// caught up. That has to be the thread that is actually writing, or the writer runs on and
+// overflows the FIFO (Dolphin: "FIFO is overflowed by GatherPipe! CPU thread is too fast!").
+static KThread *s_displayThread;
+static bool s_ownerIsDisplay;
+static uint64_t s_holdStart;
+static uint64_t s_displayWait, s_maxDisplayWait, s_emuHold, s_maxEmuHold;
+static uint32_t s_displayCopies, s_emuTransactions;
+static volatile uint32_t s_retraceCount;
+static VIRetraceCallback s_previousRetrace;
+static void countRetrace(uint32_t count) {
+    s_retraceCount = count;
+    if (s_previousRetrace) s_previousRetrace(count);
+}
+uint32_t Wii_VideoRetraceCount() { return s_retraceCount; }
+void Wii_GxLock() {
+    const uint64_t begin = PPCGetTickCount();
+    KMutexLock(&s_gxMutex);
+    s_ownerIsDisplay = KThreadGetSelf() == s_displayThread;
+    s_holdStart = PPCGetTickCount();
+    if (s_ownerIsDisplay) {
+        const uint64_t wait = s_holdStart - begin;
+        s_displayWait += wait;
+        if (wait > s_maxDisplayWait) s_maxDisplayWait = wait;
+    }
+    GX_SetCurrentGXThread();
+}
+void Wii_GxUnlock() {
+    if (!s_ownerIsDisplay) {
+        const uint64_t hold = PPCGetTickCount() - s_holdStart;
+        s_emuHold += hold;
+        if (hold > s_maxEmuHold) s_maxEmuHold = hold;
+        ++s_emuTransactions;
+    }
+    KMutexUnlock(&s_gxMutex);
+}
+void Wii_VideoDumpTiming(FILE *f) {
+    PPCIrqState irq = PPCIrqLockByMsr();
+    const uint64_t wait = s_displayWait, maxWait = s_maxDisplayWait;
+    const uint64_t hold = s_emuHold, maxHold = s_maxEmuHold;
+    const uint32_t copies = s_displayCopies, frames = s_emuTransactions;
+    const uint32_t vi = s_retraceCount;
+    PPCIrqUnlockByMsr(irq);
+    fprintf(f, "PRESENT vi=%u xfb_submitted=%u gx_frames=%u wait_us=%llu max_wait_us=%llu gx_hold_us=%llu max_gx_hold_us=%llu\n",
+        vi, copies, frames, (unsigned long long)PPCTicksToUs(wait),
+        (unsigned long long)PPCTicksToUs(maxWait),
+        (unsigned long long)PPCTicksToUs(hold),
+        (unsigned long long)PPCTicksToUs(maxHold));
+}
+
+void Wii_GxCopyFilter(bool display) {
+    if (display) GX_SetCopyFilter(rmode->aa, rmode->sample_pattern, GX_TRUE, rmode->vfilter);
+    else         GX_SetCopyFilter(GX_FALSE, rmode->sample_pattern, GX_FALSE, rmode->vfilter);
+}
+
+// Put back every piece of GX state the display path sets once at start-up and relies on.
+void Wii_GxRestoreDisplayState() {
+    GXColor background = { 0x18, 0x18, 0x18, 0xFF };
+    GX_SetCopyClear(background, GX_MAX_Z24);
+    Wii_GxCopyFilter(true);
+    GX_SetPixelFmt(GX_PF_RGB8_Z24, GX_ZC_LINEAR);
+    GX_SetCullMode(GX_CULL_NONE);
+    GX_SetClipMode(GX_CLIP_ENABLE);
+    GX_SetZCompLoc(GX_TRUE);
+    GX_SetZMode(GX_FALSE, GX_ALWAYS, GX_FALSE);
+    GX_SetDither(GX_TRUE);
+    GX_SetColorUpdate(GX_TRUE);
+    GX_SetAlphaUpdate(GX_TRUE);
+    GX_SetDstAlpha(GX_DISABLE, 0);
+    GX_SetAlphaCompare(GX_ALWAYS, 0, GX_AOP_AND, GX_ALWAYS, 0);
+    GX_SetBlendMode(GX_BM_NONE, GX_BL_ONE, GX_BL_ZERO, GX_LO_CLEAR);
+    GX_LoadProjectionMtx(perspective, GX_ORTHOGRAPHIC);
+    GX_LoadPosMtxImm(modelView, GX_PNMTX0);
+    GX_SetCurrentMtx(GX_PNMTX0);
+    GX_ClearVtxDesc();
+    GX_SetVtxDesc(GX_VA_POS,  GX_DIRECT);
+    GX_SetVtxDesc(GX_VA_CLR0, GX_DIRECT);
+    GX_SetVtxDesc(GX_VA_TEX0, GX_DIRECT);
+    GX_SetNumTexGens(1);
+    GX_SetTexCoordGen(GX_TEXCOORD0, GX_TG_MTX2x4, GX_TG_TEX0, GX_IDENTITY);
+    GX_SetViewport(0, 0, rmode->fbWidth, rmode->efbHeight, 0, 1);
+    GX_SetScissor(0, 0, rmode->fbWidth, rmode->efbHeight);
+    GX_InvalidateTexAll();
+}
+
 void Wii_VideoInit() {
+    s_displayThread = KThreadGetSelf();
     VIDEO_Init();
+    s_previousRetrace = VIDEO_SetPostRetraceCallback(countRetrace);
     PAD_Init();
 
     rmode = VIDEO_GetPreferredMode(nullptr);
@@ -618,6 +708,9 @@ static void Wii_ComputeScreenRects(int fbW, int fbH, bool gbaMode, WiiScreenRect
     out->botVis = true;
 }
 
+static bool s_preTiled = false;
+void Wii_VideoSetPreTiled(bool on) { s_preTiled = on; }
+
 void Wii_VideoRender(const uint32_t* srcTop, const uint32_t* srcBottom,
                      bool gbaMode, bool uploadTextures) {
     const int scrW = gbaMode ? GBA_SCREEN_WIDTH  : NDS_SCREEN_WIDTH;
@@ -625,8 +718,31 @@ void Wii_VideoRender(const uint32_t* srcTop, const uint32_t* srcBottom,
     const size_t bufSize = (size_t)scrW * scrH * 4;
     const u8 filterMode = (Settings::screenFilter != 0) ? GX_LINEAR : GX_NEAR;
     static u8 s_lastFilterMode = 0xFF;
+    static bool s_lastPreTiled = false;
+    static const void *s_lastTop = nullptr;
 
-    if (gbaMode != wiiVid.lastGbaMode || filterMode != s_lastFilterMode) {
+    // v1.112: the emulator thread already produced the two textures; just point at them.
+    if (s_preTiled && !gbaMode && srcTop && srcBottom) {
+        if (uploadTextures || !s_lastPreTiled || srcTop != s_lastTop || filterMode != s_lastFilterMode) {
+            GX_InitTexObj(&wiiVid.texObjTop, (void*)srcTop, scrW, scrH, GX_TF_RGB565, GX_CLAMP, GX_CLAMP, GX_FALSE);
+            GX_InitTexObjFilterMode(&wiiVid.texObjTop, filterMode, filterMode);
+            GX_InitTexObj(&wiiVid.texObjBottom, (void*)srcBottom, scrW, scrH, GX_TF_RGB565, GX_CLAMP, GX_CLAMP, GX_FALSE);
+            GX_InitTexObjFilterMode(&wiiVid.texObjBottom, filterMode, filterMode);
+            GX_InvalidateTexAll();
+            s_lastTop = srcTop;
+        }
+        s_lastPreTiled = true;
+        s_lastFilterMode = filterMode;
+        wiiVid.lastGbaMode = false;
+        uploadTextures = false;
+    }
+    else if (s_lastPreTiled) {
+        s_lastPreTiled = false;
+        s_lastFilterMode = 0xFF; // force the texture objects back to the RGBA8 buffers
+        uploadTextures = true;
+    }
+
+    if (!s_lastPreTiled && (gbaMode != wiiVid.lastGbaMode || filterMode != s_lastFilterMode)) {
         GX_InitTexObj(&wiiVid.texObjTop,
                       wiiVid.texDataTop,
                       scrW, scrH,
@@ -748,6 +864,7 @@ void Wii_DrawCursor(float x, float y) {
 }
 
 void Wii_VideoFlushAsync() {
+    ++s_displayCopies;
     wiiVid.currentXfb ^= 1;
     GX_SetZMode(GX_FALSE, GX_ALWAYS, GX_FALSE);
     GX_SetColorUpdate(GX_TRUE);

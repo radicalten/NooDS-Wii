@@ -20,6 +20,9 @@
 
 #include "core.h"
 #include <cstring>
+#if NOODS_MPU_CACHE_VERIFY
+uint32_t g_mpuPageCacheStats[3];
+#endif
 
 Cp15::Cp15(Core *core): core(core) {
     pageGen = new uint16_t[0x100000]();
@@ -122,6 +125,7 @@ uint8_t Cp15::fillPagePermSlow(uint32_t page) {
 }
 
 void Cp15::updateMpuState() {
+    execOkPage = 0xFFFFFFFFu;
     if (++mpuGen == 0) {
         if (pageGen) memset(pageGen, 0, sizeof(uint16_t) * 0x100000);
         mpuGen = 1;
@@ -155,6 +159,14 @@ void Cp15::updateMpuState() {
         checkAccess(0x02000000u, false, true, true) && checkAccess(0x02000000u, true, true, true) &&
         checkAccess(0x04000000u, false, true, true) && checkAccess(0x04000000u, true, true, true) &&
         checkAccess(0x06000000u, false, true, true) && checkAccess(0x06000000u, true, true, true);
+    // v1.121: the Nintendo SDK puts a no-access guard region on the last page of the 4 MB
+    // main RAM (0x023FF000, the alias of the shared work area at 0x027FF000). That is the MPU
+    // setup of retail games, and because of it this test used to fail for them, which
+    // switched off the whole fast path (compiled blocks, unchecked data access): Animal
+    // Crossing: Wild World ran entirely in the checked interpreter. A guard region of up to
+    // 32 KB at the very top of main RAM is now tolerated like the libnds DTCM canary: the fast
+    // path stays on and an access to the guard does not raise a data abort. Guard pages
+    // anywhere else (suite-poly's MPU test uses one at 0x021F0000) keep the exact path.
     if (privOk) {
         for (int r = 0; r < 8; r++) {
             uint32_t reg = regionControl[r];
@@ -166,6 +178,7 @@ void Cp15::updateMpuState() {
             const bool privRW = (dataAp == 1 || dataAp == 2 || dataAp == 3);
             if (!privRW && base >= 0x02000000u && base < 0x08000000u &&
                 !(base == dtcmAddr && sizeField == 11) &&
+                !(sizeField <= 17 && base >= 0x023C0000u && base < 0x02400000u) && // allow top of Main RAM SDK guard (up to 256 KB)
                 !checkAccess(base, true, true, true)) {
                 privOk = false;
                 break;
@@ -250,6 +263,7 @@ void Cp15::write(uint8_t cn, uint8_t cm, uint8_t cp, uint32_t value) {
         itcmCanRead = (ctrlReg & BIT(18)) && !(ctrlReg & BIT(19));
         itcmCanWrite = (ctrlReg & BIT(18));
         updateMpuState();
+        g_evCnt[0]++;
 
         // Update the memory map at the current TCM locations
         core->memory.updateMap9(dtcmAddr, dtcmAddr + dtcmSize, true);
@@ -293,4 +307,12 @@ void Cp15::write(uint8_t cn, uint8_t cm, uint8_t cp, uint32_t value) {
         LOG_WARN("Unknown CP15 register write: C%d,C%d,%d\n", cn, cm, cp);
         return;
     }
+}
+
+void Cp15::dumpMpu(FILE *f) const {
+
+    fprintf(f, "MPU ctrl=%08X restricted=%d fastPriv=%d dtcm=%08X+%X itcmSize=%X", (unsigned)ctrlReg, mpuRestricted, mpuFastPriv,
+            (unsigned)dtcmAddr, (unsigned)dtcmSize, (unsigned)itcmSize);
+    for (int r = 0; r < 8; r++) fprintf(f, " r%d=%08X/%02X", r, (unsigned)regionControl[r], regionPerms[r]);
+    fprintf(f, "\n");
 }

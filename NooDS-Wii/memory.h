@@ -23,6 +23,7 @@
 #include <cstdint>
 #include "defines.h"
 #include "arm_jit.h"
+#include "gba_timing.h"
 
 class Core;
 
@@ -47,6 +48,7 @@ public:
 
     uint8_t palette[0x800] = {}; // 2KB palette
     uint8_t oam[0x800] = {}; // 2KB OAM
+    uint32_t oamGen = 1; // v1.123: bumped on every DS-side write to OAM (see Gpu2D::buildObjectLineDs)
     uint8_t *engAExtPal[5] = {};
     uint8_t *engBExtPal[5] = {};
     uint8_t *tex3D[4] = {};
@@ -64,6 +66,7 @@ public:
 
     void updateMap9(uint32_t start, uint32_t end, bool tcm = false);
     void updateMap7(uint32_t start, uint32_t end);
+    void updateVramMaps();
     void updateVram();
 
     void setGbaBiosOpenBus(uint32_t val) { gbaBiosOpenBus = val; }
@@ -71,11 +74,29 @@ public:
     void clearGbaDmaOpenBus() { gbaDmaOpenBusActive = false; }
     void completeGbaSioTransfer();
     uint16_t getWaitCnt() const { return gbaWaitCnt; }
+    uint8_t *gbaOamData() { return oam; } // v1.106: GBA DMA fast path (OAM is 1 KB, mirrored)
     bool mpuDataCheckActive = false;
     bool gbaModeCached = false;
     bool gbaCpuExecActive = false;
     bool handleMpuDataAbort(uint32_t address, bool isWrite);
     void onGbaCpuDataAccess(uint32_t address, uint32_t sizeBytes, bool isLoad);
+    // v1.106: the common GBA data access (BIOS, IWRAM, I/O or OAM while the cartridge
+    // prefetcher is idle) costs one cycle and touches nothing else, so it is accounted inline.
+    GbaBus *gbaBusFast = nullptr;
+    uint32_t *gbaCyclesFast = nullptr, *gbaGlobalFast = nullptr;
+    FORCE_INLINE void gbaDataAccess(uint32_t address, uint32_t sizeBytes, bool isLoad) {
+        GbaBus &bus = *gbaBusFast;
+        const uint32_t region = address >> 24;
+        if (__builtin_expect(!bus.active && region < 8 && ((0x9Bu >> region) & 1), 1)) {
+            bus.nextSeq = false;
+            bus.inSeqAccess = true;
+            bus.hadDataAccess = true;
+            if (isLoad) bus.hadLoad = true;
+            *gbaCyclesFast = (*gbaGlobalFast += 1);
+            return;
+        }
+        onGbaCpuDataAccess(address, sizeBytes, isLoad);
+    }
 
     template <typename T> T read(bool arm7, uint32_t address, bool tcm = true);
     template <typename T> void write(bool arm7, uint32_t address, T value, bool tcm = true);
@@ -182,7 +203,7 @@ template <typename T> FORCE_INLINE T Memory::read(bool arm7, uint32_t address, b
             return 0;
     }
     if (arm7 && gbaCpuExecActive)
-        onGbaCpuDataAccess(address, sizeof(T), true);
+        gbaDataAccess(address, sizeof(T), true);
     // Look up a pointer to readable memory and read a value from it LSB-first
     uint8_t **readMap = arm7 ? readMap7 : (tcm ? readMap9A : readMap9B);
     if (uint8_t *data = readMap[address >> 12]) {
@@ -224,7 +245,7 @@ template <typename T> FORCE_INLINE void Memory::write(bool arm7, uint32_t addres
             return;
     }
     if (arm7 && gbaCpuExecActive)
-        onGbaCpuDataAccess(address, sizeof(T), false);
+        gbaDataAccess(address, sizeof(T), false);
     if constexpr (sizeof(T) == 1) {
         if (arm7 && gbaModeCached && (address >> 24) == 6) {
             writeFallback<uint8_t>(arm7, address, value);
@@ -265,4 +286,18 @@ template <typename T> FORCE_INLINE void Memory::write(bool arm7, uint32_t addres
 
     // Handle special write cases that can't be mapped
     return writeFallback<T>(arm7, address, value);
+}
+
+#include <cstdint>
+// Only ATTR0/ATTR1 determine scanline membership. ATTR2 and affine-matrix
+// writes are reread when building the line list and do not invalidate masks.
+namespace GbaObjMask {
+inline bool changesMembership(const uint8_t *oam, uint32_t address, uint32_t value, unsigned bytes) {
+    const unsigned off=address & (bytes==4 ? 0x3FCu : 0x3FEu);
+    if (bytes==1 || (off&4u)) return false;
+    uint32_t old=uint32_t(oam[off])|(uint32_t(oam[off+1])<<8);
+    if (bytes==4) old|=(uint32_t(oam[off+2])<<16)|(uint32_t(oam[off+3])<<24);
+    else value &= 0xFFFFu;
+    return old!=value;
+}
 }
