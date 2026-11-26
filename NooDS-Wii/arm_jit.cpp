@@ -3756,6 +3756,25 @@ bool ArmPpcJit::emitNativeMrcArm(uint32_t *&p, Interpreter *cpu, uint32_t opcode
     const int16_t offCore = (int16_t)offsetof(Interpreter, core);
     *p++ = JitPpc::lwz(JitPpc::R4, JitPpc::R31, offCore); // R4 = cpu->core
 
+    // CP15 C5 readback packs eight region permissions into 2-bit or 4-bit
+    // fields. Emit the packing natively, matching Cp15::read exactly.
+    if (cn == 5 && cm == 0 && cp <= 3) {
+        const unsigned bits = cp >= 2 ? 4u : 2u;
+        emitLoadImm32(p, JitPpc::R5, (uint32_t)(offsetof(Core, cp15) + offsetof(Cp15, regionPerms)));
+        *p++ = JitPpc::add(JitPpc::R5, JitPpc::R4, JitPpc::R5);
+        *p++ = JitPpc::li(JitPpc::R3, 0);
+        for (unsigned region = 0; region < 8; ++region) {
+            *p++ = JitPpc::lbz(JitPpc::R6, JitPpc::R5, (int16_t)region);
+            if ((cp & 1u) == 0) *p++ = JitPpc::srwi(JitPpc::R6, JitPpc::R6, 4);
+            *p++ = JitPpc::andi_rc(JitPpc::R6, JitPpc::R6, bits == 4 ? 15u : 3u);
+            if (region) *p++ = JitPpc::slwi(JitPpc::R6, JitPpc::R6, region * bits);
+            *p++ = JitPpc::or_(JitPpc::R3, JitPpc::R3, JitPpc::R6);
+        }
+        emitStoreGuestReg(p, JitPpc::R3, rd);
+        outCycles = 1;
+        return true;
+    }
+
     uint32_t memberOff = 0;
     bool isDirectMember = true;
     switch ((cn << 16) | (cm << 8) | cp) {
@@ -3785,7 +3804,11 @@ bool ArmPpcJit::emitNativeMrcArm(uint32_t *&p, Interpreter *cpu, uint32_t opcode
         return true;
     }
 
-    return false;
+    // Unknown registers read as zero in Cp15::read; emit that value directly.
+    *p++ = JitPpc::li(JitPpc::R3, 0);
+    emitStoreGuestReg(p, JitPpc::R3, rd);
+    outCycles = 1;
+    return true;
 }
 
 bool ArmPpcJit::emitNativeArm(uint32_t *&p, Interpreter *cpu, uint32_t opcode, int &outCycles, bool emitFlags) {
