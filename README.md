@@ -13,7 +13,7 @@ You may store your roms in a preferred place such as sd:/noods/roms, sd:/noods/n
 
 ## Current Progress:
 3D games run at 10-30 fps, 2D at 30-60 fps  <br />
-Wii remote, Gamecube controller, and Wii Classic controller are supported as of NooDS-Wii v1.2.
+Wii remote, Gamecube controller, and Wii Classic controller are supported.
 
 ## Channel Icon
 <img width="128" height="48" alt="icon" src="https://github.com/user-attachments/assets/abfebd7a-7400-481c-ad71-ae433ccf3670" />
