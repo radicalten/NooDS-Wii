@@ -12,7 +12,7 @@ The program starts in the sd:/noods/ folder and will search for these files in s
 You may store your roms in a preferred place such as sd:/noods/roms, sd:/noods/nds, or sd:/noods/gba  <br />
 
 ## Current Progress:
-3D games run at 10-30 fps, 2D at 30-60 fps  <br />
+3D games run at 10-30 fps, 2D at 20-60 fps  <br />
 Wii remote, Gamecube controller, and Wii Classic controller are supported.
 
 ## Channel Icon
